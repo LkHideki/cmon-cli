@@ -271,6 +271,7 @@ def collect(args):
     rows = limits(fetch())
     con.executemany("INSERT INTO snapshots VALUES (?,?,?,?,?,?)",
                     [[ts, k, lbl, pct, reset, act] for k, lbl, pct, reset, act in rows])
+    _write_cache(rows, ts)
     print(f"{ts:%Y-%m-%d %H:%M} coletado:")
     for _k, lbl, pct, reset, _a in rows:
         print(f"  {lbl:16} {pct:4.0f}%  reset {reset[:16] if reset else '-'}")
@@ -472,13 +473,67 @@ def _eta_short(iso: str | None) -> str:
     return e.replace(" ", "").replace("min", "m") if e not in ("-", "expirado") else e
 
 
-def status(args):
-    """Linha única p/ statusline/tmux/prompt. Silencioso e exit 0 se offline."""
+CACHE = os.path.expanduser("~/.cmon/status.json")  # fixo: statusline roda de qualquer cwd
+
+
+def _write_cache(rows, ts) -> None:
+    """Grava o último snapshot num cache leve p/ o 'status' ler sem rede/DuckDB."""
     try:
-        rows = limits(fetch())
-    except FetchError:
-        print("cmon offline")
-        return
+        os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+        with open(CACHE, "w", encoding="utf-8") as f:
+            json.dump({"ts": ts.isoformat(), "rows": [list(r) for r in rows]}, f)
+    except Exception:
+        pass
+
+
+def _read_cache():
+    """(rows, idade_s) do cache JSON, ou None se ausente/ilegível."""
+    if not os.path.exists(CACHE):
+        return None
+    try:
+        with open(CACHE, encoding="utf-8") as f:
+            d = json.load(f)
+        ts = datetime.fromisoformat(d["ts"])
+        return [tuple(r) for r in d["rows"]], (datetime.now(timezone.utc) - ts).total_seconds()
+    except Exception:
+        return None
+
+
+def _rows_from_db():
+    """(rows, idade_s) do último snapshot no banco, ou None se não houver."""
+    con = db(create=False)
+    if con is None:
+        return None
+    df = con.execute("SELECT key,label,percent,resets_at,is_active,ts FROM snapshots "
+                     "WHERE ts=(SELECT max(ts) FROM snapshots)").df()
+    if df.empty:
+        return None
+    rows = [(r.key, r.label, float(r.percent),
+             r.resets_at.isoformat() if r.resets_at is not None else None,
+             bool(r.is_active)) for r in df.itertuples()]
+    return rows, (datetime.now(timezone.utc) - df.ts.iloc[0]).total_seconds()
+
+
+def status(args):
+    """Linha única p/ statusline/tmux/prompt. Por padrão lê o cache local (rápido,
+    ~sub-20ms, sem rede) alimentado pelo 'collect'; --live força a API."""
+    age = None
+    if args.live:
+        try:
+            rows = limits(fetch())
+        except FetchError:
+            print("cmon offline")
+            return
+    else:
+        got = _read_cache() or _rows_from_db()
+        if got:
+            rows, age = got
+        else:
+            try:
+                rows = limits(fetch())  # sem cache nem banco ainda: cai pra API
+            except FetchError:
+                print("cmon offline")
+                return
     parts = []
     for key, short in (("session", "5h"), ("weekly_all", "sem")):
         r = next((x for x in rows if x[0] == key), None)
@@ -487,6 +542,8 @@ def status(args):
     sess = next((x for x in rows if x[0] == "session"), None)
     if sess and sess[3]:
         parts.append(f"reset {_eta_short(sess[3])}")
+    if age is not None and age > 1800:  # dado velho: sinaliza sem poluir
+        parts.append(f"há {age / 60:.0f}m")
     print(" · ".join(parts))
 
 
@@ -796,7 +853,8 @@ def main():
     p.add_argument("--db", help="caminho do banco DuckDB (sobrepõe CMON_DB)")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("now", help="uso atual + tempo até o reset + ritmo/projeção")
-    sub.add_parser("status", help="linha única p/ statusline/tmux/prompt")
+    ps = sub.add_parser("status", help="linha única p/ statusline/tmux/prompt (lê cache local)")
+    ps.add_argument("--live", action="store_true", help="consulta a API em vez do cache local")
     sub.add_parser("trends", help="consumo por ciclo: pico, delta e anomalia")
     pc = sub.add_parser("collect", help="grava 1 snapshot no banco")
     pc.add_argument("--force", action="store_true", help="grava mesmo com snapshot recente (ignora dedup)")
