@@ -333,7 +333,7 @@ def now(_):
     print(f"\n5h window: {pct:.0f}% used — expires in {fmt_eta(reset)}.")
 
     con = db(create=False)
-    if con is None:
+    if con is None or not reset:
         return
     end = datetime.fromisoformat(reset)
     win = con.execute(
