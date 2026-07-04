@@ -415,6 +415,19 @@ def report(args):
         print(g.to_string())
 
 
+def _open_file(path):
+    """Abre o arquivo no app padrão do SO (best-effort; silencioso se falhar)."""
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["open", path], check=False)
+        elif sys.platform.startswith("win"):
+            os.startfile(path)  # type: ignore[attr-defined]
+        else:
+            subprocess.run(["xdg-open", path], check=False)
+    except Exception:
+        pass
+
+
 def plot(args):
     try:
         import matplotlib.pyplot as plt
@@ -437,8 +450,10 @@ def plot(args):
         a.set_title(t)
         a.set_xlabel("")
     fig.tight_layout()
-    fig.savefig(args.out, dpi=150)
-    print(f"{args.out} salvo")
+    out = args.out or f"usage_{datetime.now():%y%m%d_%H%M%S}.png"
+    fig.savefig(out, dpi=150)
+    print(f"{out} salvo")
+    _open_file(out)
 
 
 def _rate(con, key) -> float | None:
@@ -1234,7 +1249,8 @@ def main():
     pin.add_argument("--dry-run", action="store_true", help="mostra o que faria, sem instalar")
     sub.add_parser("uninstall", help="remove o agendamento criado pelo install")
     pp = sub.add_parser("plot", help="gera gráficos -> PNG")
-    pp.add_argument("-o", "--out", default="usage.png")
+    pp.add_argument("-o", "--out", default=None,
+                    help="caminho do PNG (padrão: usage_AAMMDD_HHMMSS.png)")
 
     pd_ = sub.add_parser("tips", help="dicas de pacing p/ usar ~100%% do semanal sem travar o 5h",
                          description="Projeta o consumo por janela e sugere acelerar/frear/trocar "
