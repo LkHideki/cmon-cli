@@ -1,69 +1,69 @@
-# Contribuindo com o cmon
+# Contributing to cmon
 
-Obrigado pelo interesse em contribuir! Este guia cobre o essencial para começar.
+Thank you for your interest in contributing! This guide covers the essentials to get started.
 
-## Ambiente de desenvolvimento
+## Development environment
 
-O projeto usa [uv](https://docs.astral.sh/uv/) para gerenciar dependências e ambientes.
+The project uses [uv](https://docs.astral.sh/uv/) to manage dependencies and environments.
 
 ```bash
-# Clone e entre no diretório
+# Clone and enter the directory
 git clone https://github.com/LkHideki/cmon.git
 cd cmon
 
-# Instala as dependências (ambiente enxuto)
+# Install dependencies (lean environment)
 uv sync
 
-# Para trabalhar com os gráficos (comando `plot`), inclua o extra opcional
+# To work with graphs (the `plot` command), include the optional extra
 uv sync --extra plot
 
-# Rode a CLI
+# Run the CLI
 uv run cmon --help
 ```
 
-Requer **Python 3.11+**. A CI valida em 3.11, 3.12 e 3.13.
+Requires **Python 3.11+**. CI validates on 3.11, 3.12, and 3.13.
 
-## Antes de abrir um PR
+## Before opening a PR
 
-Rode o mesmo que a CI roda:
+Run the same checks that CI runs:
 
 ```bash
-# Lint (obrigatório — a CI falha se houver violação)
+# Lint (mandatory — CI fails if there are violations)
 uv run ruff check .
 
-# Formatação automática das correções triviais
+# Automatic formatting of trivial fixes
 uv run ruff check --fix .
 
-# Smoke test (importa o módulo e valida o CLI, sem rede)
+# Smoke test (imports the module and validates the CLI, no network)
 uv run cmon --help
 ```
 
-A configuração do ruff vive no `pyproject.toml` (`line-length = 120`, regras `E/F/I/UP/B`).
+The ruff configuration lives in `pyproject.toml` (`line-length = 120`, rules `E/F/I/UP/B`).
 
-## Mensagens de commit
+## Commit messages
 
-Seguimos [Conventional Commits](https://www.conventionalcommits.org/pt-br/):
+We follow [Conventional Commits](https://www.conventionalcommits.org/):
 
 ```
-<tipo>: <resumo no imperativo, minúsculo>
+<type>: <summary in imperative, lowercase>
 
-<corpo opcional explicando o PORQUÊ, não o o quê>
+<optional body explaining the WHY, not the what>
 ```
 
-Tipos usados: `feat`, `fix`, `docs`, `perf`, `refactor`, `style`, `chore`, `ci`, `test`.
+Types used: `feat`, `fix`, `docs`, `perf`, `refactor`, `style`, `chore`, `ci`, `test`.
 
-Diretrizes:
+Guidelines:
 
-- **Escreva em português com acentuação correta.** Nada de `nao`, `voce`, `e` no lugar de `não`, `você`, `é`.
-- Prefira **um tipo por commit**. Evite tipos compostos como `perf+feat:` — separe em dois commits ou escolha o predominante.
-- O corpo é opcional, mas quando o commit muda comportamento, **explique o porquê** e traga números quando fizer sentido (ex.: `72s -> 1.3s`).
+- **Write in clear, grammatically correct English.** Avoid typos and abbreviations that obscure meaning.
+- Prefer **one type per commit**. Avoid composite types like `perf+feat:` — split into two commits or pick the predominant one.
+- The body is optional, but when the commit changes behavior, **explain the why** and include numbers when it makes sense (e.g., `72s -> 1.3s`).
 
-## Escopo e estilo
+## Scope and style
 
-- O código-fonte é um único módulo: [`cmon.py`](cmon.py). Mantenha as mudanças coesas com o estilo existente.
-- Novas dependências pesadas devem entrar como **extra opcional** (como `plot`), não no core.
-- Nunca versione segredos. `.env`, `*.duckdb` e `*.png` já estão no `.gitignore`.
+- The source code is a single module: [`cmon.py`](cmon.py). Keep changes cohesive with the existing style.
+- Heavy new dependencies should be added as **optional extras** (like `plot`), not in core.
+- Never version secrets. `.env`, `*.duckdb`, and `*.png` are already in `.gitignore`.
 
-## Reportando bugs e ideias
+## Reporting bugs and ideas
 
-Abra uma [issue](https://github.com/LkHideki/cmon/issues) descrevendo o que esperava, o que aconteceu e como reproduzir. Para a CLI, inclua o comando exato e a saída relevante (mascare tokens).
+Open an [issue](https://github.com/LkHideki/cmon/issues) describing what you expected, what happened, and how to reproduce it. For the CLI, include the exact command and relevant output (redact tokens).

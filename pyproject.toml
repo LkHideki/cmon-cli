@@ -1,9 +1,9 @@
-# Nome de distribuição (PyPI): 'cmon' já está tomado por um projeto sem relação.
-# O comando de terminal continua 'cmon' via [project.scripts] abaixo.
+# Distribution name (PyPI): 'cmon' is already taken by an unrelated project.
+# The terminal command remains 'cmon' via [project.scripts] below.
 [project]
 name = "cmon-cli"
 version = "0.1.0"
-description = "Claude Monitor — rastreia o consumo do seu plano Claude ao longo do tempo"
+description = "Claude Monitor — tracks your Claude plan consumption over time"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -32,8 +32,8 @@ dependencies = [
     "rich>=13.0",
 ]
 
-# Gráficos são opcionais: matplotlib+seaborn são pesados e só o comando `plot`
-# os usa. `uv sync` padrão fica enxuto; para gráficos: `uv sync --extra plot`.
+# Plots are optional: matplotlib+seaborn are heavy and only the `plot` command
+# uses them. Default `uv sync` stays lean; for plots: `uv sync --extra plot`.
 [project.optional-dependencies]
 plot = ["matplotlib>=3.8", "seaborn>=0.13"]
 

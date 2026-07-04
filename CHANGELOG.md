@@ -1,64 +1,64 @@
 # Changelog
 
-Todas as mudanças relevantes deste projeto são documentadas aqui.
+All notable changes to this project are documented here.
 
-O formato é baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/)
-e o projeto adere ao [Versionamento Semântico](https://semver.org/lang/pt-BR/).
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
+and the project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Não lançado]
+## [Unreleased]
 
-Primeira linha de desenvolvimento rumo ao `0.1.0`. Ainda sem release publicado.
+First development line toward `0.1.0`. No release published yet.
 
-### Adicionado
+### Added
 
-- **CLI `cmon`** para rastrear o consumo do plano Claude ao longo do tempo:
-  comandos `now`, `collect`, `report` e `plot`, lendo `limits[]` de
-  `claude.ai/api/oauth/usage` e gravando snapshots em DuckDB.
-- **Cofre de token cross-platform** via keyring (Keychain / Credential Manager /
-  Secret Service), com resolução `env -> cofre do SO -> credencial do Claude Code`
-  e os comandos `cmon token set/status/clear`.
-- **Auto-refresh do token OAuth**: renovação proativa (lê `expiresAt`, 60s de
-  folga) e reativa (no 401), com a cadeia guardada em cofre próprio, separada da
-  credencial do Claude Code. `client_id`/endpoint configuráveis por env.
-- **`cmon tips`**: projeção por janela, alvo de %/h e dicas geradas via
-  `claude -p` (Sonnet), aterradas no mix real de modelos das últimas 5h.
-- **`cmon watch`**: TUI ao vivo (rich) com barras coloridas, ritmo, projeção,
-  alertas e a linha `burn 5h (logs)`; `--collect` grava enquanto observa.
-- **`cmon status`**: linha única para statusline/tmux/prompt, degradando de forma
-  graciosa quando offline.
-- **`cmon wait`**: bloqueia até a janela resetar (ou `--at N%`) e dispara
-  notificação nativa.
-- **`cmon trends`**: segmenta o histórico por reset, com pico por ciclo, delta
-  vs. o anterior e detecção de anomalia.
-- **`cmon install/uninstall`**: coleta de fundo via launchd (macOS) /
-  systemd-user com fallback cron (Linux) / schtasks (Windows); `--dry-run`.
-- **`cmon burn`**: minera os logs locais do Claude Code
-  (`~/.claude/projects/**/*.jsonl`) para estimar tokens e US$, com breakdown por
-  componente (input/output/cache read/cache write), rótulo honesto
-  ("equivalente na API", não fatura) e agrupamento por `model`, `day`, `project`,
-  `session` ou `surface` (entrypoint: terminal/vscode/app/sdk).
-- **Alertas**: aviso quando, no ritmo atual, a janela bate 100% antes do reset
+- **CLI `cmon`** to track Claude plan consumption over time:
+  commands `now`, `collect`, `report`, and `plot`, reading `limits[]` from
+  `claude.ai/api/oauth/usage` and writing snapshots to DuckDB.
+- **Cross-platform token vault** via keyring (Keychain / Credential Manager /
+  Secret Service), with resolution `env -> OS vault -> Claude Code credential`
+  and commands `cmon token set/status/clear`.
+- **OAuth token auto-refresh**: proactive renewal (reads `expiresAt`, 60s grace period)
+  and reactive (on 401), with the refresh chain stored in its own vault, separate from
+  Claude Code credential. `client_id`/endpoint configurable via env.
+- **`cmon tips`**: window-based projection, %/h target, and tips generated via
+  `claude -p` (Sonnet), grounded in the actual model mix from the last 5h.
+- **`cmon watch`**: live TUI (rich) with colored bars, burn rate, projection,
+  alerts, and the `burn 5h (logs)` line; `--collect` records while watching.
+- **`cmon status`**: single line for statusline/tmux/prompt, gracefully degrading
+  when offline.
+- **`cmon wait`**: blocks until the window resets (or `--at N%`) and fires
+  native notification.
+- **`cmon trends`**: segments history by reset, with peak per cycle, delta
+  vs. previous, and anomaly detection.
+- **`cmon install/uninstall`**: background collection via launchd (macOS) /
+  systemd-user with fallback cron (Linux) / schtasks (Windows); `--dry-run`.
+- **`cmon burn`**: mines local Claude Code logs
+  (`~/.claude/projects/**/*.jsonl`) to estimate tokens and US$, with breakdown by
+  component (input/output/cache read/cache write), honest label
+  ("API equivalent", not billed) and grouping by `model`, `day`, `project`,
+  `session`, or `surface` (entrypoint: terminal/vscode/app/sdk).
+- **Alerts**: warning when, at the current burn rate, the window hits 100% before reset
   (`_notify` best-effort via osascript/notify-send).
-- **Robustez**: retry com backoff exponencial respeitando `Retry-After` para
-  429/5xx/rede; 401/403 falham com mensagem legível; `collect` com dedup por
-  janela e falha não-silenciosa (exit code != 0).
-- **Empacotamento open-source**: metadados PyPI, `LICENSE` (MIT), workflow de CI
-  (ruff + smoke em 3.11–3.13), gráficos como extra opcional (`plot`).
+- **Robustness**: retry with exponential backoff respecting `Retry-After` for
+  429/5xx/network; 401/403 fail with readable message; `collect` with dedup per
+  window and fail-fast (exit code != 0).
+- **Open-source packaging**: PyPI metadata, `LICENSE` (MIT), CI workflow
+  (ruff + smoke on 3.11–3.13), graphs as optional extra (`plot`).
 
 ### Performance
 
-- **`burn` first-scan ~55x mais rápido**: insert vetorizado via DataFrame +
-  `drop_duplicates` no lugar de `executemany`+`ON CONFLICT`; scan com orjson,
-  leitura binária, pré-filtro por `"usage"` e parse paralelo (ProcessPool).
-  Varredura de 520MB/1939 arquivos: 72s -> 1.3s; incremental 1.1s -> 0.28s.
-- **`status` ~12x mais rápido**: lê cache local (`~/.cmon/status.json`) antes de
-  banco e API, tirando a rede do caminho quente da statusline (~50ms vs. ~590ms).
+- **`burn` first-scan ~55x faster**: vectorized insert via DataFrame +
+  `drop_duplicates` instead of `executemany`+`ON CONFLICT`; scan with orjson,
+  binary read, pre-filter by `"usage"`, and parallel parse (ProcessPool).
+  Scan of 520MB/1939 files: 72s -> 1.3s; incremental 1.1s -> 0.28s.
+- **`status` ~12x faster**: reads local cache (`~/.cmon/status.json`) before
+  database and API, removing network from the hot path of statusline (~50ms vs. ~590ms).
 
-### Alterado
+### Changed
 
-- `requires-python` relaxado de `>=3.14` para `>=3.11` (o código só precisa de
-  3.11); `.python-version` em 3.12.
-- Nome de distribuição no PyPI passa a ser `cmon-cli` (o comando de terminal
-  continua `cmon`), pois `cmon` já estava tomado.
-- `burn` passa a usar janela padrão de 30 dias (o Claude Code apaga transcripts
-  com mais de 30d); `--since all` varre todo o histórico disponível.
+- `requires-python` relaxed from `>=3.14` to `>=3.11` (the code only needs
+  3.11); `.python-version` on 3.12.
+- PyPI distribution name is now `cmon-cli` (the terminal command remains `cmon`),
+  since `cmon` was already taken.
+- `burn` now uses a default window of 30 days (Claude Code removes transcripts
+  older than 30d); `--since all` scans the entire available history.

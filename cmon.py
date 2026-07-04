@@ -1,21 +1,21 @@
-"""cmon — Claude Monitor. Rastreia o consumo do seu plano Claude ao longo do tempo.
+"""cmon — Claude Monitor. Track your Claude plan consumption over time.
 
-Fonte: endpoint privado https://claude.ai/api/oauth/usage (o mesmo que o app usa).
-Token, resolvido nesta ordem:
-  1. variável de ambiente CLAUDE_OAUTH_TOKEN (útil em CI / override);
-  2. cofre seguro do SO — Keychain (macOS), Credential Manager (Windows) ou
-     Secret Service (Linux) —, gravado uma vez com `cmon token set`;
-  3. credencial do Claude Code, se você estiver logado (zero atrito).
-Quando o access token expira, o cmon o renova sozinho via refresh_token e guarda
-a nova cadeia no cofre dele (não regrava a credencial do Claude Code). Se um
-CLAUDE_OAUTH_TOKEN velho devolver 401, o cmon renova e usa o novo mesmo assim.
+Source: private endpoint https://claude.ai/api/oauth/usage (same as the app uses).
+Token, resolved in order:
+  1. CLAUDE_OAUTH_TOKEN environment variable (useful in CI / override);
+  2. OS secure vault — Keychain (macOS), Credential Manager (Windows) or
+     Secret Service (Linux) —, saved once with `cmon token set`;
+  3. Claude Code credentials, if you're logged in (zero friction).
+When the access token expires, cmon automatically renews it via refresh_token and stores
+the new string in its vault (doesn't re-save Claude Code credentials). If an old
+CLAUDE_OAUTH_TOKEN returns 401, cmon refreshes and uses the new one anyway.
 
-  cmon now         # uso atual + tempo até o reset + ritmo/projeção
-  cmon collect     # grava 1 snapshot no banco (rode via cron a cada ~20min)
-  cmon report      # resumo do consumo acumulado
-  cmon plot        # gráficos seaborn -> PNG
-  cmon tips        # dicas de pacing p/ usar ~100% do semanal sem travar o 5h
-  cmon token set   # guarda o token no cofre seguro do SO (cross-platform)
+  cmon now         # current usage + time to reset + rate/projection
+  cmon collect     # save 1 snapshot to database (run via cron every ~20min)
+  cmon report      # summary of accumulated consumption
+  cmon plot        # seaborn charts -> PNG
+  cmon tips        # pacing tips to use ~100% of weekly without blocking 5h
+  cmon token set   # save token to OS secure vault (cross-platform)
 """
 
 import argparse
@@ -28,19 +28,19 @@ from datetime import UTC, datetime, timedelta
 
 DB = os.environ.get("CMON_DB", "usage.duckdb")
 URL = "https://claude.ai/api/oauth/usage"
-# UA obrigatório: sem ele o Cloudflare do claude.ai devolve 403 ("Just a moment").
+# UA is required: without it claude.ai's Cloudflare returns 403 ("Just a moment").
 UA = "claude-cli/1.0 (external, cli)"
 LABELS = {"session": "Current session", "weekly_all": "All models"}
-SERVICE, ACCOUNT = "cmon", "claude-oauth"  # entrada no cofre seguro do SO (token set manual)
-AUTO_ACCOUNT = "claude-oauth-auto"  # cadeia renovada pelo cmon, separada do Claude Code
+SERVICE, ACCOUNT = "cmon", "claude-oauth"  # entry in the OS secure vault (manual token set)
+AUTO_ACCOUNT = "claude-oauth-auto"  # chain refreshed by cmon, separate from Claude Code
 RETRIES = int(os.environ.get("CMON_RETRIES", "3"))
-DEDUP_SECS = int(os.environ.get("CMON_DEDUP_SECS", "60"))  # janela p/ deduplicar collect
-# OAuth do Claude Code — valores públicos do fluxo de login; usados só p/ renovar o token.
+DEDUP_SECS = int(os.environ.get("CMON_DEDUP_SECS", "60"))  # window to deduplicate collect
+# Claude Code OAuth — public values from login flow; used only for token renewal.
 OAUTH_CLIENT_ID = os.environ.get("CMON_OAUTH_CLIENT_ID", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
 OAUTH_TOKEN_URL = os.environ.get("CMON_OAUTH_TOKEN_URL", "https://console.anthropic.com/v1/oauth/token")
 
 
-try:  # orjson acelera ~2-3x o parse dos logs; json puro é o fallback.
+try:  # orjson speeds up log parsing ~2-3x; plain json is the fallback.
     import orjson
     _loads = orjson.loads
 except ImportError:
@@ -48,11 +48,11 @@ except ImportError:
 
 
 class FetchError(Exception):
-    """Falha ao consultar o endpoint de uso, com mensagem já legível ao usuário."""
+    """Failure to query the usage endpoint, with user-readable message."""
 
 
 def _keyring():
-    """Módulo keyring, ou None se ausente (dependência opcional em runtime)."""
+    """keyring module, or None if absent (optional runtime dependency)."""
     try:
         import keyring
         return keyring
@@ -61,8 +61,8 @@ def _keyring():
 
 
 def _claude_code_cred() -> dict | None:
-    """Blob claudeAiOauth do Claude Code, se logado: {accessToken, refreshToken, expiresAt}.
-    Cross-platform (arquivo no Linux/Windows, Keychain no macOS)."""
+    """Claude Code claudeAiOauth blob if logged in: {accessToken, refreshToken, expiresAt}.
+    Cross-platform (file on Linux/Windows, Keychain on macOS)."""
     path = os.path.expanduser("~/.claude/.credentials.json")  # Linux, Windows
     if os.path.exists(path):
         try:
@@ -70,7 +70,7 @@ def _claude_code_cred() -> dict | None:
                 return json.load(f)["claudeAiOauth"]
         except Exception:
             pass
-    if sys.platform == "darwin":  # macOS guarda no Keychain, não em arquivo
+    if sys.platform == "darwin":  # macOS stores in Keychain, not file
         try:
             blob = subprocess.run(
                 ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
@@ -82,8 +82,8 @@ def _claude_code_cred() -> dict | None:
 
 
 def _oauth_refresh(refresh_token: str) -> dict | None:
-    """Troca refresh_token por um access_token novo. Best-effort; None se falhar.
-    Só fala com o endpoint OAuth da Anthropic — não regrava a credencial do Claude Code."""
+    """Exchange refresh_token for a new access_token. Best-effort; None if it fails.
+    Only talks to Anthropic OAuth endpoint — doesn't re-save Claude Code credentials."""
     import time
 
     import requests
@@ -125,16 +125,16 @@ def _auto_save(blob: dict) -> None:
 
 
 def _auto_token() -> tuple[str | None, str | None]:
-    """(fonte, access_token) da cadeia auto-gerida: prefere a do cmon, senão bootstrapa
-    do Claude Code. Renova via refresh_token quando o access expira. (None, None) se nada."""
+    """(source, access_token) from self-managed chain: prefers cmon's, else bootstraps
+    from Claude Code. Renews via refresh_token when access expires. (None, None) if none."""
     import time
     blob, src = _auto_load(), "cmon auto-refresh"
     if not blob:
-        blob, src = _claude_code_cred(), "credencial do Claude Code"
+        blob, src = _claude_code_cred(), "Claude Code credentials"
     if not blob:
         return None, None
     exp = blob.get("expiresAt") or 0
-    if blob.get("accessToken") and time.time() * 1000 < exp - 60_000:  # 60s de folga
+    if blob.get("accessToken") and time.time() * 1000 < exp - 60_000:  # 60s buffer
         return src, blob["accessToken"]
     if rt := blob.get("refreshToken"):
         if new := _oauth_refresh(rt):
@@ -144,9 +144,9 @@ def _auto_token() -> tuple[str | None, str | None]:
 
 
 def _force_refresh() -> str | None:
-    """Força uma renovação (usada quando a API devolve 401). Devolve o novo access_token,
-    ou None. Renova a partir da cadeia do cmon ou, na falta, da credencial do Claude Code —
-    então funciona mesmo se um CLAUDE_OAUTH_TOKEN velho (env/.env) estiver sombreando tudo."""
+    """Force a refresh (used when API returns 401). Returns new access_token or None.
+    Refreshes from cmon's chain or, failing that, Claude Code credentials — so it works
+    even if an old CLAUDE_OAUTH_TOKEN (env/.env) is shadowing everything."""
     blob = _auto_load() or _claude_code_cred() or {}
     if rt := blob.get("refreshToken"):
         if new := _oauth_refresh(rt):
@@ -156,13 +156,13 @@ def _force_refresh() -> str | None:
 
 
 def _resolve_token() -> tuple[str | None, str | None]:
-    """(fonte, token) na ordem de precedência; (None, None) se nada for achado."""
+    """(source, token) in order of precedence; (None, None) if none found."""
     if tok := os.environ.get("CLAUDE_OAUTH_TOKEN"):
         return "env CLAUDE_OAUTH_TOKEN", tok
     if kr := _keyring():
         try:
             if tok := kr.get_password(SERVICE, ACCOUNT):
-                return f"cofre do SO ({kr.get_keyring().name})", tok
+                return f"OS vault ({kr.get_keyring().name})", tok
         except Exception:
             pass
     return _auto_token()
@@ -171,52 +171,52 @@ def _resolve_token() -> tuple[str | None, str | None]:
 def get_token() -> str:
     _src, tok = _resolve_token()
     if not tok:
-        sys.exit("Sem token. Rode 'cmon token set' para guardá-lo com segurança, "
-                 "defina CLAUDE_OAUTH_TOKEN, ou faça login no Claude Code.")
+        sys.exit("No token. Run 'cmon token set' to save it securely, "
+                 "set CLAUDE_OAUTH_TOKEN, or log in to Claude Code.")
     return tok
 
 
 def _mask(tok: str) -> str:
-    """Nunca imprime o token inteiro: só o prefixo e o sufixo."""
+    """Never print the full token: only prefix and suffix."""
     return f"{tok[:12]}…{tok[-4:]}" if len(tok) > 20 else "…"
 
 
 def token_set(_):
     kr = _keyring()
     if not kr:
-        sys.exit("Biblioteca 'keyring' ausente. Rode 'uv sync' para instalá-la.")
-    # stdin isatty → prompt oculto; senão lê de pipe (ex.: echo $TOK | cmon token set).
-    tok = (getpass.getpass("Cole o token OAuth (oculto): ") if sys.stdin.isatty()
+        sys.exit("'keyring' library missing. Run 'uv sync' to install it.")
+    # stdin isatty → hidden prompt; else read from pipe (e.g., echo $TOK | cmon token set).
+    tok = (getpass.getpass("Paste OAuth token (hidden): ") if sys.stdin.isatty()
            else sys.stdin.readline()).strip()
     if not tok:
-        sys.exit("Token vazio — nada foi guardado.")
+        sys.exit("Empty token — nothing saved.")
     try:
         kr.set_password(SERVICE, ACCOUNT, tok)
     except Exception as e:
-        sys.exit(f"Falha ao acessar o cofre do SO: {e}\n"
-                 "Em Linux headless instale um backend (ex.: gnome-keyring) "
-                 "ou use CLAUDE_OAUTH_TOKEN.")
-    print(f"✓ Token guardado no cofre do SO ({kr.get_keyring().name}).")
+        sys.exit(f"Failed to access OS vault: {e}\n"
+                 "On headless Linux install a backend (e.g., gnome-keyring) "
+                 "or use CLAUDE_OAUTH_TOKEN.")
+    print(f"✓ Token saved to OS vault ({kr.get_keyring().name}).")
 
 
 def token_status(_):
     src, tok = _resolve_token()
     if not tok:
-        print("Nenhum token disponível. Rode 'cmon token set'.")
+        print("No token available. Run 'cmon token set'.")
         return
-    print(f"Fonte : {src}\nToken : {_mask(tok)}")
-    if auto := _auto_load():  # cadeia renovada pelo cmon
+    print(f"Source: {src}\nToken : {_mask(tok)}")
+    if auto := _auto_load():  # chain renewed by cmon
         exp = auto.get("expiresAt")
         if exp:
             import time
             rem = (exp / 1000 - time.time()) / 3600
-            print(f"Auto  : renovado; expira em {rem:.1f}h" if rem > 0 else "Auto  : expirado (renova no próximo uso)")
+            print(f"Auto  : refreshed; expires in {rem:.1f}h" if rem > 0 else "Auto  : expired (renews on next use)")
 
 
 def token_clear(_):
     kr = _keyring()
     if not kr:
-        sys.exit("Biblioteca 'keyring' ausente. Rode 'uv sync' para instalá-la.")
+        sys.exit("'keyring' library missing. Run 'uv sync' to install it.")
     n = 0
     for acct in (ACCOUNT, AUTO_ACCOUNT):
         try:
@@ -224,11 +224,11 @@ def token_clear(_):
             n += 1
         except Exception:
             pass
-    print(f"Removido do cofre do SO ({n} entrada(s))." if n else "Nada havia guardado no cofre do SO.")
+    print(f"Removed from OS vault ({n} entry/entries)." if n else "Nothing was saved in OS vault.")
 
 
 def _retry_after(r) -> float | None:
-    """Segundos pedidos pelo header Retry-After (429/503), se numérico."""
+    """Seconds requested by Retry-After header (429/503), if numeric."""
     try:
         return float(r.headers.get("Retry-After") or "")
     except ValueError:
@@ -236,15 +236,15 @@ def _retry_after(r) -> float | None:
 
 
 def fetch(retries: int = RETRIES) -> dict:
-    """Consulta o endpoint de uso com retry/backoff. Levanta FetchError com
-    mensagem legível — 401/403 falham na hora (não adianta repetir); 429 e 5xx
-    e erros de rede tentam de novo com espera exponencial (respeitando Retry-After)."""
+    """Query usage endpoint with retry/backoff. Raises FetchError with user-readable message —
+    401/403 fail immediately (no point retrying); 429 and 5xx and network errors retry
+    with exponential backoff (respecting Retry-After)."""
     import time
 
     import requests
     last, override = "?", None
     for attempt in range(retries):
-        # override = token recém-renovado após um 401; vence até um CLAUDE_OAUTH_TOKEN velho.
+        # override = newly refreshed token after 401; overrides even old CLAUDE_OAUTH_TOKEN.
         headers = {"Authorization": f"Bearer {override or get_token()}",
                    "anthropic-beta": "oauth-2025-04-20", "User-Agent": UA}
         try:
@@ -253,25 +253,25 @@ def fetch(retries: int = RETRIES) -> dict:
                 if override is None and (new := _force_refresh()):
                     override = new
                     continue
-                raise FetchError("401 — token inválido ou expirado. Abra o Claude Code p/ "
-                                 "renovar, defina CLAUDE_OAUTH_TOKEN, ou rode 'cmon token set'.")
+                raise FetchError("401 — invalid or expired token. Open Claude Code to "
+                                 "refresh, set CLAUDE_OAUTH_TOKEN, or run 'cmon token set'.")
             if r.status_code == 403:
-                raise FetchError("403 — bloqueado (Cloudflare/User-Agent) ou sem "
-                                 "acesso. O endpoint privado pode ter mudado.")
+                raise FetchError("403 — blocked (Cloudflare/User-Agent) or no access. "
+                                 "The private endpoint may have changed.")
             if r.status_code == 429 or r.status_code >= 500:
                 last, wait = f"HTTP {r.status_code}", _retry_after(r) or 2 ** attempt
             else:
                 r.raise_for_status()
                 return r.json()
         except requests.RequestException as e:
-            last, wait = f"rede: {e}", 2 ** attempt
+            last, wait = f"network: {e}", 2 ** attempt
         if attempt < retries - 1:
             time.sleep(wait)
-    raise FetchError(f"Falha ao consultar {URL} após {retries} tentativas ({last}).")
+    raise FetchError(f"Failed to query {URL} after {retries} attempts ({last}).")
 
 
 def limits(data: dict) -> list[tuple]:
-    """Normaliza limits[] -> (key, label, percent, resets_at, is_active). key é estável p/ delta."""
+    """Normalize limits[] -> (key, label, percent, resets_at, is_active). key is stable for delta."""
     out = []
     for lim in data.get("limits", []):
         kind = lim["kind"]
@@ -283,7 +283,7 @@ def limits(data: dict) -> list[tuple]:
 
 
 def db(create: bool = True):
-    """Conexão DuckDB. create=False retorna None se o banco ainda não existe (não cria arquivo)."""
+    """DuckDB connection. create=False returns None if database doesn't yet exist (doesn't create file)."""
     if not create and not os.path.exists(DB):
         return None
     import duckdb
@@ -295,13 +295,13 @@ def db(create: bool = True):
 
 
 def deltas(con):
-    """delta = percent - snapshot anterior da mesma janela; delta<0 = reset (não é consumo)."""
+    """delta = percent - previous snapshot for same window; delta<0 = reset (not consumption)."""
     df = con.execute(
         "SELECT ts, key, label, percent, percent - lag(percent) "
         "OVER (PARTITION BY key ORDER BY ts) AS delta "
         "FROM snapshots ORDER BY ts").df()
     if df.empty:
-        sys.exit("Sem dados — rode 'cmon collect' algumas vezes primeiro.")
+        sys.exit("No data — run 'cmon collect' a few times first.")
     return df
 
 
@@ -315,22 +315,22 @@ def fmt_eta(iso: str | None) -> str:
         return "-"
     secs = (datetime.fromisoformat(iso) - datetime.now(UTC)).total_seconds()
     if secs < 0:
-        return "expirado"
+        return "expired"
     h, m = divmod(int(secs // 60), 60)
-    return f"{h}h {m}min" if h else f"{m}min"
+    return f"{h}h {m}m" if h else f"{m}m"
 
 
 def now(_):
     rows = limits(fetch())
-    print("Uso atual:")
+    print("Current usage:")
     for _k, lbl, pct, reset, _act in rows:
-        print(f"  {lbl:16} {bar(pct)} {pct:4.0f}%   reseta em {fmt_eta(reset):>9}")
+        print(f"  {lbl:16} {bar(pct)} {pct:4.0f}%   resets in {fmt_eta(reset):>9}")
 
     sess = next((r for r in rows if r[0] == "session"), None)
     if not sess:
         return
     _k, _lbl, pct, reset, _a = sess
-    print(f"\nJanela de 5h: {pct:.0f}% usada — expira em {fmt_eta(reset)}.")
+    print(f"\n5h window: {pct:.0f}% used — expires in {fmt_eta(reset)}.")
 
     con = db(create=False)
     if con is None:
@@ -344,19 +344,19 @@ def now(_):
     dt_h = (win.ts.iloc[-1] - win.ts.iloc[0]).total_seconds() / 3600
     dpct = win.percent.iloc[-1] - win.percent.iloc[0]
     if dt_h <= 0 or dpct <= 0:
-        print("Ritmo: sem consumo mensurável nesta janela.")
+        print("Rate: no measurable consumption in this window.")
         return
     rate = dpct / dt_h
     rem_h = (end - datetime.now(UTC)).total_seconds() / 3600
     proj = min(pct + rate * rem_h, 100)
-    print(f"Ritmo: {rate:.1f}%/h → projeção no reset: {proj:.0f}%.")
+    print(f"Rate: {rate:.1f}%/h → projection at reset: {proj:.0f}%.")
     if pct < 100:
         to100 = (100 - pct) / rate
         if to100 < rem_h:
-            print(f"⚠ No ritmo atual você atinge 100% em ~{to100:.1f}h, antes do reset.")
+            print(f"⚠ At current rate you'll hit 100% in ~{to100:.1f}h, before reset.")
 
     for m in _alerts(rows, con):
-        if not m.startswith("Current session"):  # 5h já coberta acima
+        if not m.startswith("Current session"):  # 5h already covered above
             print(f"⚠ {m}")
 
 
@@ -367,23 +367,23 @@ def collect(args):
         recent = con.execute("SELECT count(*) FROM snapshots WHERE ts > ?",
                              [ts - timedelta(seconds=DEDUP_SECS)]).fetchone()[0]
         if recent:
-            print(f"Snapshot há <{DEDUP_SECS}s — pulado (use --force p/ gravar assim mesmo).")
+            print(f"Snapshot <{DEDUP_SECS}s ago — skipped (use --force to save anyway).")
             return
     rows = limits(fetch())
     con.executemany("INSERT INTO snapshots VALUES (?,?,?,?,?,?)",
                     [[ts, k, lbl, pct, reset, act] for k, lbl, pct, reset, act in rows])
     _write_cache(rows, ts)
-    print(f"{ts:%Y-%m-%d %H:%M} coletado:")
+    print(f"{ts:%Y-%m-%d %H:%M} collected:")
     for _k, lbl, pct, reset, _a in rows:
         print(f"  {lbl:16} {pct:4.0f}%  reset {reset[:16] if reset else '-'}")
     if getattr(args, "alert", False):
         for m in _alerts(rows, con):
             print(f"⚠ {m}", file=sys.stderr)
-            _notify("cmon — limite Claude", m)
+            _notify("cmon — Claude limit", m)
 
 
 def _parse_since(s: str | None):
-    """'24h', '7d' ou uma data/hora ISO -> datetime UTC. None se vazio ou 'all' (tudo)."""
+    """'24h', '7d' or ISO date/time -> datetime UTC. None if empty or 'all' (everything)."""
     if not s:
         return None
     s = s.strip().lower()
@@ -404,7 +404,7 @@ def report(args):
     if since is not None:
         df = df[df.ts >= since]
         if df.empty:
-            sys.exit(f"Sem dados desde {since:%Y-%m-%d %H:%M} UTC.")
+            sys.exit(f"No data since {since:%Y-%m-%d %H:%M} UTC.")
     g = df.groupby("label").agg(
         snapshots=("percent", "size"),
         pico_pct=("percent", "max"),
@@ -416,7 +416,7 @@ def report(args):
 
 
 def _open_file(path):
-    """Abre o arquivo no app padrão do SO (best-effort; silencioso se falhar)."""
+    """Open file in OS default app (best-effort; silent if it fails)."""
     try:
         if sys.platform == "darwin":
             subprocess.run(["open", path], check=False)
@@ -433,8 +433,8 @@ def plot(args):
         import matplotlib.pyplot as plt
         import seaborn as sns
     except ImportError:
-        sys.exit("Os gráficos precisam dos extras de plot. Instale com:\n"
-                 "  uv sync --extra plot         (no repositório)\n"
+        sys.exit("Plots need plot extras. Install with:\n"
+                 "  uv sync --extra plot         (in repo)\n"
                  "  pip install 'cmon[plot]'     (via PyPI)")
     df = deltas(db())
     df["hora"], df["dia"] = df.ts.dt.hour, df.ts.dt.day_name()
@@ -445,27 +445,27 @@ def plot(args):
     sns.lineplot(df, x="ts", y="percent", hue="label", marker="o", ax=ax[0])
     sns.barplot(b, x="hora", y="delta", hue="label", estimator="sum", errorbar=None, ax=ax[1])
     sns.barplot(b, x="dia", y="delta", hue="label", estimator="sum", errorbar=None, order=dias, ax=ax[2])
-    titulos = ["Usage (%) over time", "Consumption by hour of day", "Consumption by day of week"]
-    for a, t in zip(ax, titulos, strict=True):
+    titles = ["Usage (%) over time", "Consumption by hour of day", "Consumption by day of week"]
+    for a, t in zip(ax, titles, strict=True):
         a.set_title(t)
         a.set_xlabel("")
     fig.tight_layout()
     out = args.out or f"usage_{datetime.now():%y%m%d_%H%M%S}.png"
     fig.savefig(out, dpi=150)
-    print(f"{out} salvo")
+    print(f"{out} saved")
     _open_file(out)
 
 
 def _rate(con, key) -> float | None:
-    """%/h observado na janela atual. Corta no último reset (queda de percent),
-    então adapta-se sozinho a janelas de 5h, 7d ou o que a API usar."""
+    """%/h observed in current window. Cuts at last reset (percent drop),
+    so it self-adapts to 5h, 7d windows or whatever the API uses."""
     if con is None:
         return None
     df = con.execute("SELECT ts, percent FROM snapshots WHERE key=? ORDER BY ts", [key]).df()
     if len(df) < 2:
         return None
     drops = [i for i in range(1, len(df)) if df.percent.iloc[i] < df.percent.iloc[i - 1]]
-    seg = df.iloc[drops[-1]:] if drops else df  # só o trecho depois do último reset
+    seg = df.iloc[drops[-1]:] if drops else df  # only segment after last reset
     if len(seg) < 2:
         return None
     dt_h = (seg.ts.iloc[-1] - seg.ts.iloc[0]).total_seconds() / 3600
@@ -474,8 +474,8 @@ def _rate(con, key) -> float | None:
 
 
 def _alerts(rows, con) -> list[str]:
-    """Avisa quando, no ritmo atual, uma janela bate 100% antes do reset.
-    Precisa de histórico (via _rate); sem banco/ritmo não gera nada."""
+    """Alert when, at current rate, a window hits 100% before reset.
+    Needs history (via _rate); without database/rate produces nothing."""
     now_utc = datetime.now(UTC)
     msgs = []
     for key, lbl, pct, reset, _a in rows:
@@ -489,14 +489,14 @@ def _alerts(rows, con) -> list[str]:
             continue
         eta = (100 - pct) / rate
         if eta < rem_h:
-            msgs.append(f"{lbl}: no ritmo de {rate:.1f}%/h bate 100% em ~{eta:.1f}h "
-                        f"(~{rem_h - eta:.1f}h antes do reset).")
+            msgs.append(f"{lbl}: at rate {rate:.1f}%/h hits 100% in ~{eta:.1f}h "
+                        f"(~{rem_h - eta:.1f}h before reset).")
     return msgs
 
 
 def _notify(title: str, body: str) -> None:
-    """Notificação nativa best-effort (osascript no macOS, notify-send no Linux).
-    Silenciosa se a ferramenta não existir — nunca derruba o comando."""
+    """Native notification best-effort (osascript on macOS, notify-send on Linux).
+    Silent if tool doesn't exist — never crashes the command."""
     import shutil
     try:
         if sys.platform == "darwin":
@@ -511,19 +511,19 @@ def _notify(title: str, body: str) -> None:
 
 
 def _ai_tip(summary: str) -> str | None:
-    """Passa os números pro Claude (sonnet, barato) e devolve 3 dicas. None se indisponível."""
+    """Pass numbers to Claude (sonnet, cheap) and return 3 tips. None if unavailable."""
     import shutil
     if not shutil.which("claude"):
         return None
     prompt = (
-        "Você otimiza o uso de um plano Claude. Estado atual:\n" + summary +
-        "\n\nObjetivo do usuário: chegar perto de 100% do limite SEMANAL no reset — "
-        "sem esgotar antes e sem estourar a janela de 5h (que trava o uso).\n"
-        "Dê no máximo 3 dicas de 1 linha, acionáveis, priorizando: pacing "
-        "(acelerar se sobra folga / frear se vai faltar), troca de modelo (Haiku "
-        "barato p/ tarefas simples, Sonnet p/ código, Opus só p/ difícil) e horário "
-        "(pico 8h–14h ET nos dias úteis drena o 5h mais rápido). Sem preâmbulo, sem "
-        "markdown. Use SÓ os números acima — não invente ritmos ou projeções ausentes."
+        "You optimize Claude plan usage. Current state:\n" + summary +
+        "\n\nUser goal: get close to 100% of WEEKLY limit at reset — "
+        "without running out early and without hitting 5h window (which blocks usage).\n"
+        "Give max 3 one-line, actionable tips, prioritizing: pacing "
+        "(speed up if buffer remains / slow down if you'll run out), model swap (Haiku "
+        "cheap for simple tasks, Sonnet for code, Opus only for hard) and timing "
+        "(peak 8h–14h ET on weekdays drains 5h faster). No preamble, no markdown. "
+        "Use ONLY numbers above — don't invent missing rates or projections."
     )
     try:
         r = subprocess.run(["claude", "-p", prompt, "--model", "sonnet"],
@@ -534,43 +534,43 @@ def _ai_tip(summary: str) -> str | None:
 
 
 def _window_tips(lbl: str, pct: float, reset: str | None, rate: float | None, now_utc):
-    """Bloco determinístico de pacing p/ uma janela. Devolve (linhas_impressas, linha_resumo)."""
+    """Deterministic pacing block for a window. Returns (printed_lines, summary_line)."""
     if not reset:
-        return [f"{lbl}: {pct:.0f}% usado."], f"- {lbl}: {pct:.0f}% usado"
+        return [f"{lbl}: {pct:.0f}% used."], f"- {lbl}: {pct:.0f}% used"
     rem_h = (datetime.fromisoformat(reset) - now_utc).total_seconds() / 3600
     if rem_h <= 0:
-        return [f"{lbl}: {pct:.0f}% usado, resetando agora."], f"- {lbl}: {pct:.0f}%, reset iminente"
-    tgt = (100 - pct) / rem_h  # %/h p/ chegar exatamente a 100 no reset
-    out = [f"{lbl}: {pct:.0f}% usado · reseta em {fmt_eta(reset)} · alvo p/ zerar folga {tgt:.2f}%/h"]
-    summ = f"- {lbl}: {pct:.0f}% usado, reseta em {fmt_eta(reset)}, alvo {tgt:.2f}%/h"
+        return [f"{lbl}: {pct:.0f}% used, resetting now."], f"- {lbl}: {pct:.0f}%, reset imminent"
+    tgt = (100 - pct) / rem_h  # %/h to hit exactly 100 at reset
+    out = [f"{lbl}: {pct:.0f}% used · resets in {fmt_eta(reset)} · target to clear buffer {tgt:.2f}%/h"]
+    summ = f"- {lbl}: {pct:.0f}% used, resets in {fmt_eta(reset)}, target {tgt:.2f}%/h"
     if rate is None:
-        out.append("  (sem ritmo ainda — rode 'cmon collect' mais vezes)")
+        out.append("  (no rate yet — run 'cmon collect' more times)")
         return out, summ
     proj = pct + rate * rem_h
-    summ += f", ritmo {rate:.2f}%/h, projeção {min(proj, 999):.0f}%"
-    out.append(f"  ritmo atual {rate:.2f}%/h → projeção no reset ~{min(proj, 999):.0f}%")
+    summ += f", rate {rate:.2f}%/h, projection {min(proj, 999):.0f}%"
+    out.append(f"  current rate {rate:.2f}%/h → projection at reset ~{min(proj, 999):.0f}%")
     if proj < 97:
         gap = tgt - rate
         extra = f" (~+{gap:.2f}%/h)" if gap > 0 else ""
-        out.append(f"  ↑ upside: ~{100 - proj:.0f}% ficariam na mesa — dá p/ intensificar{extra} "
-                   "ou usar modelo mais forte")
+        out.append(f"  ↑ upside: ~{100 - proj:.0f}% left on table — can intensify{extra} "
+                   "or use stronger model")
     elif proj > 103:
         eta = (100 - pct) / rate
-        out.append(f"  ⚠ vai faltar: bate 100% em ~{eta:.0f}h ({rem_h - eta:.0f}h antes do reset) — "
-                   f"freie p/ ~{tgt:.2f}%/h ou troque p/ modelo mais barato")
+        out.append(f"  ⚠ won't make it: hits 100% in ~{eta:.0f}h ({rem_h - eta:.0f}h before reset) — "
+                   f"slow to ~{tgt:.2f}%/h or switch to cheaper model")
     else:
-        out.append("  ✓ no ritmo certo p/ chegar perto de 100% no reset")
+        out.append("  ✓ on track to hit close to 100% at reset")
     return out, summ
 
 
 def tips(args):
     rows = limits(fetch())
-    con = db()  # writable: _rate + mix de modelos dos logs
+    con = db()  # writable: _rate + model mix from logs
     now_utc = datetime.now(UTC)
-    print("cmon tips — usar ~100% do semanal sem faltar nem travar a janela de 5h.\n")
+    print("cmon tips — use ~100% of weekly without running out or blocking 5h window.\n")
 
     summaries = []
-    for key, want in (("weekly_all", "Semanal (All models)"), ("session", "Janela 5h")):
+    for key, want in (("weekly_all", "Weekly (All models)"), ("session", "5h window")):
         row = next((r for r in rows if r[0] == key), None)
         if not row:
             continue
@@ -579,18 +579,18 @@ def tips(args):
         print("\n".join(block) + "\n")
         summaries.append(summ)
 
-    # modelos escopados (ex.: Fable/Opus) entram só no resumo pra IA sugerir troca
+    # scoped models (e.g., Fable/Opus) go only in summary so AI can suggest swap
     for key, lbl, pct, reset, _a in rows:
         if key not in ("weekly_all", "session"):
-            summaries.append(f"- {lbl}: {pct:.0f}% usado, reseta em {fmt_eta(reset)}")
+            summaries.append(f"- {lbl}: {pct:.0f}% used, resets in {fmt_eta(reset)}")
 
-    # mix real de modelos nas últimas 5h (dos logs) — aterra a dica de troca de modelo
+    # real model mix in last 5h (from logs) — grounds model swap advice
     win = now_utc - timedelta(hours=5)
     scan_logs(con, since=win, quiet=True)
     bs = _burn_summary(_burn_rows(con, win))
     if bs:
         tok, cost, mix = bs
-        line = f"Mix de modelos (últimas 5h): {tok / 1e6:.2f}M tok · US$ {cost:.2f} · {mix}"
+        line = f"Model mix (last 5h): {tok / 1e6:.2f}M tok · US$ {cost:.2f} · {mix}"
         print(line + "\n")
         summaries.append("- " + line)
 
@@ -598,22 +598,22 @@ def tips(args):
         return
     tip = _ai_tip("\n".join(summaries))
     if tip:
-        print("Dicas (Claude Sonnet):\n" + tip)
+        print("Tips (Claude Sonnet):\n" + tip)
     else:
-        print("(Dica IA indisponível — 'claude' não encontrado no PATH. Use --no-ai p/ silenciar.)")
+        print("(AI tip unavailable — 'claude' not found in PATH. Use --no-ai to silence.)")
 
 
 def _eta_short(iso: str | None) -> str:
-    """fmt_eta compacto p/ statusline: '3h 31min' -> '3h31m'."""
+    """Compact fmt_eta for statusline: '3h 31m' -> '3h31m'."""
     e = fmt_eta(iso)
-    return e.replace(" ", "").replace("min", "m") if e not in ("-", "expirado") else e
+    return e.replace(" ", "") if e not in ("-", "expired") else e
 
 
-CACHE = os.path.expanduser("~/.cmon/status.json")  # fixo: statusline roda de qualquer cwd
+CACHE = os.path.expanduser("~/.cmon/status.json")  # fixed: statusline runs from any cwd
 
 
 def _write_cache(rows, ts) -> None:
-    """Grava o último snapshot num cache leve p/ o 'status' ler sem rede/DuckDB."""
+    """Save latest snapshot to lightweight cache for 'status' to read without network/DuckDB."""
     try:
         os.makedirs(os.path.dirname(CACHE), exist_ok=True)
         with open(CACHE, "w", encoding="utf-8") as f:
@@ -623,7 +623,7 @@ def _write_cache(rows, ts) -> None:
 
 
 def _read_cache():
-    """(rows, idade_s) do cache JSON, ou None se ausente/ilegível."""
+    """(rows, age_s) from JSON cache, or None if absent/unreadable."""
     if not os.path.exists(CACHE):
         return None
     try:
@@ -636,7 +636,7 @@ def _read_cache():
 
 
 def _rows_from_db():
-    """(rows, idade_s) do último snapshot no banco, ou None se não houver."""
+    """(rows, age_s) from latest snapshot in database, or None if none."""
     con = db(create=False)
     if con is None:
         return None
@@ -651,8 +651,8 @@ def _rows_from_db():
 
 
 def status(args):
-    """Linha única p/ statusline/tmux/prompt. Por padrão lê o cache local (rápido,
-    ~sub-20ms, sem rede) alimentado pelo 'collect'; --live força a API."""
+    """Single line for statusline/tmux/prompt. By default reads local cache (fast,
+    ~sub-20ms, no network) fed by 'collect'; --live forces API."""
     age = None
     if args.live:
         try:
@@ -666,26 +666,26 @@ def status(args):
             rows, age = got
         else:
             try:
-                rows = limits(fetch())  # sem cache nem banco ainda: cai pra API
+                rows = limits(fetch())  # no cache or db yet: fall back to API
             except FetchError:
                 print("cmon offline")
                 return
     parts = []
-    for key, short in (("session", "5h"), ("weekly_all", "sem")):
+    for key, short in (("session", "5h"), ("weekly_all", "wk")):
         r = next((x for x in rows if x[0] == key), None)
         if r:
             parts.append(f"{short} {r[2]:.0f}%")
     sess = next((x for x in rows if x[0] == "session"), None)
     if sess and sess[3]:
         parts.append(f"reset {_eta_short(sess[3])}")
-    if age is not None and age > 1800:  # dado velho: sinaliza sem poluir
-        parts.append(f"há {age / 60:.0f}m")
+    if age is not None and age > 1800:  # stale data: signal without noise
+        parts.append(f"{age / 60:.0f}m ago")
     print(" · ".join(parts))
 
 
 def wait(args):
-    """Bloqueia até a janela resetar (padrão) ou atingir --at N%, e notifica.
-    Ctrl-C cancela. Poll a cada --interval s; no modo reset dorme até resets_at."""
+    """Block until window resets (default) or hits --at N%, then notify.
+    Ctrl-C cancels. Poll every --interval s; in reset mode sleep until resets_at."""
     import time
     key = args.window
 
@@ -695,43 +695,43 @@ def wait(args):
     try:
         row = get()
         if not row:
-            sys.exit(f"Janela '{key}' não encontrada no endpoint.")
+            sys.exit(f"Window '{key}' not found on endpoint.")
         _k, lbl, pct0, reset, _a = row
 
         if args.at is not None:
-            print(f"Aguardando {lbl} atingir {args.at}% (atual {pct0:.0f}%)… Ctrl-C sai.")
+            print(f"Waiting for {lbl} to hit {args.at}% (current {pct0:.0f}%)… Ctrl-C quits.")
             while True:
                 r = get()
                 if r and r[2] >= args.at:
-                    msg = f"{lbl} atingiu {r[2]:.0f}% (limiar {args.at}%)."
+                    msg = f"{lbl} hit {r[2]:.0f}% (threshold {args.at}%)."
                     print(msg)
-                    _notify("cmon — limiar atingido", msg)
+                    _notify("cmon — threshold reached", msg)
                     return
                 time.sleep(args.interval)
 
         if not reset:
-            sys.exit(f"{lbl} não tem reset agendado — nada a aguardar.")
+            sys.exit(f"{lbl} has no scheduled reset — nothing to wait for.")
         target = datetime.fromisoformat(reset)
-        print(f"Aguardando {lbl} resetar (~{fmt_eta(reset)}, {pct0:.0f}% usado agora)… Ctrl-C sai.")
+        print(f"Waiting for {lbl} to reset (~{fmt_eta(reset)}, {pct0:.0f}% used now)… Ctrl-C quits.")
         while True:
             now_utc = datetime.now(UTC)
             if now_utc >= target:
                 r = get()
                 if r is None or r[2] < pct0 or r[3] != reset:
-                    msg = f"{lbl} resetou — pode retomar."
+                    msg = f"{lbl} reset — you can resume."
                     print(msg)
-                    _notify("cmon — janela liberada", msg)
+                    _notify("cmon — window released", msg)
                     return
-                time.sleep(min(args.interval, 30))  # reset ainda não refletido; re-checa
+                time.sleep(min(args.interval, 30))  # reset not yet reflected; re-check
             else:
                 time.sleep(min((target - now_utc).total_seconds(), args.interval))
     except KeyboardInterrupt:
-        print("\ncancelado.")
+        print("\ncanceled.")
 
 
 def _cycles(con, key: str) -> list:
-    """Segmenta os snapshots de uma janela em ciclos, cortando em cada reset
-    (queda de percent). Devolve lista de DataFrames (ts, percent)."""
+    """Segment snapshots for a window into cycles, cutting at each reset
+    (percent drop). Returns list of DataFrames (ts, percent)."""
     if con is None:
         return []
     df = con.execute("SELECT ts, percent FROM snapshots WHERE key=? ORDER BY ts", [key]).df()
@@ -747,33 +747,33 @@ def _cycles(con, key: str) -> list:
 
 
 def trends(args):
-    """Consumo por ciclo (reset-aware): pico de cada ciclo, delta vs. anterior e
-    aviso de anomalia se o ciclo atual destoa da média dos anteriores."""
+    """Consumption per cycle (reset-aware): peak per cycle, delta vs. previous, and
+    anomaly alert if current cycle differs from average of previous ones."""
     con = db(create=False)
     if con is None:
-        sys.exit("Sem histórico — rode 'cmon collect' algumas vezes primeiro.")
-    for key, lbl in (("weekly_all", "Semanal (All models)"), ("session", "Janela 5h")):
+        sys.exit("No history — run 'cmon collect' a few times first.")
+    for key, lbl in (("weekly_all", "Weekly (All models)"), ("session", "5h window")):
         segs = _cycles(con, key)
         if not segs:
             continue
         peaks = [float(s.percent.max()) for s in segs]
-        print(f"\n{lbl} — {len(segs)} ciclo(s):")
+        print(f"\n{lbl} — {len(segs)} cycle(s):")
         for i in range(max(0, len(segs) - 5), len(segs)):
             ini = segs[i].ts.iloc[0]
             d = peaks[i] - peaks[i - 1] if i > 0 else None
-            delta = f"  ({'+' if d >= 0 else ''}{d:.0f} vs anterior)" if d is not None else ""
-            print(f"  {ini:%Y-%m-%d %H:%M}  pico {peaks[i]:.0f}%{delta}")
+            delta = f"  ({'+' if d >= 0 else ''}{d:.0f} vs previous)" if d is not None else ""
+            print(f"  {ini:%Y-%m-%d %H:%M}  peak {peaks[i]:.0f}%{delta}")
         if len(peaks) >= 3:
             prev = peaks[:-1]
             avg = sum(prev) / len(prev)
             if avg > 0 and peaks[-1] > avg * 1.2:
-                print(f"  ⚠ ciclo atual {peaks[-1]:.0f}% vs média {avg:.0f}% (+{peaks[-1] / avg * 100 - 100:.0f}%)")
+                print(f"  ⚠ current cycle {peaks[-1]:.0f}% vs avg {avg:.0f}% (+{peaks[-1] / avg * 100 - 100:.0f}%)")
 
 
-# --- Camada de logs: minera ~/.claude/projects/**/*.jsonl p/ tokens & custo ---
+# --- Logs layer: mines ~/.claude/projects/**/*.jsonl for tokens & cost ---
 LOGS_ROOT = os.path.expanduser("~/.claude/projects")
-# US$ por milhão de tokens: (input, output, cache_read, cache_write). Estimativa — ajuste aqui.
-# cache_read ≈ 0.1× input; cache_write = 2× input (TTL 1h, que é o que o Claude Code usa).
+# USD per million tokens: (input, output, cache_read, cache_write). Estimate — adjust here.
+# cache_read ≈ 0.1× input; cache_write = 2× input (1h TTL, what Claude Code uses).
 PRICES = {
     "fable":  (10.0, 50.0, 1.00, 20.0),
     "opus":   (5.0, 25.0, 0.50, 10.0),
@@ -799,7 +799,7 @@ def _short_model(model: str) -> str:
 
 
 SURFACE = {"cli": "terminal", "claude-vscode": "vscode", "claude-desktop": "app (desktop)",
-           "sdk-cli": "sdk (-p/agente)"}
+           "sdk-cli": "sdk (-p/agent)"}
 
 
 def _surface(entrypoint: str) -> str:
@@ -807,17 +807,17 @@ def _surface(entrypoint: str) -> str:
 
 
 def _parse_jsonl(path: str):
-    """Extrai as mensagens do assistant com usage de um transcript JSONL.
-    Só faz json.loads em linhas que contêm '"usage"' — o resto (user/tool) é pulado barato."""
+    """Extract assistant messages with usage from JSONL transcript.
+    Only json.loads lines containing '"usage"' — rest (user/tool) skipped cheaply."""
     proj_fallback = os.path.basename(os.path.dirname(path))
     out = []
     try:
-        f = open(path, "rb")  # binário + orjson: parse mais rápido
+        f = open(path, "rb")  # binary + orjson: faster parse
     except OSError:
         return out
     with f:
         for line in f:
-            if b'"usage"' not in line:  # pré-filtro: evita parsear a maioria das linhas
+            if b'"usage"' not in line:  # pre-filter: avoids parsing most lines
                 continue
             try:
                 o = _loads(line)
@@ -846,15 +846,15 @@ def _parse_jsonl(path: str):
 
 
 def scan_logs(con, since=None, quiet: bool = False) -> None:
-    """Varredura incremental dos JSONL -> tabela token_log. Cacheia por (mtime,size),
-    deduplica por uuid; com `since` pula arquivos mais antigos que a janela. O parse
-    dos arquivos novos roda em paralelo (multicore)."""
+    """Incremental scan of JSONL -> token_log table. Caches by (mtime,size),
+    deduplicates by uuid; with `since` skips files older than the window. Parse
+    of new files runs in parallel (multicore)."""
     import glob
-    # Migração: se a token_log é de um schema antigo (sem entrypoint), reconstrói — é cache.
+    # Migration: if token_log has old schema (no entrypoint), rebuild — it's cache.
     try:
         cols = [r[1] for r in con.execute("PRAGMA table_info('token_log')").fetchall()]
     except Exception:
-        cols = []  # tabela ainda não existe (banco novo)
+        cols = []  # table doesn't exist yet (new database)
     if cols and "entrypoint" not in cols:
         con.execute("DROP TABLE token_log")
         con.execute("DROP TABLE IF EXISTS scanned")
@@ -874,18 +874,18 @@ def scan_logs(con, since=None, quiet: bool = False) -> None:
         if seen.get(f) == (st.st_mtime, st.st_size):
             continue
         if since_epoch and st.st_mtime < since_epoch:
-            continue  # fora da janela; não marca como scanned p/ uma varredura futura pegar
+            continue  # outside window; don't mark as scanned so future scan picks it up
         todo.append((f, st))
     if not todo:
         return
     if not quiet:
-        print(f"varrendo {len(todo)} arquivo(s) de log…", file=sys.stderr)
+        print(f"scanning {len(todo)} log file(s)…", file=sys.stderr)
     import pandas as pd
-    parsed = _parse_many([f for f, _ in todo])  # paralelo (com fallback serial)
+    parsed = _parse_many([f for f, _ in todo])  # parallel (with serial fallback)
     rows = [r for chunk in parsed for r in chunk]
     if rows:
-        # Insert vetorizado via DataFrame: ~680x mais rápido que executemany+ON CONFLICT.
-        # drop_duplicates resolve uuids repetidos dentro do lote (transcripts espelhados).
+        # Vectorized insert via DataFrame: ~680x faster than executemany+ON CONFLICT.
+        # drop_duplicates resolves duplicate uuids within batch (mirrored transcripts).
         tdf = pd.DataFrame(rows, columns=["uuid", "ts", "model", "entrypoint", "project",
                                           "session", "in_tok", "out_tok", "cache_read",
                                           "cache_create"]).drop_duplicates("uuid")
@@ -901,8 +901,8 @@ def scan_logs(con, since=None, quiet: bool = False) -> None:
 
 
 def _parse_many(paths: list) -> list:
-    """Parseia vários JSONL em paralelo (ProcessPool). Cai p/ serial se o pool falhar
-    ou se forem poucos arquivos (overhead de spawn não compensa)."""
+    """Parse multiple JSONL in parallel (ProcessPool). Falls back to serial if pool fails
+    or if there are few files (spawn overhead doesn't pay off)."""
     if len(paths) < 8:
         return [_parse_jsonl(p) for p in paths]
     try:
@@ -915,7 +915,7 @@ def _parse_many(paths: list) -> list:
 
 
 def _burn_rows(con, since):
-    """Tokens por (janela, modelo) desde `since`, já com custo estimado por linha."""
+    """Tokens by (window, model) since `since`, already with estimated cost per row."""
     where = "WHERE ts >= ?" if since else ""
     df = con.execute(
         f"SELECT model, sum(in_tok) i, sum(out_tok) o, sum(cache_read) r, sum(cache_create) c "
@@ -924,7 +924,7 @@ def _burn_rows(con, since):
 
 
 def _burn_summary(df):
-    """(tokens_total, custo_usd, 'Opus 80% · Sonnet 20%') a partir de _burn_rows, ou None."""
+    """(tokens_total, cost_usd, 'Opus 80% · Sonnet 20%') from _burn_rows, or None."""
     if df.empty:
         return None
     tok, cost, bym = 0, 0.0, {}
@@ -939,7 +939,7 @@ def _burn_summary(df):
 
 
 def burn(args):
-    """Relatório de tokens & US$ estimado a partir dos logs locais do Claude Code."""
+    """Report tokens & estimated US$ from local Claude Code logs."""
     con = db()
     since = _parse_since(getattr(args, "since", None))
     scan_logs(con, since)
@@ -950,7 +950,7 @@ def burn(args):
         f"SELECT {col} grp, model, sum(in_tok) i, sum(out_tok) o, sum(cache_read) r, sum(cache_create) c "
         f"FROM token_log {where} GROUP BY grp, model", [since] if since else []).df()
     if df.empty:
-        sys.exit("Sem dados de log do Claude Code no período.")
+        sys.exit("No Claude Code log data in period.")
     df["custo"] = [
         (row.i * _price(row.model)[0] + row.o * _price(row.model)[1]
          + row.r * _price(row.model)[2] + row.c * _price(row.model)[3]) / 1e6
@@ -961,17 +961,17 @@ def burn(args):
     if getattr(args, "json", False):
         print(g.to_json(orient="records", force_ascii=False))
         return
-    per = {"model": "modelo", "surface": "cliente", "day": "dia",
-           "project": "projeto", "session": "sessão"}[args.by]
-    janela = f" desde {since:%Y-%m-%d %H:%M} UTC" if since else ""
-    print(f"Consumo por {per}{janela} (equivalente na API):")
+    per = {"model": "model", "surface": "surface", "day": "day",
+           "project": "project", "session": "session"}[args.by]
+    window = f" since {since:%Y-%m-%d %H:%M} UTC" if since else ""
+    print(f"Consumption by {per}{window} (API equivalent):")
     for row in g.itertuples():
         label = _surface(row.grp) if args.by == "surface" else str(row.grp)
         print(f"  {label:24} {row.tok / 1e6:9.1f}M tok   US$ {row.custo:9.2f}")
     total_c = g.custo.sum()
     print(f"  {'TOTAL':24} {g.tok.sum() / 1e6:9.1f}M tok   US$ {total_c:9.2f}")
 
-    # Breakdown por componente: cache read costuma dominar (releitura de contexto).
+    # Breakdown by component: cache read usually dominates (context re-reading).
     comp = {"input": (0, 0.0, 0), "output": (0, 0.0, 1),
             "cache read": (0, 0.0, 2), "cache write": (0, 0.0, 3)}
     tok_by = {"input": "i", "output": "o", "cache read": "r", "cache write": "c"}
@@ -983,20 +983,20 @@ def burn(args):
         ccost["output"] += row.o * p[1] / 1e6
         ccost["cache read"] += row.r * p[2] / 1e6
         ccost["cache write"] += row.c * p[3] / 1e6
-    print("\nPor componente:")
+    print("\nBy component:")
     for k in ("input", "output", "cache read", "cache write"):
         pct = ccost[k] / total_c * 100 if total_c else 0
         print(f"  {k:12} {ctok[k] / 1e6:9.1f}M tok   US$ {ccost[k]:9.2f}   {pct:4.0f}%")
     real = ccost["input"] + ccost["output"]
     cache = ccost["cache read"] + ccost["cache write"]
-    print(f"\n→ Trabalho real (input+output): US$ {real:.0f} · Cache (releitura de contexto): US$ {cache:.0f}")
-    print("\nCusto EQUIVALENTE na API (pay-per-token) — você paga a assinatura, não isso.")
-    print("Estimativa; só uso do Claude Code CLI (não inclui claude.ai web/desktop).")
+    print(f"\n→ Real work (input+output): US$ {real:.0f} · Cache (context re-reading): US$ {cache:.0f}")
+    print("\nAPI EQUIVALENT cost (pay-per-token) — you pay subscription, not this.")
+    print("Estimate; Claude Code CLI usage only (doesn't include claude.ai web/desktop).")
 
 
 def watch(args):
-    """TUI ao vivo: re-consulta o uso a cada N segundos e redesenha. Ctrl-C sai.
-    Com --collect, grava cada leitura no banco (respeitando o dedup)."""
+    """Live TUI: re-queries usage every N seconds and redraws. Ctrl-C quits.
+    With --collect, saves each read to database (respecting dedup)."""
     import time
 
     from rich.console import Console, Group
@@ -1005,7 +1005,7 @@ def watch(args):
     from rich.table import Table
     from rich.text import Text
 
-    con = db()  # writable: usado p/ snapshots (--collect), _rate e burn dos logs
+    con = db()  # writable: used for snapshots (--collect), _rate and burn from logs
 
     def color(pct: float) -> str:
         return "red" if pct >= 90 else "yellow" if pct >= 70 else "green"
@@ -1014,8 +1014,8 @@ def watch(args):
         try:
             rows = limits(fetch())
         except FetchError as e:
-            return Panel(Text(f"{e}\nnova tentativa em {args.interval}s", style="red"),
-                         title="cmon watch — erro", border_style="red")
+            return Panel(Text(f"{e}\nretrying in {args.interval}s", style="red"),
+                         title="cmon watch — error", border_style="red")
         if args.collect:
             ts = datetime.now(UTC)
             recent = con.execute("SELECT count(*) FROM snapshots WHERE ts > ?",
@@ -1025,12 +1025,12 @@ def watch(args):
                                 [[ts, k, lbl, pct, reset, act] for k, lbl, pct, reset, act in rows])
         now_utc = datetime.now(UTC)
         t = Table(expand=True, header_style="bold")
-        t.add_column("Janela")
-        t.add_column("Uso", ratio=1)
+        t.add_column("Window")
+        t.add_column("Usage", ratio=1)
         t.add_column("%", justify="right")
-        t.add_column("reseta em", justify="right")
-        t.add_column("ritmo", justify="right")
-        t.add_column("projeção", justify="right")
+        t.add_column("resets in", justify="right")
+        t.add_column("rate", justify="right")
+        t.add_column("projection", justify="right")
         for key, lbl, pct, reset, act in rows:
             rate = _rate(con, key)
             rem_h = ((datetime.fromisoformat(reset) - now_utc).total_seconds() / 3600
@@ -1051,8 +1051,8 @@ def watch(args):
         alerts = _alerts(rows, con)
         if alerts:
             body.append(Text("\n".join("⚠ " + m for m in alerts), style="bold red"))
-        body.append(Text(f"{now_utc:%H:%M:%S} UTC · atualiza a cada {args.interval}s"
-                         f"{' · gravando' if args.collect else ''} · Ctrl-C sai", style="dim"))
+        body.append(Text(f"{now_utc:%H:%M:%S} UTC · updates every {args.interval}s"
+                         f"{' · recording' if args.collect else ''} · Ctrl-C quits", style="dim"))
         return Panel(Group(*body), title="cmon watch", border_style="cyan")
 
     with Live(render(), console=Console(), screen=True, refresh_per_second=4) as live:
@@ -1064,12 +1064,12 @@ def watch(args):
             pass
 
 
-AGENT = "com.cmon.collect"  # macOS LaunchAgent / nome-base das units
+AGENT = "com.cmon.collect"  # macOS LaunchAgent / base name of the units
 
 
 def _sched_cmd() -> list[str]:
-    """Comando que o agendador roda. Interpretador e script absolutos + --db
-    absoluto: independe de PATH/cwd/env, que são mínimos em launchd/cron/systemd."""
+    """Command that scheduler runs. Interpreter and script absolute + --db
+    absolute: independent of PATH/cwd/env, which are minimal in launchd/cron/systemd."""
     return [sys.executable, os.path.abspath(__file__), "--db", os.path.abspath(DB),
             "collect", "--alert"]
 
@@ -1090,15 +1090,15 @@ def _install_macos(cmd, secs, logdir, dry):
                f'  <key>StandardErrorPath</key><string>{logdir}/collect.err.log</string>\n'
                '</dict></plist>\n')
     if dry:
-        print(f"[dry-run] escreveria {plist}:\n{content}[dry-run] launchctl unload/load -w {plist}")
+        print(f"[dry-run] would write {plist}:\n{content}[dry-run] launchctl unload/load -w {plist}")
         return
     with open(plist, "w", encoding="utf-8") as f:
         f.write(content)
     subprocess.run(["launchctl", "unload", plist], capture_output=True)
     r = subprocess.run(["launchctl", "load", "-w", plist], capture_output=True, text=True)
     if r.returncode != 0:
-        sys.exit(f"launchctl load falhou: {r.stderr.strip()}")
-    print(f"✓ LaunchAgent instalado: {plist}\n  logs em {logdir}. Desinstalar: cmon uninstall")
+        sys.exit(f"launchctl load failed: {r.stderr.strip()}")
+    print(f"✓ LaunchAgent installed: {plist}\n  logs in {logdir}. Uninstall: cmon uninstall")
 
 
 def _install_linux(cmd, interval_min, dry):
@@ -1125,23 +1125,23 @@ def _install_linux(cmd, interval_min, dry):
         r = subprocess.run(["systemctl", "--user", "enable", "--now", "cmon-collect.timer"],
                            capture_output=True, text=True)
         if r.returncode != 0:
-            sys.exit(f"systemctl falhou: {r.stderr.strip()}")
-        print(f"✓ systemd timer instalado ({interval_min}min). Ver: systemctl --user list-timers")
+            sys.exit(f"systemctl failed: {r.stderr.strip()}")
+        print(f"✓ systemd timer installed ({interval_min}min). View: systemctl --user list-timers")
     else:
         _cron(f"*/{interval_min} * * * * {exec_line}", dry)
 
 
 def _cron(line, dry, remove=False):
-    """Adiciona/remove uma linha do crontab marcada com '# cmon'. Fallback sem systemd."""
+    """Add/remove a crontab line marked with '# cmon'. Fallback without systemd."""
     tag = "# cmon-collect"
     cur = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
     kept = [ln for ln in cur.splitlines() if tag not in ln]
     new = kept if remove else kept + [f"{line}  {tag}"]
     if dry:
-        print("[dry-run] crontab passaria a ter:\n" + "\n".join(new))
+        print("[dry-run] crontab would become:\n" + "\n".join(new))
         return
     subprocess.run(["crontab", "-"], input="\n".join(new) + "\n", text=True)
-    print("✓ crontab atualizado." if not remove else "✓ entrada removida do crontab.")
+    print("✓ crontab updated." if not remove else "✓ entry removed from crontab.")
 
 
 def _install_windows(cmd, interval_min, dry):
@@ -1153,18 +1153,18 @@ def _install_windows(cmd, interval_min, dry):
         return
     r = subprocess.run(a, capture_output=True, text=True)
     if r.returncode != 0:
-        sys.exit(f"schtasks falhou: {r.stderr.strip()}")
-    print(f"✓ Tarefa 'cmon-collect' agendada ({interval_min}min).")
+        sys.exit(f"schtasks failed: {r.stderr.strip()}")
+    print(f"✓ Task 'cmon-collect' scheduled ({interval_min}min).")
 
 
 def install(args):
-    """Agenda 'cmon collect --alert' no agendador nativo do SO. --dry-run só mostra."""
+    """Schedule 'cmon collect --alert' on OS native scheduler. --dry-run only shows."""
     logdir = os.path.expanduser("~/.cmon")
     if not args.dry_run:
         os.makedirs(logdir, exist_ok=True)
     cmd = _sched_cmd()
     m = args.interval
-    print(f"Agendando a cada {m}min · banco {os.path.abspath(DB)}\n  {' '.join(cmd)}")
+    print(f"Scheduling every {m}min · database {os.path.abspath(DB)}\n  {' '.join(cmd)}")
     if sys.platform == "darwin":
         _install_macos(cmd, m * 60, logdir, args.dry_run)
     elif sys.platform.startswith("linux"):
@@ -1172,20 +1172,20 @@ def install(args):
     elif sys.platform.startswith("win"):
         _install_windows(cmd, m, args.dry_run)
     else:
-        sys.exit(f"SO não suportado p/ install: {sys.platform}")
+        sys.exit(f"OS not supported for install: {sys.platform}")
     if not args.dry_run:
-        print("Token no background: usa o cofre do SO ou a credencial do Claude Code; "
-              "'CLAUDE_OAUTH_TOKEN' do shell NÃO é herdado. Rode 'cmon token set' se precisar.")
+        print("Background token: uses OS vault or Claude Code credentials; "
+              "shell 'CLAUDE_OAUTH_TOKEN' is NOT inherited. Run 'cmon token set' if needed.")
 
 
 def uninstall(args):
-    """Remove o agendamento criado pelo install."""
+    """Remove scheduling created by install."""
     if sys.platform == "darwin":
         plist = os.path.expanduser(f"~/Library/LaunchAgents/{AGENT}.plist")
         subprocess.run(["launchctl", "unload", plist], capture_output=True)
         if os.path.exists(plist):
             os.remove(plist)
-        print("✓ LaunchAgent removido.")
+        print("✓ LaunchAgent removed.")
     elif sys.platform.startswith("linux"):
         import shutil
         if shutil.which("systemctl"):
@@ -1197,14 +1197,14 @@ def uninstall(args):
                 if os.path.exists(p):
                     os.remove(p)
             subprocess.run(["systemctl", "--user", "daemon-reload"])
-            print("✓ systemd timer removido.")
+            print("✓ systemd timer removed.")
         else:
             _cron("", dry=False, remove=True)
     elif sys.platform.startswith("win"):
         subprocess.run(["schtasks", "/delete", "/tn", "cmon-collect", "/f"], capture_output=True)
-        print("✓ Tarefa removida.")
+        print("✓ Task removed.")
     else:
-        sys.exit(f"SO não suportado: {sys.platform}")
+        sys.exit(f"OS not supported: {sys.platform}")
 
 
 def main():
@@ -1215,55 +1215,55 @@ def main():
         pass
     p = argparse.ArgumentParser(
         prog="cmon", description=__doc__.splitlines()[0],
-        epilog="Token: env CLAUDE_OAUTH_TOKEN → cofre do SO (cmon token set) → "
-               "credencial do Claude Code. Veja 'cmon token --help'.",
+        epilog="Token: env CLAUDE_OAUTH_TOKEN → OS vault (cmon token set) → "
+               "Claude Code credentials. See 'cmon token --help'.",
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--db", help="caminho do banco DuckDB (sobrepõe CMON_DB)")
+    p.add_argument("--db", help="DuckDB database path (overrides CMON_DB)")
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("now", help="uso atual + tempo até o reset + ritmo/projeção")
-    ps = sub.add_parser("status", help="linha única p/ statusline/tmux/prompt (lê cache local)")
-    ps.add_argument("--live", action="store_true", help="consulta a API em vez do cache local")
-    sub.add_parser("trends", help="consumo por ciclo: pico, delta e anomalia")
-    pb = sub.add_parser("burn", help="tokens & US$ estimado dos logs locais do Claude Code")
+    sub.add_parser("now", help="current usage + time to reset + rate/projection")
+    ps = sub.add_parser("status", help="single line for statusline/tmux/prompt (reads local cache)")
+    ps.add_argument("--live", action="store_true", help="query API instead of local cache")
+    sub.add_parser("trends", help="consumption per cycle: peak, delta and anomaly")
+    pb = sub.add_parser("burn", help="tokens & estimated US$ from local Claude Code logs")
     pb.add_argument("--by", choices=["model", "surface", "day", "project", "session"], default="model",
-                    help="agrupa por modelo (padrão), surface (terminal/vscode/app/sdk), dia, projeto ou sessão")
+                    help="group by model (default), surface (terminal/vscode/app/sdk), day, project or session")
     pb.add_argument("--since", default="30d",
-                    help="janela: '24h', '7d', '30d' (padrão), data ISO, ou 'all' p/ tudo")
-    pb.add_argument("--json", action="store_true", help="saída em JSON")
-    pc = sub.add_parser("collect", help="grava 1 snapshot no banco")
-    pc.add_argument("--force", action="store_true", help="grava mesmo com snapshot recente (ignora dedup)")
+                    help="window: '24h', '7d', '30d' (default), ISO date, or 'all' for everything")
+    pb.add_argument("--json", action="store_true", help="JSON output")
+    pc = sub.add_parser("collect", help="save 1 snapshot to database")
+    pc.add_argument("--force", action="store_true", help="save even with recent snapshot (bypass dedup)")
     pc.add_argument("--alert", action="store_true",
-                    help="avisa (stderr + notificação) se projetar 100%% antes do reset")
-    pr = sub.add_parser("report", help="resumo do consumo acumulado")
-    pr.add_argument("--since", help="filtra a partir de '24h', '7d' ou data ISO")
-    pr.add_argument("--json", action="store_true", help="saída em JSON")
-    pw = sub.add_parser("watch", help="TUI ao vivo com o uso atual (Ctrl-C sai)")
-    pw.add_argument("-n", "--interval", type=int, default=30, help="segundos entre atualizações (padrão 30)")
-    pw.add_argument("--collect", action="store_true", help="grava cada leitura no banco enquanto observa")
-    pwa = sub.add_parser("wait", help="bloqueia até a janela resetar (ou --at N%%), então notifica")
-    pwa.add_argument("--window", default="session", help="janela a observar (padrão session = 5h; ex.: weekly_all)")
-    pwa.add_argument("--at", type=float, help="em vez do reset, aguarda o uso atingir N%%")
-    pwa.add_argument("-n", "--interval", type=int, default=60, help="segundos entre verificações (padrão 60)")
-    pin = sub.add_parser("install", help="agenda 'collect --alert' no agendador do SO (coleta de fundo)")
-    pin.add_argument("-i", "--interval", type=int, default=20, help="minutos entre coletas (padrão 20)")
-    pin.add_argument("--dry-run", action="store_true", help="mostra o que faria, sem instalar")
-    sub.add_parser("uninstall", help="remove o agendamento criado pelo install")
-    pp = sub.add_parser("plot", help="gera gráficos -> PNG")
+                    help="alert (stderr + notification) if projected to hit 100%% before reset")
+    pr = sub.add_parser("report", help="summary of accumulated consumption")
+    pr.add_argument("--since", help="filter from '24h', '7d' or ISO date")
+    pr.add_argument("--json", action="store_true", help="JSON output")
+    pw = sub.add_parser("watch", help="live TUI with current usage (Ctrl-C quits)")
+    pw.add_argument("-n", "--interval", type=int, default=30, help="seconds between updates (default 30)")
+    pw.add_argument("--collect", action="store_true", help="save each read to database while watching")
+    pwa = sub.add_parser("wait", help="block until window resets (or --at N%%), then notify")
+    pwa.add_argument("--window", default="session", help="window to watch (default session = 5h; e.g., weekly_all)")
+    pwa.add_argument("--at", type=float, help="instead of reset, wait for usage to reach N%%")
+    pwa.add_argument("-n", "--interval", type=int, default=60, help="seconds between checks (default 60)")
+    pin = sub.add_parser("install", help="schedule 'collect --alert' on OS scheduler (background collection)")
+    pin.add_argument("-i", "--interval", type=int, default=20, help="minutes between collections (default 20)")
+    pin.add_argument("--dry-run", action="store_true", help="show what it would do, don't install")
+    sub.add_parser("uninstall", help="remove scheduling created by install")
+    pp = sub.add_parser("plot", help="generate charts -> PNG")
     pp.add_argument("-o", "--out", default=None,
-                    help="caminho do PNG (padrão: usage_AAMMDD_HHMMSS.png)")
+                    help="PNG path (default: usage_YYMMDD_HHMMSS.png)")
 
-    pd_ = sub.add_parser("tips", help="dicas de pacing p/ usar ~100%% do semanal sem travar o 5h",
-                         description="Projeta o consumo por janela e sugere acelerar/frear/trocar "
-                                     "de modelo. Enriquece com Claude Sonnet via 'claude -p'.")
-    pd_.add_argument("--no-ai", action="store_true", help="só as projeções locais, sem chamar o Claude")
+    pd_ = sub.add_parser("tips", help="pacing tips to use ~100%% of weekly without blocking 5h",
+                         description="Projects consumption per window and suggests speed up/slow down/swap "
+                                     "model. Enriches with Claude Sonnet via 'claude -p'.")
+    pd_.add_argument("--no-ai", action="store_true", help="only local projections, don't call Claude")
 
-    pt = sub.add_parser("token", help="gerencia o token OAuth com segurança (cross-platform)",
-                        description="Guarda o token no cofre nativo do SO (Keychain no macOS, "
-                                    "Credential Manager no Windows, Secret Service no Linux).")
+    pt = sub.add_parser("token", help="manage OAuth token securely (cross-platform)",
+                        description="Stores token in OS native vault (Keychain on macOS, "
+                                    "Credential Manager on Windows, Secret Service on Linux).")
     ta = pt.add_subparsers(dest="action", required=True)
-    ta.add_parser("set", help="guarda um token no cofre do SO (input oculto; aceita pipe)")
-    ta.add_parser("status", help="mostra de onde vem o token, mascarado")
-    ta.add_parser("clear", help="remove o token guardado no cofre")
+    ta.add_parser("set", help="save token to OS vault (hidden input; accepts pipe)")
+    ta.add_parser("status", help="show token source, masked")
+    ta.add_parser("clear", help="remove saved token from vault")
 
     args = p.parse_args()
     if args.db:

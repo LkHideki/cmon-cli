@@ -19,5 +19,5 @@ jobs:
       - run: uv sync
       - name: Ruff
         run: uv run ruff check .
-      - name: Smoke (importa o módulo e valida o CLI, sem rede)
+      - name: Smoke (imports the module and validates CLI, no network)
         run: uv run cmon --help

@@ -1,253 +1,250 @@
-# cmon — Claude Monitor
+# Claude Monitor
 
 [![CI](https://github.com/LkHideki/cmon/actions/workflows/ci.yml/badge.svg)](https://github.com/LkHideki/cmon/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
-CLI para rastrear o consumo do seu plano Claude ao longo do tempo. Lê o mesmo
-endpoint que o app usa (`https://claude.ai/api/oauth/usage`), guarda snapshots
-em DuckDB e mostra ritmo de consumo, projeções e gráficos.
+CLI to track your Claude plan consumption over time. Reads the same endpoint
+the app uses (`https://claude.ai/api/oauth/usage`), stores snapshots in DuckDB,
+and displays consumption rate, projections, and charts.
 
-## Instalação
+## Installation
 
 ```bash
 git clone https://github.com/LkHideki/cmon && cd cmon
-uv sync                  # instalação enxuta (sem libs de gráfico)
-uv sync --extra plot     # opcional: habilita o comando `plot` (matplotlib/seaborn)
+uv sync                  # lightweight install (without plotting libraries)
+uv sync --extra plot     # optional: enables the `plot` command (matplotlib/seaborn)
 ```
 
-Requer Python ≥ 3.11 e [uv](https://docs.astral.sh/uv/). Sem uv, um
-`pip install -e .` também funciona.
+Requires Python ≥ 3.11 and [uv](https://docs.astral.sh/uv/). Without uv,
+`pip install -e .` also works.
 
 ## Token
 
-O `cmon` resolve o token nesta ordem, parando no primeiro que encontrar:
+`cmon` resolves the token in this order, stopping at the first match:
 
-1. **`CLAUDE_OAUTH_TOKEN`** — variável de ambiente (ideal em CI / override).
-2. **Cofre seguro do SO** — Keychain (macOS), Credential Manager (Windows) ou
-   Secret Service (Linux). Gravado uma vez, sem ficar em texto puro:
+1. **`CLAUDE_OAUTH_TOKEN`** — environment variable (ideal for CI / override).
+2. **OS secure vault** — Keychain (macOS), Credential Manager (Windows), or
+   Secret Service (Linux). Stored once, never in plain text:
 
    ```bash
-   cmon token set        # cola o token (input oculto); ou:  echo $TOK | cmon token set
-   cmon token status     # de onde vem o token, mascarado
-   cmon token clear      # remove do cofre
+   cmon token set        # paste the token (hidden input); or:  echo $TOK | cmon token set
+   cmon token status     # where the token comes from, masked
+   cmon token clear      # remove from vault
    ```
-3. **Credencial do Claude Code** — se você estiver logado, é lida direto do
-   Keychain (macOS) ou de `~/.claude/.credentials.json` (Linux/Windows). Zero
-   atrito: nada a configurar.
+3. **Claude Code credential** — if you're logged in, read directly from
+   Keychain (macOS) or `~/.claude/.credentials.json` (Linux/Windows). Zero
+   friction: nothing to configure.
 
-**Auto-refresh:** quando o access token expira, o `cmon` o renova sozinho via
-`refresh_token` e guarda a nova cadeia num cofre próprio (`claude-oauth-auto`),
-**sem** regravar a credencial do Claude Code. Renova de forma proativa (lê o
-`expiresAt`) e reativa (se a API devolver 401 — inclusive quando um
-`CLAUDE_OAUTH_TOKEN` velho está sombreando tudo). Efeito colateral: a 1ª
-renovação gira o `refresh_token` do Claude Code, então **ele pode pedir login uma
-vez** na próxima vez que for renovar — depois disso as duas cadeias ficam
-independentes. `token status` mostra a validade; `client_id`/endpoint são
-configuráveis por `CMON_OAUTH_CLIENT_ID` / `CMON_OAUTH_TOKEN_URL`.
+**Auto-refresh:** when the access token expires, `cmon` renews it automatically via
+`refresh_token` and stores the new token in its own vault (`claude-oauth-auto`),
+**without** rewriting the Claude Code credential. Renews proactively (reads
+`expiresAt`) and reactively (if the API returns 401 — including when an old
+`CLAUDE_OAUTH_TOKEN` is shadowing everything). Side effect: the first renewal
+rotates Claude Code's `refresh_token`, so **it may ask for login once** the next
+time it renews — after that the two tokens become independent. `token status`
+shows validity; `client_id`/endpoint are configurable via `CMON_OAUTH_CLIENT_ID` /
+`CMON_OAUTH_TOKEN_URL`.
 
-Ou seja, com o Claude Code logado não precisa de nada — e continua funcionando
-mesmo com o token vencido. Sem ele, `cmon token set` guarda o token com segurança
-em qualquer sistema. `.env` continua funcionando para o passo 1 (veja
-`.env.example`). Rode `cmon --help` ou `cmon token --help` para o resto.
+In short, with Claude Code logged in you need nothing — and it keeps working
+even with an expired token. Without it, `cmon token set` stores the token securely
+on any system. `.env` still works for step 1 (see `.env.example`). Run `cmon --help`
+or `cmon token --help` for the rest.
 
-## Uso
+## Usage
 
 ```bash
-uv run cmon now       # uso atual + tempo até o reset + ritmo/projeção
-uv run cmon status    # linha única p/ statusline/tmux/prompt
-uv run cmon watch     # TUI ao vivo, atualiza sozinho (Ctrl-C sai)
-uv run cmon wait      # bloqueia até a janela de 5h resetar, então notifica
-uv run cmon collect   # grava 1 snapshot no banco (com timestamp UTC)
-uv run cmon report    # resumo do consumo acumulado
-uv run cmon trends    # consumo por ciclo (pico, delta vs anterior, anomalia)
-uv run cmon burn      # tokens & US$ estimado (dos logs locais do Claude Code)
-uv run cmon plot      # gráficos -> usage.png
-uv run cmon tips      # dicas de pacing (usar ~100% do semanal sem travar o 5h)
-uv run cmon install   # agenda a coleta de fundo no agendador do SO
+uv run cmon now       # current usage + time to reset + rate/projection
+uv run cmon status    # one-liner for statusline/tmux/prompt
+uv run cmon watch     # live TUI, self-updating (Ctrl-C exits)
+uv run cmon wait      # block until 5h window resets, then notify
+uv run cmon collect   # save 1 snapshot to database (with UTC timestamp)
+uv run cmon report    # summary of accumulated consumption
+uv run cmon trends    # consumption by cycle (peak, delta vs previous, anomaly)
+uv run cmon burn      # tokens & estimated US$ (from local Claude Code logs)
+uv run cmon plot      # charts -> usage.png
+uv run cmon tips      # pacing tips (use ~100% of weekly without exhausting 5h)
+uv run cmon install   # schedule background collection in OS scheduler
 ```
 
-Opção global `--db PATH` (antes do subcomando) sobrepõe `CMON_DB`:
+Global option `--db PATH` (before the subcommand) overrides `CMON_DB`:
 `uv run cmon --db ~/.cmon/usage.duckdb now`.
 
 ### `cmon status` — statusline
 
-Uma linha compacta, ideal pra barra de status / tmux / prompt. Sai com código 0
-e imprime `cmon offline` se a rede falhar (não quebra a statusline):
+One compact line, ideal for status bar / tmux / prompt. Exits with code 0
+and prints `cmon offline` if the network fails (doesn't break the statusline):
 
 ```
-5h 18% · sem 42% · reset 3h18m
+5h 18% · week 42% · reset 3h18m
 ```
 
-### `cmon wait` — avisa quando liberar
+### `cmon wait` — notify when ready
 
-Bloqueia até a janela resetar e então dispara uma notificação nativa — pra você
-retomar no segundo em que o 5h libera. Ou use `--at N` p/ avisar ao *atingir* N%:
+Blocks until the window resets and then triggers a native notification — so you
+can resume the second the 5h limit clears. Or use `--at N` to notify when *reaching* N%:
 
 ```bash
-uv run cmon wait                      # espera o 5h resetar
-uv run cmon wait --window weekly_all  # espera o semanal resetar
-uv run cmon wait --at 80              # avisa quando o 5h chegar a 80%
+uv run cmon wait                      # wait for 5h to reset
+uv run cmon wait --window weekly_all  # wait for weekly to reset
+uv run cmon wait --at 80              # notify when 5h reaches 80%
 ```
 
-### `cmon trends` — tendência entre ciclos
+### `cmon trends` — cycle trends
 
-Segmenta o histórico em ciclos (corta em cada reset) e mostra o pico de cada um,
-o delta em relação ao ciclo anterior e um aviso se o ciclo atual destoa da média.
+Segments the history into cycles (cuts at each reset) and shows the peak of each,
+the delta versus the previous cycle, and a warning if the current cycle deviates from the average.
 
-### `cmon burn` — tokens & custo (dos logs)
+### `cmon burn` — tokens & cost (from logs)
 
-Enquanto o resto do `cmon` lê o **% oficial** do endpoint, o `burn` minera os
-transcripts locais do Claude Code (`~/.claude/projects/**/*.jsonl`) para dar o que
-o endpoint não expõe: **tokens e US$ estimado por modelo, dia, projeto ou sessão**
-— retroativo, offline, sem token.
+While the rest of `cmon` reads the **official %** from the endpoint, `burn` mines
+the local Claude Code transcripts (`~/.claude/projects/**/*.jsonl`) to provide what
+the endpoint doesn't expose: **tokens and estimated US$ by model, day, project, or session**
+— retroactive, offline, no token required.
 
 ```bash
-uv run cmon burn                    # por modelo, últimos 30 dias (padrão)
-uv run cmon burn --by surface       # por cliente: terminal / vscode / app / sdk (-p)
-uv run cmon burn --by project       # atribuição por projeto (onde seu plano foi)
-uv run cmon burn --since 7d         # janela menor (24h, 7d, data ISO…)
-uv run cmon burn --since all        # histórico completo (mas o Claude Code só guarda ~30d)
+uv run cmon burn                    # by model, last 30 days (default)
+uv run cmon burn --by surface       # by client: terminal / vscode / app / sdk (-p)
+uv run cmon burn --by project       # attribution by project (where your plan went)
+uv run cmon burn --since 7d         # smaller window (24h, 7d, ISO date…)
+uv run cmon burn --since all        # full history (but Claude Code only keeps ~30d)
 uv run cmon burn --json
 ```
 
-A janela padrão é **30 dias** — o Claude Code apaga transcripts mais antigos que
-isso, então além de 30d normalmente não há dado. Use `--since all` p/ tudo o que
-houver, ou `--since 7d`/`24h`/data ISO p/ janelas menores.
+The default window is **30 days** — Claude Code deletes transcripts older than
+that, so beyond 30d there's usually no data. Use `--since all` for everything
+available, or `--since 7d`/`24h`/ISO date for smaller windows.
 
-`--by surface` separa por onde você usou (campo `entrypoint` dos logs). Só do
-Claude Code, porém — contas diferentes (por email) **não** são separáveis: os
-transcripts não gravam a conta, e o chat do claude.ai nem escreve logs.
+`--by surface` separates by where you used it (the `entrypoint` field in logs). Only
+Claude Code, though — different accounts (by email) **are not** separable: transcripts
+don't record the account, and claude.ai chat doesn't write logs.
 
-A varredura é incremental (cacheia por `mtime`+tamanho, deduplica por `uuid`): a
-primeira vez lê tudo (~dezenas de segundos em bases grandes), as seguintes levam
-frações de segundo. Os mesmos números aparecem no `watch` (linha *burn 5h*) e no
-`tips` (mix de modelos das últimas 5h, que aterra a dica de troca de modelo).
+Scanning is incremental (caches by `mtime`+size, deduplicates by `uuid`): the
+first run reads everything (~tens of seconds on large bases), subsequent runs take
+fractions of a second. The same numbers appear in `watch` (line *burn 5h*) and in
+`tips` (model mix from the last 5h, which grounds the model-switch tip).
 
-O `burn` mostra também um **breakdown por componente** (input / output / cache read
-/ cache write). Não se assuste com o total: em uso agentico, **cache read + write
-costumam ser ~80% do custo** — é o modelo relendo o contexto do cache a cada
-mensagem, não trabalho novo. E o valor é o **custo equivalente na API**
-(pay-per-token): **você paga a assinatura, não isso** — o número mostra o *valor* que
-você extrai do plano (facilmente dezenas de vezes a mensalidade).
+`burn` also shows a **component breakdown** (input / output / cache read
+/ cache write). Don't be alarmed by the total: in agentic use, **cache read + write
+typically account for ~80% of the cost** — the model re-reading cached context with
+each message, not new work. And the value is the **API-equivalent cost**
+(pay-per-token): **you pay the subscription, not this** — the number shows the *value*
+you extract from your plan (easily tens of times the monthly subscription).
 
-Cruzando as duas fontes: a **API** diz *onde está a parede* (% oficial + reset), os
-**logs** dizem *como você gastou* (qual modelo/projeto drenou). Ressalvas: o custo é
-**estimativa** (tabela de preços editável no topo de [`cmon.py`](cmon.py); cache write
-a 2×, TTL 1h), e os logs cobrem **só o Claude Code CLI** — uso no claude.ai web/desktop
-não aparece (mas conta no % oficial).
+Crossing both sources: the **API** tells you *where the wall is* (official % + reset), the
+**logs** tell you *how you spent it* (which model/project drained it). Caveats: cost is
+an **estimate** (price table editable at the top of [`cmon.py`](cmon.py); cache write
+at 2×, TTL 1h), and logs cover **only Claude Code CLI** — usage on claude.ai web/desktop
+doesn't appear (but counts toward the official %).
 
-### `cmon watch` — TUI ao vivo
+### `cmon watch` — live TUI
 
-Painel que se atualiza sozinho: barras coloridas por janela (verde/amarelo/
-vermelho), ritmo `%/h`, projeção no reset e alertas quando você vai bater 100%
-antes do reset. Ótimo pra deixar aberto num canto do terminal.
+Self-updating dashboard: colored bars by window (green/yellow/red), rate `%/h`,
+projection at reset, and alerts when you'll hit 100% before reset. Great to leave open
+in a corner of the terminal.
 
 ```bash
-uv run cmon watch                 # atualiza a cada 30s
-uv run cmon watch -n 10           # a cada 10s
-uv run cmon watch --collect       # grava cada leitura no banco enquanto observa
+uv run cmon watch                 # update every 30s
+uv run cmon watch -n 10           # every 10s
+uv run cmon watch --collect       # save each reading to database while watching
 ```
 
-### Alertas
+### Alerts
 
-`_alerts` avisa quando, **no ritmo atual, a janela bate 100% antes do reset**.
-Aparecem em `now` e `watch`; no `collect --alert` vão pro stderr (o cron manda
-por e-mail) e disparam uma notificação nativa best-effort (macOS/Linux):
+`_alerts` warns when, **at the current rate, the window hits 100% before reset**.
+They appear in `now` and `watch`; in `collect --alert` they go to stderr (cron emails
+them) and trigger a best-effort native notification (macOS/Linux):
 
 ```cron
-*/20 * * * * cd ~/cmon && /caminho/para/uv run cmon collect --alert
+*/20 * * * * cd ~/cmon && /path/to/uv run cmon collect --alert
 ```
 
 ### `cmon report`
 
 ```bash
-uv run cmon report --since 24h    # só as últimas 24h (aceita 7d ou data ISO)
-uv run cmon report --json         # saída em JSON p/ script/pipe
+uv run cmon report --since 24h    # last 24h only (accepts 7d or ISO date)
+uv run cmon report --json         # JSON output for script/pipe
 ```
 
 ### `cmon tips`
 
-Objetivo: gastar perto de **100% do limite semanal** até o reset — sem esgotar
-antes e sem estourar a **janela de 5h**, que trava o uso. Para cada janela mostra
-o ritmo observado, o alvo `%/h` para zerar a folga e a projeção no reset:
+Goal: spend close to **100% of the weekly limit** by reset — without exhausting
+early and without hitting the **5h window**, which locks you out. For each window shows
+the observed rate, the target `%/h` to zero slack, and the projection at reset:
 
-- **projeção < 100%** → *upside*: sobra cota, dá pra intensificar ou usar modelo
-  mais forte;
-- **projeção > 100%** → *vai faltar*: em quantas horas você bate 100% antes do
-  reset e para quanto frear.
+- **projection < 100%** → *upside*: quota left, you can intensify or use a stronger model;
+- **projection > 100%** → *shortfall*: how many hours until you hit 100% before
+  reset and how much you need to throttle.
 
-O ritmo corta automaticamente no último reset, então se adapta a janelas de 5h,
-7d (ou 72h — a Anthropic reseta o "semanal" num horário fixo por conta, nem
-sempre em 7 dias exatos). Por fim, passa os números pro **Claude Sonnet**
-(`claude -p`, barato) que devolve 3 dicas acionáveis. Use `--no-ai` para só as
-projeções locais, sem gastar cota.
+The rate automatically cuts at the last reset, so it adapts to 5h, 7d windows
+(or 72h — Anthropic resets the "weekly" at a fixed time, not always exactly 7 days).
+Finally, it sends the numbers to **Claude Sonnet** (`claude -p`, cheap) which returns
+3 actionable tips. Use `--no-ai` for local projections only, no quota cost.
 
-`cmon now` responde na hora "quanto falta pra minha janela de 5h resetar" e,
-se já houver histórico, projeta se você vai bater o limite antes disso:
+`cmon now` answers immediately "how long until my 5h window resets" and,
+if there's history, projects whether you'll hit the limit before then:
 
 ```
-Uso atual:
-  Current session  █··················   7%    reseta em   4h 25min
-  All models       ████████··········  41%    reseta em 3d 22h
-  Fable only       ████████··········  43%    reseta em 3d 22h  ←ativo
+Current usage:
+  Current session  █··················   7%    resets in   4h 25min
+  All models       ████████··········  41%    resets in 3d 22h
+  Fable only       ████████··········  43%    resets in 3d 22h  ←active
 
-Janela de 5h: 7% usada — expira em 4h 25min.
-Ritmo: 2.1%/h → projeção no reset: 16%.
+5h window: 7% used — expires in 4h 25min.
+Rate: 2.1%/h → projection at reset: 16%.
 ```
 
-## Coleta contínua
+## Continuous collection
 
-`report`/`plot`/`trends`/alertas ficam úteis com histórico. O jeito fácil é deixar
-o `collect` agendado no agendador nativo do SO:
+`report`/`plot`/`trends`/alerts become useful with history. The easy way is to leave
+`collect` scheduled in the OS native scheduler:
 
 ```bash
-uv run cmon install            # a cada 20min (launchd/systemd/schtasks)
-uv run cmon install -i 10      # a cada 10min
-uv run cmon install --dry-run  # só mostra o que faria
+uv run cmon install            # every 20min (launchd/systemd/schtasks)
+uv run cmon install -i 10      # every 10min
+uv run cmon install --dry-run  # only show what it would do
 uv run cmon uninstall          # remove
 ```
 
-No background o token vem do cofre do SO ou da credencial do Claude Code — a env
-`CLAUDE_OAUTH_TOKEN` do seu shell **não** é herdada, então rode `cmon token set`
-se for esse o seu caso. Preferir cron na mão? Continua valendo:
+In the background the token comes from the OS vault or Claude Code credential — your shell's
+`CLAUDE_OAUTH_TOKEN` env var **is not** inherited, so run `cmon token set`
+if that's your case. Prefer manual cron? Still works:
 
 ```cron
-*/20 * * * * cd ~/cmon && /caminho/para/uv run cmon collect --alert
+*/20 * * * * cd ~/cmon && /path/to/uv run cmon collect --alert
 ```
 
-## Como funciona
+## How it works
 
-- **Fonte**: array `limits[]` do endpoint — `session` (janela de 5h),
-  `weekly_all` (todos os modelos) e `weekly_scoped` (por modelo, ex. Fable).
-- **Consumo**: diferença de `percent` entre snapshots; quedas = reset da janela
-  (descartadas), não consumo.
-- É preciso o header `User-Agent: claude-cli/...`, senão o Cloudflare do
-  claude.ai responde 403.
-- **Robustez**: `fetch` tenta de novo em 429/5xx/rede com backoff (respeita
-  `Retry-After`); 401/403 falham na hora com mensagem clara. `collect` deduplica
-  leituras muito próximas (`CMON_DEDUP_SECS`, padrão 60s; `--force` ignora) e sai
-  com código ≠ 0 em falha, então o cron registra o erro em vez de silenciar.
+- **Source**: `limits[]` array from the endpoint — `session` (5h window),
+  `weekly_all` (all models), and `weekly_scoped` (per-model, e.g. Fable).
+- **Consumption**: difference in `percent` between snapshots; drops = window reset
+  (discarded), not consumption.
+- Requires the `User-Agent: claude-cli/...` header, otherwise claude.ai's Cloudflare
+  responds with 403.
+- **Resilience**: `fetch` retries on 429/5xx/network with backoff (respects
+  `Retry-After`); 401/403 fail immediately with clear message. `collect` deduplicates
+  very close readings (`CMON_DEDUP_SECS`, default 60s; `--force` ignores) and exits
+  with code ≠ 0 on failure, so cron logs the error instead of silencing it.
 
-## Desenvolvimento
+## Development
 
-Tudo vive num único arquivo, [`cmon.py`](cmon.py) — comandos são funções `now`,
-`collect`, `watch`, etc., ligadas ao argparse em `main()`. Fácil de ler de cima a baixo.
+Everything lives in a single file, [`cmon.py`](cmon.py) — commands are functions `now`,
+`collect`, `watch`, etc., wired to argparse in `main()`. Easy to read top to bottom.
 
 ```bash
-uv sync --extra plot         # instala tudo, inclusive libs de gráfico
-uv run ruff check .          # lint (config em pyproject.toml)
-uv run ruff check --fix .    # corrige o que dá
-uv run cmon <cmd>            # roda direto do fonte
+uv sync --extra plot         # install everything, including plotting libs
+uv run ruff check .          # lint (config in pyproject.toml)
+uv run ruff check --fix .    # auto-fix what it can
+uv run cmon <cmd>            # run straight from source
 ```
 
-O CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) roda ruff + um smoke
-do CLI em Python 3.11–3.13. PRs bem-vindos: mantenha o `ruff` verde e o estilo
-enxuto do arquivo. Variáveis de ambiente úteis: `CMON_DB` (caminho do banco),
-`CMON_RETRIES`, `CMON_DEDUP_SECS`.
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs ruff + CLI smoke tests
+on Python 3.11–3.13. PRs welcome: keep `ruff` green and the file style lean. Useful
+environment variables: `CMON_DB` (database path), `CMON_RETRIES`, `CMON_DEDUP_SECS`.
 
-## Aviso
+## Warning
 
-Usa um endpoint privado e não documentado da Anthropic; pode mudar sem aviso.
-Só acessa a sua própria conta. Licença [MIT](LICENSE).
+Uses a private, undocumented Anthropic endpoint; may change without notice.
+Only accesses your own account. License [MIT](LICENSE).
