@@ -138,6 +138,13 @@ an **estimate** (price table editable at the top of [`cmon.py`](cmon.py); cache 
 at 2×, TTL 1h), and logs cover **only Claude Code CLI** — usage on claude.ai web/desktop
 doesn't appear (but counts toward the official %).
 
+**The `<synthetic>` label** (usually `0%` in the model mix) is not a real model: Claude
+Code stamps `model: "<synthetic>"` on messages it generates *locally* instead of calling
+the API — interrupts (`[Request interrupted by user]`), injected notices, aborted turns.
+Their `usage` block is all zeros, so they cost nothing and don't move your totals; they
+appear only because `cmon` mines every transcript line carrying a `usage` field. Safe to
+ignore — real consumption is under `Opus`/`Sonnet`/`Haiku`/`Fable`.
+
 ### `cmon watch` — live TUI
 
 Self-updating dashboard: colored bars by window (green/yellow/red), rate `%/h`,
