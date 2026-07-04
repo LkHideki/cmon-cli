@@ -223,13 +223,13 @@ def now(_):
     rows = limits(fetch())
     print("Uso atual:")
     for _k, lbl, pct, reset, _act in rows:
-        print(f"  {lbl:16} {bar(pct)} {pct:5.1f}%   reseta em {fmt_eta(reset):>9}")
+        print(f"  {lbl:16} {bar(pct)} {pct:4.0f}%   reseta em {fmt_eta(reset):>9}")
 
     sess = next((r for r in rows if r[0] == "session"), None)
     if not sess:
         return
     _k, _lbl, pct, reset, _a = sess
-    print(f"\nJanela de 5h: {pct:.1f}% usada — expira em {fmt_eta(reset)}.")
+    print(f"\nJanela de 5h: {pct:.0f}% usada — expira em {fmt_eta(reset)}.")
 
     con = db(create=False)
     if con is None:
@@ -273,7 +273,7 @@ def collect(args):
                     [[ts, k, lbl, pct, reset, act] for k, lbl, pct, reset, act in rows])
     print(f"{ts:%Y-%m-%d %H:%M} coletado:")
     for _k, lbl, pct, reset, _a in rows:
-        print(f"  {lbl:16} {pct:5.1f}%  reset {reset[:16] if reset else '-'}")
+        print(f"  {lbl:16} {pct:4.0f}%  reset {reset[:16] if reset else '-'}")
     if getattr(args, "alert", False):
         for m in _alerts(rows, con):
             print(f"⚠ {m}", file=sys.stderr)
@@ -304,7 +304,7 @@ def report(args):
     g = df.groupby("label").agg(
         snapshots=("percent", "size"),
         pico_pct=("percent", "max"),
-        consumo_total_pct=("delta", lambda s: s[s > 0].sum())).round(1)
+        consumo_total_pct=("delta", lambda s: s[s > 0].sum())).round().astype(int)
     if getattr(args, "json", False):
         print(g.reset_index().to_json(orient="records", force_ascii=False))
     else:
@@ -509,7 +509,7 @@ def watch(args):
             proj = f"{min(pct + rate * rem_h, 999):.0f}%" if rate and rem_h and rem_h > 0 else "-"
             t.add_row(lbl + (" ●" if act else ""),
                       Text(bar(pct, 28), style=color(pct)),
-                      f"{pct:.1f}", fmt_eta(reset),
+                      f"{pct:.0f}", fmt_eta(reset),
                       f"{rate:.1f}%/h" if rate else "-", proj)
         body = [t]
         alerts = _alerts(rows, con)
