@@ -466,6 +466,117 @@ def tips(args):
         print("(Dica IA indisponível — 'claude' não encontrado no PATH. Use --no-ai p/ silenciar.)")
 
 
+def _eta_short(iso: str | None) -> str:
+    """fmt_eta compacto p/ statusline: '3h 31min' -> '3h31m'."""
+    e = fmt_eta(iso)
+    return e.replace(" ", "").replace("min", "m") if e not in ("-", "expirado") else e
+
+
+def status(args):
+    """Linha única p/ statusline/tmux/prompt. Silencioso e exit 0 se offline."""
+    try:
+        rows = limits(fetch())
+    except FetchError:
+        print("cmon offline")
+        return
+    parts = []
+    for key, short in (("session", "5h"), ("weekly_all", "sem")):
+        r = next((x for x in rows if x[0] == key), None)
+        if r:
+            parts.append(f"{short} {r[2]:.0f}%")
+    sess = next((x for x in rows if x[0] == "session"), None)
+    if sess and sess[3]:
+        parts.append(f"reset {_eta_short(sess[3])}")
+    print(" · ".join(parts))
+
+
+def wait(args):
+    """Bloqueia até a janela resetar (padrão) ou atingir --at N%, e notifica.
+    Ctrl-C cancela. Poll a cada --interval s; no modo reset dorme até resets_at."""
+    import time
+    key = args.window
+
+    def get():
+        return next((r for r in limits(fetch()) if r[0] == key), None)
+
+    try:
+        row = get()
+        if not row:
+            sys.exit(f"Janela '{key}' não encontrada no endpoint.")
+        _k, lbl, pct0, reset, _a = row
+
+        if args.at is not None:
+            print(f"Aguardando {lbl} atingir {args.at}% (atual {pct0:.0f}%)… Ctrl-C sai.")
+            while True:
+                r = get()
+                if r and r[2] >= args.at:
+                    msg = f"{lbl} atingiu {r[2]:.0f}% (limiar {args.at}%)."
+                    print(msg)
+                    _notify("cmon — limiar atingido", msg)
+                    return
+                time.sleep(args.interval)
+
+        if not reset:
+            sys.exit(f"{lbl} não tem reset agendado — nada a aguardar.")
+        target = datetime.fromisoformat(reset)
+        print(f"Aguardando {lbl} resetar (~{fmt_eta(reset)}, {pct0:.0f}% usado agora)… Ctrl-C sai.")
+        while True:
+            now_utc = datetime.now(timezone.utc)
+            if now_utc >= target:
+                r = get()
+                if r is None or r[2] < pct0 or r[3] != reset:
+                    msg = f"{lbl} resetou — pode retomar."
+                    print(msg)
+                    _notify("cmon — janela liberada", msg)
+                    return
+                time.sleep(min(args.interval, 30))  # reset ainda não refletido; re-checa
+            else:
+                time.sleep(min((target - now_utc).total_seconds(), args.interval))
+    except KeyboardInterrupt:
+        print("\ncancelado.")
+
+
+def _cycles(con, key: str) -> list:
+    """Segmenta os snapshots de uma janela em ciclos, cortando em cada reset
+    (queda de percent). Devolve lista de DataFrames (ts, percent)."""
+    if con is None:
+        return []
+    df = con.execute("SELECT ts, percent FROM snapshots WHERE key=? ORDER BY ts", [key]).df()
+    if df.empty:
+        return []
+    segs, start = [], 0
+    for i in range(1, len(df)):
+        if df.percent.iloc[i] < df.percent.iloc[i - 1]:
+            segs.append(df.iloc[start:i])
+            start = i
+    segs.append(df.iloc[start:])
+    return segs
+
+
+def trends(args):
+    """Consumo por ciclo (reset-aware): pico de cada ciclo, delta vs. anterior e
+    aviso de anomalia se o ciclo atual destoa da média dos anteriores."""
+    con = db(create=False)
+    if con is None:
+        sys.exit("Sem histórico — rode 'cmon collect' algumas vezes primeiro.")
+    for key, lbl in (("weekly_all", "Semanal (All models)"), ("session", "Janela 5h")):
+        segs = _cycles(con, key)
+        if not segs:
+            continue
+        peaks = [float(s.percent.max()) for s in segs]
+        print(f"\n{lbl} — {len(segs)} ciclo(s):")
+        for i in range(max(0, len(segs) - 5), len(segs)):
+            ini = segs[i].ts.iloc[0]
+            d = peaks[i] - peaks[i - 1] if i > 0 else None
+            delta = f"  ({'+' if d >= 0 else ''}{d:.0f} vs anterior)" if d is not None else ""
+            print(f"  {ini:%Y-%m-%d %H:%M}  pico {peaks[i]:.0f}%{delta}")
+        if len(peaks) >= 3:
+            prev = peaks[:-1]
+            avg = sum(prev) / len(prev)
+            if avg > 0 and peaks[-1] > avg * 1.2:
+                print(f"  ⚠ ciclo atual {peaks[-1]:.0f}% vs média {avg:.0f}% (+{peaks[-1] / avg * 100 - 100:.0f}%)")
+
+
 def watch(args):
     """TUI ao vivo: re-consulta o uso a cada N segundos e redesenha. Ctrl-C sai.
     Com --collect, grava cada leitura no banco (respeitando o dedup)."""
@@ -528,6 +639,149 @@ def watch(args):
             pass
 
 
+AGENT = "com.cmon.collect"  # macOS LaunchAgent / nome-base das units
+
+
+def _sched_cmd() -> list[str]:
+    """Comando que o agendador roda. Interpretador e script absolutos + --db
+    absoluto: independe de PATH/cwd/env, que são mínimos em launchd/cron/systemd."""
+    return [sys.executable, os.path.abspath(__file__), "--db", os.path.abspath(DB),
+            "collect", "--alert"]
+
+
+def _install_macos(cmd, secs, logdir, dry):
+    from xml.sax.saxutils import escape
+    plist = os.path.expanduser(f"~/Library/LaunchAgents/{AGENT}.plist")
+    args_xml = "".join(f"    <string>{escape(x)}</string>\n" for x in cmd)
+    content = ('<?xml version="1.0" encoding="UTF-8"?>\n'
+               '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+               '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+               '<plist version="1.0"><dict>\n'
+               f'  <key>Label</key><string>{AGENT}</string>\n'
+               f'  <key>ProgramArguments</key><array>\n{args_xml}  </array>\n'
+               f'  <key>StartInterval</key><integer>{secs}</integer>\n'
+               '  <key>RunAtLoad</key><true/>\n'
+               f'  <key>StandardOutPath</key><string>{logdir}/collect.out.log</string>\n'
+               f'  <key>StandardErrorPath</key><string>{logdir}/collect.err.log</string>\n'
+               '</dict></plist>\n')
+    if dry:
+        print(f"[dry-run] escreveria {plist}:\n{content}[dry-run] launchctl unload/load -w {plist}")
+        return
+    with open(plist, "w", encoding="utf-8") as f:
+        f.write(content)
+    subprocess.run(["launchctl", "unload", plist], capture_output=True)
+    r = subprocess.run(["launchctl", "load", "-w", plist], capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit(f"launchctl load falhou: {r.stderr.strip()}")
+    print(f"✓ LaunchAgent instalado: {plist}\n  logs em {logdir}. Desinstalar: cmon uninstall")
+
+
+def _install_linux(cmd, interval_min, dry):
+    import shlex
+    import shutil
+    exec_line = " ".join(shlex.quote(x) for x in cmd)
+    if shutil.which("systemctl"):
+        d = os.path.expanduser("~/.config/systemd/user")
+        service = (f"[Unit]\nDescription=cmon collect\n\n[Service]\nType=oneshot\n"
+                   f"ExecStart={exec_line}\n")
+        timer = (f"[Unit]\nDescription=cmon collect timer\n\n[Timer]\nOnBootSec=2min\n"
+                 f"OnUnitActiveSec={interval_min}min\nPersistent=true\n\n"
+                 f"[Install]\nWantedBy=timers.target\n")
+        if dry:
+            print(f"[dry-run] {d}/cmon-collect.service:\n{service}\n{d}/cmon-collect.timer:\n{timer}\n"
+                  "[dry-run] systemctl --user daemon-reload && enable --now cmon-collect.timer")
+            return
+        os.makedirs(d, exist_ok=True)
+        with open(f"{d}/cmon-collect.service", "w") as f:
+            f.write(service)
+        with open(f"{d}/cmon-collect.timer", "w") as f:
+            f.write(timer)
+        subprocess.run(["systemctl", "--user", "daemon-reload"])
+        r = subprocess.run(["systemctl", "--user", "enable", "--now", "cmon-collect.timer"],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            sys.exit(f"systemctl falhou: {r.stderr.strip()}")
+        print(f"✓ systemd timer instalado ({interval_min}min). Ver: systemctl --user list-timers")
+    else:
+        _cron(f"*/{interval_min} * * * * {exec_line}", dry)
+
+
+def _cron(line, dry, remove=False):
+    """Adiciona/remove uma linha do crontab marcada com '# cmon'. Fallback sem systemd."""
+    tag = "# cmon-collect"
+    cur = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
+    kept = [ln for ln in cur.splitlines() if tag not in ln]
+    new = kept if remove else kept + [f"{line}  {tag}"]
+    if dry:
+        print("[dry-run] crontab passaria a ter:\n" + "\n".join(new))
+        return
+    subprocess.run(["crontab", "-"], input="\n".join(new) + "\n", text=True)
+    print("✓ crontab atualizado." if not remove else "✓ entrada removida do crontab.")
+
+
+def _install_windows(cmd, interval_min, dry):
+    tr = " ".join(f'"{x}"' for x in cmd)
+    a = ["schtasks", "/create", "/tn", "cmon-collect", "/tr", tr,
+         "/sc", "minute", "/mo", str(interval_min), "/f"]
+    if dry:
+        print("[dry-run] " + subprocess.list2cmdline(a))
+        return
+    r = subprocess.run(a, capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit(f"schtasks falhou: {r.stderr.strip()}")
+    print(f"✓ Tarefa 'cmon-collect' agendada ({interval_min}min).")
+
+
+def install(args):
+    """Agenda 'cmon collect --alert' no agendador nativo do SO. --dry-run só mostra."""
+    logdir = os.path.expanduser("~/.cmon")
+    if not args.dry_run:
+        os.makedirs(logdir, exist_ok=True)
+    cmd = _sched_cmd()
+    m = args.interval
+    print(f"Agendando a cada {m}min · banco {os.path.abspath(DB)}\n  {' '.join(cmd)}")
+    if sys.platform == "darwin":
+        _install_macos(cmd, m * 60, logdir, args.dry_run)
+    elif sys.platform.startswith("linux"):
+        _install_linux(cmd, m, args.dry_run)
+    elif sys.platform.startswith("win"):
+        _install_windows(cmd, m, args.dry_run)
+    else:
+        sys.exit(f"SO não suportado p/ install: {sys.platform}")
+    if not args.dry_run:
+        print("Token no background: usa o cofre do SO ou a credencial do Claude Code; "
+              "'CLAUDE_OAUTH_TOKEN' do shell NÃO é herdado. Rode 'cmon token set' se precisar.")
+
+
+def uninstall(args):
+    """Remove o agendamento criado pelo install."""
+    if sys.platform == "darwin":
+        plist = os.path.expanduser(f"~/Library/LaunchAgents/{AGENT}.plist")
+        subprocess.run(["launchctl", "unload", plist], capture_output=True)
+        if os.path.exists(plist):
+            os.remove(plist)
+        print("✓ LaunchAgent removido.")
+    elif sys.platform.startswith("linux"):
+        import shutil
+        if shutil.which("systemctl"):
+            subprocess.run(["systemctl", "--user", "disable", "--now", "cmon-collect.timer"],
+                           capture_output=True)
+            d = os.path.expanduser("~/.config/systemd/user")
+            for n in ("cmon-collect.timer", "cmon-collect.service"):
+                p = f"{d}/{n}"
+                if os.path.exists(p):
+                    os.remove(p)
+            subprocess.run(["systemctl", "--user", "daemon-reload"])
+            print("✓ systemd timer removido.")
+        else:
+            _cron("", dry=False, remove=True)
+    elif sys.platform.startswith("win"):
+        subprocess.run(["schtasks", "/delete", "/tn", "cmon-collect", "/f"], capture_output=True)
+        print("✓ Tarefa removida.")
+    else:
+        sys.exit(f"SO não suportado: {sys.platform}")
+
+
 def main():
     try:
         from dotenv import load_dotenv
@@ -539,8 +793,11 @@ def main():
         epilog="Token: env CLAUDE_OAUTH_TOKEN → cofre do SO (cmon token set) → "
                "credencial do Claude Code. Veja 'cmon token --help'.",
         formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--db", help="caminho do banco DuckDB (sobrepõe CMON_DB)")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("now", help="uso atual + tempo até o reset + ritmo/projeção")
+    sub.add_parser("status", help="linha única p/ statusline/tmux/prompt")
+    sub.add_parser("trends", help="consumo por ciclo: pico, delta e anomalia")
     pc = sub.add_parser("collect", help="grava 1 snapshot no banco")
     pc.add_argument("--force", action="store_true", help="grava mesmo com snapshot recente (ignora dedup)")
     pc.add_argument("--alert", action="store_true", help="avisa (stderr + notificação) se projetar 100%% antes do reset")
@@ -550,6 +807,14 @@ def main():
     pw = sub.add_parser("watch", help="TUI ao vivo com o uso atual (Ctrl-C sai)")
     pw.add_argument("-n", "--interval", type=int, default=30, help="segundos entre atualizações (padrão 30)")
     pw.add_argument("--collect", action="store_true", help="grava cada leitura no banco enquanto observa")
+    pwa = sub.add_parser("wait", help="bloqueia até a janela resetar (ou --at N%%), então notifica")
+    pwa.add_argument("--window", default="session", help="janela a observar (padrão session = 5h; ex.: weekly_all)")
+    pwa.add_argument("--at", type=float, help="em vez do reset, aguarda o uso atingir N%%")
+    pwa.add_argument("-n", "--interval", type=int, default=60, help="segundos entre verificações (padrão 60)")
+    pin = sub.add_parser("install", help="agenda 'collect --alert' no agendador do SO (coleta de fundo)")
+    pin.add_argument("-i", "--interval", type=int, default=20, help="minutos entre coletas (padrão 20)")
+    pin.add_argument("--dry-run", action="store_true", help="mostra o que faria, sem instalar")
+    sub.add_parser("uninstall", help="remove o agendamento criado pelo install")
     pp = sub.add_parser("plot", help="gera gráficos -> PNG")
     pp.add_argument("-o", "--out", default="usage.png")
 
@@ -567,12 +832,16 @@ def main():
     ta.add_parser("clear", help="remove o token guardado no cofre")
 
     args = p.parse_args()
+    if args.db:
+        global DB
+        DB = args.db
     if args.cmd == "token":
         {"set": token_set, "status": token_status, "clear": token_clear}[args.action](args)
         return
     try:
-        {"now": now, "collect": collect, "report": report,
-         "watch": watch, "plot": plot, "tips": tips}[args.cmd](args)
+        {"now": now, "status": status, "trends": trends, "collect": collect, "report": report,
+         "watch": watch, "wait": wait, "plot": plot, "tips": tips,
+         "install": install, "uninstall": uninstall}[args.cmd](args)
     except FetchError as e:
         sys.exit(f"cmon: {e}")
 
