@@ -1,5 +1,7 @@
+# Nome de distribuição (PyPI): 'cmon' já está tomado por um projeto sem relação.
+# O comando de terminal continua 'cmon' via [project.scripts] abaixo.
 [project]
-name = "cmon"
+name = "cmon-cli"
 version = "0.1.0"
 description = "Claude Monitor — rastreia o consumo do seu plano Claude ao longo do tempo"
 readme = "README.md"
