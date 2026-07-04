@@ -125,11 +125,18 @@ primeira vez lê tudo (~dezenas de segundos em bases grandes), as seguintes leva
 frações de segundo. Os mesmos números aparecem no `watch` (linha *burn 5h*) e no
 `tips` (mix de modelos das últimas 5h, que aterra a dica de troca de modelo).
 
+O `burn` mostra também um **breakdown por componente** (input / output / cache read
+/ cache write). Não se assuste com o total: em uso agentico, **cache read + write
+costumam ser ~80% do custo** — é o modelo relendo o contexto do cache a cada
+mensagem, não trabalho novo. E o valor é o **custo equivalente na API**
+(pay-per-token): **você paga a assinatura, não isso** — o número mostra o *valor* que
+você extrai do plano (facilmente dezenas de vezes a mensalidade).
+
 Cruzando as duas fontes: a **API** diz *onde está a parede* (% oficial + reset), os
 **logs** dizem *como você gastou* (qual modelo/projeto drenou). Ressalvas: o custo é
-**estimativa** (tabela de preços editável no topo de [`cmon.py`](cmon.py)), e os logs
-cobrem **só o Claude Code CLI** — uso no claude.ai web/desktop não aparece (mas conta
-no % oficial).
+**estimativa** (tabela de preços editável no topo de [`cmon.py`](cmon.py); cache write
+a 2×, TTL 1h), e os logs cobrem **só o Claude Code CLI** — uso no claude.ai web/desktop
+não aparece (mas conta no % oficial).
 
 ### `cmon watch` — TUI ao vivo
 

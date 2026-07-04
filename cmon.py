@@ -757,12 +757,13 @@ def trends(args):
 
 # --- Camada de logs: minera ~/.claude/projects/**/*.jsonl p/ tokens & custo ---
 LOGS_ROOT = os.path.expanduser("~/.claude/projects")
-# US$ por milhão de tokens: (input, output, cache_read, cache_write_5m). Estimativa — ajuste aqui.
+# US$ por milhão de tokens: (input, output, cache_read, cache_write). Estimativa — ajuste aqui.
+# cache_read ≈ 0.1× input; cache_write = 2× input (TTL 1h, que é o que o Claude Code usa).
 PRICES = {
-    "fable":  (10.0, 50.0, 1.00, 12.50),
-    "opus":   (5.0, 25.0, 0.50, 6.25),
-    "sonnet": (3.0, 15.0, 0.30, 3.75),
-    "haiku":  (1.0, 5.0, 0.10, 1.25),
+    "fable":  (10.0, 50.0, 1.00, 20.0),
+    "opus":   (5.0, 25.0, 0.50, 10.0),
+    "sonnet": (3.0, 15.0, 0.30, 6.0),
+    "haiku":  (1.0, 5.0, 0.10, 2.0),
 }
 
 
@@ -948,12 +949,34 @@ def burn(args):
     per = {"model": "modelo", "surface": "cliente", "day": "dia",
            "project": "projeto", "session": "sessão"}[args.by]
     janela = f" desde {since:%Y-%m-%d %H:%M} UTC" if since else ""
-    print(f"Consumo por {per}{janela} (estimado):")
+    print(f"Consumo por {per}{janela} (equivalente na API):")
     for row in g.itertuples():
         label = _surface(row.grp) if args.by == "surface" else str(row.grp)
-        print(f"  {label:24} {row.tok / 1e6:8.2f}M tok   US$ {row.custo:8.2f}")
-    print(f"  {'TOTAL':24} {g.tok.sum() / 1e6:8.2f}M tok   US$ {g.custo.sum():8.2f}")
-    print("\n(estimativa; só uso do Claude Code CLI — não inclui claude.ai web/desktop.)")
+        print(f"  {label:24} {row.tok / 1e6:9.1f}M tok   US$ {row.custo:9.2f}")
+    total_c = g.custo.sum()
+    print(f"  {'TOTAL':24} {g.tok.sum() / 1e6:9.1f}M tok   US$ {total_c:9.2f}")
+
+    # Breakdown por componente: cache read costuma dominar (releitura de contexto).
+    comp = {"input": (0, 0.0, 0), "output": (0, 0.0, 1),
+            "cache read": (0, 0.0, 2), "cache write": (0, 0.0, 3)}
+    tok_by = {"input": "i", "output": "o", "cache read": "r", "cache write": "c"}
+    ctok = {k: int(df[v].sum()) for k, v in tok_by.items()}
+    ccost = {k: 0.0 for k in comp}
+    for row in df.itertuples():
+        p = _price(row.model)
+        ccost["input"] += row.i * p[0] / 1e6
+        ccost["output"] += row.o * p[1] / 1e6
+        ccost["cache read"] += row.r * p[2] / 1e6
+        ccost["cache write"] += row.c * p[3] / 1e6
+    print("\nPor componente:")
+    for k in ("input", "output", "cache read", "cache write"):
+        pct = ccost[k] / total_c * 100 if total_c else 0
+        print(f"  {k:12} {ctok[k] / 1e6:9.1f}M tok   US$ {ccost[k]:9.2f}   {pct:4.0f}%")
+    real = ccost["input"] + ccost["output"]
+    cache = ccost["cache read"] + ccost["cache write"]
+    print(f"\n→ Trabalho real (input+output): US$ {real:.0f} · Cache (releitura de contexto): US$ {cache:.0f}")
+    print("\nCusto EQUIVALENTE na API (pay-per-token) — você paga a assinatura, não isso.")
+    print("Estimativa; só uso do Claude Code CLI (não inclui claude.ai web/desktop).")
 
 
 def watch(args):
