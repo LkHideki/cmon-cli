@@ -709,9 +709,24 @@ def _rows_from_db():
     return rows, (datetime.now(UTC) - df.ts.iloc[0]).total_seconds()
 
 
+def _reset_expired(rows) -> bool:
+    """True if the session window's cached reset already passed — a dead cycle whose % is
+    stale and misleading (shows a used-up window that has since rolled over)."""
+    sess = next((r for r in rows if r[0] == "session"), None)
+    if not sess or not sess[3]:
+        return False
+    try:
+        return datetime.fromisoformat(sess[3]) <= datetime.now(UTC)
+    except (ValueError, TypeError):
+        return False
+
+
 def status(args):
     """Single line for statusline/tmux/prompt. By default reads local cache (fast,
-    ~sub-20ms, no network) fed by 'collect'; --live forces API."""
+    ~sub-20ms, no network) fed by 'collect'; --live forces API. A cache whose session
+    window already reset is auto-refreshed from the API (and re-cached) so the line never
+    shows a dead 'reset expired' cycle; on network failure it falls back to the stale
+    rows with an 'Xm ago' marker."""
     age = None
     if args.live:
         try:
@@ -721,14 +736,18 @@ def status(args):
             return
     else:
         got = _read_cache() or _rows_from_db()
-        if got:
+        if got and not _reset_expired(got[0]):
             rows, age = got
         else:
             try:
-                rows = limits(fetch())  # no cache or db yet: fall back to API
+                rows = limits(fetch(retries=1))  # no/stale cache: refresh and re-cache
+                _write_cache(rows, datetime.now(UTC))
             except FetchError:
-                print("cmon offline")
-                return
+                if got:  # offline: keep stale rows; staleness shown via 'Xm ago'
+                    rows, age = got
+                else:
+                    print("cmon offline")
+                    return
     parts = []
     for key, short in (("session", "5h"), ("weekly_all", "wk")):
         r = next((x for x in rows if x[0] == key), None)
