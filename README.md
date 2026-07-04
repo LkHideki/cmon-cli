@@ -13,23 +13,52 @@ uv sync
 
 ## Token
 
-No **macOS** nada é preciso: o `cmon` lê a credencial que o Claude Code guarda
-no Keychain (e mantém válida sozinho).
+O `cmon` resolve o token nesta ordem, parando no primeiro que encontrar:
 
-Em **Linux/CI**, exporte o token (ou use um `.env`, veja `.env.example`):
+1. **`CLAUDE_OAUTH_TOKEN`** — variável de ambiente (ideal em CI / override).
+2. **Cofre seguro do SO** — Keychain (macOS), Credential Manager (Windows) ou
+   Secret Service (Linux). Gravado uma vez, sem ficar em texto puro:
 
-```bash
-export CLAUDE_OAUTH_TOKEN=sk-ant-oat01-...
-```
+   ```bash
+   cmon token set        # cola o token (input oculto); ou:  echo $TOK | cmon token set
+   cmon token status     # de onde vem o token, mascarado
+   cmon token clear      # remove do cofre
+   ```
+3. **Credencial do Claude Code** — se você estiver logado, é lida direto do
+   Keychain (macOS) ou de `~/.claude/.credentials.json` (Linux/Windows). Zero
+   atrito: nada a configurar.
+
+Ou seja, com o Claude Code logado não precisa de nada. Sem ele, `cmon token set`
+guarda o token com segurança em qualquer sistema. `.env` continua funcionando
+para o passo 1 (veja `.env.example`). Rode `cmon --help` ou `cmon token --help`
+para o resto.
 
 ## Uso
 
 ```bash
 uv run cmon now       # uso atual + tempo até o reset + ritmo/projeção
-uv run cmon collect   # grava 1 snapshot no banco
+uv run cmon collect   # grava 1 snapshot no banco (com timestamp UTC)
 uv run cmon report    # resumo do consumo acumulado
 uv run cmon plot      # gráficos -> usage.png
+uv run cmon tips      # dicas de pacing (usar ~100% do semanal sem travar o 5h)
 ```
+
+### `cmon tips`
+
+Objetivo: gastar perto de **100% do limite semanal** até o reset — sem esgotar
+antes e sem estourar a **janela de 5h**, que trava o uso. Para cada janela mostra
+o ritmo observado, o alvo `%/h` para zerar a folga e a projeção no reset:
+
+- **projeção < 100%** → *upside*: sobra cota, dá pra intensificar ou usar modelo
+  mais forte;
+- **projeção > 100%** → *vai faltar*: em quantas horas você bate 100% antes do
+  reset e para quanto frear.
+
+O ritmo corta automaticamente no último reset, então se adapta a janelas de 5h,
+7d (ou 72h — a Anthropic reseta o "semanal" num horário fixo por conta, nem
+sempre em 7 dias exatos). Por fim, passa os números pro **Claude Sonnet**
+(`claude -p`, barato) que devolve 3 dicas acionáveis. Use `--no-ai` para só as
+projeções locais, sem gastar cota.
 
 `cmon now` responde na hora "quanto falta pra minha janela de 5h resetar" e,
 se já houver histórico, projeta se você vai bater o limite antes disso:
