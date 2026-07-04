@@ -52,6 +52,7 @@ uv run cmon wait      # bloqueia até a janela de 5h resetar, então notifica
 uv run cmon collect   # grava 1 snapshot no banco (com timestamp UTC)
 uv run cmon report    # resumo do consumo acumulado
 uv run cmon trends    # consumo por ciclo (pico, delta vs anterior, anomalia)
+uv run cmon burn      # tokens & US$ estimado (dos logs locais do Claude Code)
 uv run cmon plot      # gráficos -> usage.png
 uv run cmon tips      # dicas de pacing (usar ~100% do semanal sem travar o 5h)
 uv run cmon install   # agenda a coleta de fundo no agendador do SO
@@ -84,6 +85,31 @@ uv run cmon wait --at 80              # avisa quando o 5h chegar a 80%
 
 Segmenta o histórico em ciclos (corta em cada reset) e mostra o pico de cada um,
 o delta em relação ao ciclo anterior e um aviso se o ciclo atual destoa da média.
+
+### `cmon burn` — tokens & custo (dos logs)
+
+Enquanto o resto do `cmon` lê o **% oficial** do endpoint, o `burn` minera os
+transcripts locais do Claude Code (`~/.claude/projects/**/*.jsonl`) para dar o que
+o endpoint não expõe: **tokens e US$ estimado por modelo, dia, projeto ou sessão**
+— retroativo, offline, sem token.
+
+```bash
+uv run cmon burn                    # por modelo
+uv run cmon burn --by project       # atribuição por projeto (onde seu plano foi)
+uv run cmon burn --by day --since 7d
+uv run cmon burn --json
+```
+
+A varredura é incremental (cacheia por `mtime`+tamanho, deduplica por `uuid`): a
+primeira vez lê tudo (~dezenas de segundos em bases grandes), as seguintes levam
+frações de segundo. Os mesmos números aparecem no `watch` (linha *burn 5h*) e no
+`tips` (mix de modelos das últimas 5h, que aterra a dica de troca de modelo).
+
+Cruzando as duas fontes: a **API** diz *onde está a parede* (% oficial + reset), os
+**logs** dizem *como você gastou* (qual modelo/projeto drenou). Ressalvas: o custo é
+**estimativa** (tabela de preços editável no topo de [`cmon.py`](cmon.py)), e os logs
+cobrem **só o Claude Code CLI** — uso no claude.ai web/desktop não aparece (mas conta
+no % oficial).
 
 ### `cmon watch` — TUI ao vivo
 
