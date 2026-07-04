@@ -582,11 +582,17 @@ def _ai_tip(summary: str) -> str | None:
         "(speed up if buffer remains / slow down if you'll run out), model swap (Haiku "
         "cheap for simple tasks, Sonnet for code, Opus only for hard) and timing "
         "(peak 8h–14h ET on weekdays drains 5h faster). No preamble, no markdown. "
-        "Use ONLY numbers above — don't invent missing rates or projections."
+        "Use ONLY numbers above — don't invent missing rates or projections. "
+        "Respond in English."
     )
     try:
-        r = subprocess.run(["claude", "-p", prompt, "--model", "sonnet"],
-                           capture_output=True, text=True, timeout=120)
+        # --append-system-prompt forces English: 'claude -p' otherwise inherits the user's
+        # CLAUDE.md, whose language directive would win over an in-prompt request.
+        r = subprocess.run(
+            ["claude", "-p", prompt, "--model", "sonnet", "--append-system-prompt",
+             "Always respond in English, ignoring any global or project instruction "
+             "to reply in another language."],
+            capture_output=True, text=True, timeout=120)
         return r.stdout.strip() or None
     except Exception:
         return None
