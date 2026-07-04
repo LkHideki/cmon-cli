@@ -448,7 +448,7 @@ def _window_tips(lbl: str, pct: float, reset: str | None, rate: float | None, no
 
 def tips(args):
     rows = limits(fetch())
-    con = db(create=False)
+    con = db()  # writable: _rate + mix de modelos dos logs
     now_utc = datetime.now(UTC)
     print("cmon tips — usar ~100% do semanal sem faltar nem travar a janela de 5h.\n")
 
@@ -466,6 +466,16 @@ def tips(args):
     for key, lbl, pct, reset, _a in rows:
         if key not in ("weekly_all", "session"):
             summaries.append(f"- {lbl}: {pct:.0f}% usado, reseta em {fmt_eta(reset)}")
+
+    # mix real de modelos nas últimas 5h (dos logs) — aterra a dica de troca de modelo
+    win = now_utc - timedelta(hours=5)
+    scan_logs(con, since=win, quiet=True)
+    bs = _burn_summary(_burn_rows(con, win))
+    if bs:
+        tok, cost, mix = bs
+        line = f"Mix de modelos (últimas 5h): {tok / 1e6:.2f}M tok · US$ {cost:.2f} · {mix}"
+        print(line + "\n")
+        summaries.append("- " + line)
 
     if getattr(args, "no_ai", False):
         return
@@ -802,7 +812,7 @@ def watch(args):
     from rich.table import Table
     from rich.text import Text
 
-    con = db() if args.collect else db(create=False)
+    con = db()  # writable: usado p/ snapshots (--collect), _rate e burn dos logs
 
     def color(pct: float) -> str:
         return "red" if pct >= 90 else "yellow" if pct >= 70 else "green"
@@ -838,6 +848,13 @@ def watch(args):
                       f"{pct:.0f}", fmt_eta(reset),
                       f"{rate:.1f}%/h" if rate else "-", proj)
         body = [t]
+        win = now_utc - timedelta(hours=5)
+        scan_logs(con, since=win, quiet=True)
+        bs = _burn_summary(_burn_rows(con, win))
+        if bs:
+            tok, cost, mix = bs
+            body.append(Text(f"burn 5h (logs): {tok / 1e6:.2f}M tok · US$ {cost:.2f} · {mix}",
+                             style="cyan"))
         alerts = _alerts(rows, con)
         if alerts:
             body.append(Text("\n".join("⚠ " + m for m in alerts), style="bold red"))
