@@ -6,6 +6,9 @@ Token, resolvido nesta ordem:
   2. cofre seguro do SO — Keychain (macOS), Credential Manager (Windows) ou
      Secret Service (Linux) —, gravado uma vez com `cmon token set`;
   3. credencial do Claude Code, se você estiver logado (zero atrito).
+Quando o access token expira, o cmon o renova sozinho via refresh_token e guarda
+a nova cadeia no cofre dele (não regrava a credencial do Claude Code). Se um
+CLAUDE_OAUTH_TOKEN velho devolver 401, o cmon renova e usa o novo mesmo assim.
 
   cmon now         # uso atual + tempo até o reset + ritmo/projeção
   cmon collect     # grava 1 snapshot no banco (rode via cron a cada ~20min)
@@ -28,9 +31,13 @@ URL = "https://claude.ai/api/oauth/usage"
 # UA obrigatório: sem ele o Cloudflare do claude.ai devolve 403 ("Just a moment").
 UA = "claude-cli/1.0 (external, cli)"
 LABELS = {"session": "Current session", "weekly_all": "All models"}
-SERVICE, ACCOUNT = "cmon", "claude-oauth"  # entrada no cofre seguro do SO
+SERVICE, ACCOUNT = "cmon", "claude-oauth"  # entrada no cofre seguro do SO (token set manual)
+AUTO_ACCOUNT = "claude-oauth-auto"  # cadeia renovada pelo cmon, separada do Claude Code
 RETRIES = int(os.environ.get("CMON_RETRIES", "3"))
 DEDUP_SECS = int(os.environ.get("CMON_DEDUP_SECS", "60"))  # janela p/ deduplicar collect
+# OAuth do Claude Code — valores públicos do fluxo de login; usados só p/ renovar o token.
+OAUTH_CLIENT_ID = os.environ.get("CMON_OAUTH_CLIENT_ID", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
+OAUTH_TOKEN_URL = os.environ.get("CMON_OAUTH_TOKEN_URL", "https://console.anthropic.com/v1/oauth/token")
 
 
 class FetchError(Exception):
@@ -46,13 +53,14 @@ def _keyring():
         return None
 
 
-def _claude_code_token() -> str | None:
-    """Credencial nativa do Claude Code, se logado. Zero atrito, cross-platform."""
+def _claude_code_cred() -> dict | None:
+    """Blob claudeAiOauth do Claude Code, se logado: {accessToken, refreshToken, expiresAt}.
+    Cross-platform (arquivo no Linux/Windows, Keychain no macOS)."""
     path = os.path.expanduser("~/.claude/.credentials.json")  # Linux, Windows
     if os.path.exists(path):
         try:
             with open(path, encoding="utf-8") as f:
-                return json.load(f)["claudeAiOauth"]["accessToken"]
+                return json.load(f)["claudeAiOauth"]
         except Exception:
             pass
     if sys.platform == "darwin":  # macOS guarda no Keychain, não em arquivo
@@ -60,9 +68,83 @@ def _claude_code_token() -> str | None:
             blob = subprocess.run(
                 ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
                 capture_output=True, text=True, check=True).stdout
-            return json.loads(blob)["claudeAiOauth"]["accessToken"]
+            return json.loads(blob)["claudeAiOauth"]
         except Exception:
             pass
+    return None
+
+
+def _oauth_refresh(refresh_token: str) -> dict | None:
+    """Troca refresh_token por um access_token novo. Best-effort; None se falhar.
+    Só fala com o endpoint OAuth da Anthropic — não regrava a credencial do Claude Code."""
+    import time
+
+    import requests
+    try:
+        r = requests.post(OAUTH_TOKEN_URL, timeout=30, json={
+            "grant_type": "refresh_token", "refresh_token": refresh_token,
+            "client_id": OAUTH_CLIENT_ID})
+        if r.status_code != 200:
+            return None
+        d = r.json()
+        if not d.get("access_token"):
+            return None
+        return {"accessToken": d["access_token"],
+                "refreshToken": d.get("refresh_token", refresh_token),
+                "expiresAt": int((time.time() + int(d.get("expires_in", 3600))) * 1000)}
+    except Exception:
+        return None
+
+
+def _auto_load() -> dict | None:
+    kr = _keyring()
+    if not kr:
+        return None
+    try:
+        raw = kr.get_password(SERVICE, AUTO_ACCOUNT)
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
+
+
+def _auto_save(blob: dict) -> None:
+    kr = _keyring()
+    if not kr:
+        return
+    try:
+        kr.set_password(SERVICE, AUTO_ACCOUNT, json.dumps(blob))
+    except Exception:
+        pass
+
+
+def _auto_token() -> tuple[str | None, str | None]:
+    """(fonte, access_token) da cadeia auto-gerida: prefere a do cmon, senão bootstrapa
+    do Claude Code. Renova via refresh_token quando o access expira. (None, None) se nada."""
+    import time
+    blob, src = _auto_load(), "cmon auto-refresh"
+    if not blob:
+        blob, src = _claude_code_cred(), "credencial do Claude Code"
+    if not blob:
+        return None, None
+    exp = blob.get("expiresAt") or 0
+    if blob.get("accessToken") and time.time() * 1000 < exp - 60_000:  # 60s de folga
+        return src, blob["accessToken"]
+    if rt := blob.get("refreshToken"):
+        if new := _oauth_refresh(rt):
+            _auto_save(new)
+            return "cmon auto-refresh", new["accessToken"]
+    return (src, blob["accessToken"]) if blob.get("accessToken") else (None, None)
+
+
+def _force_refresh() -> str | None:
+    """Força uma renovação (usada quando a API devolve 401). Devolve o novo access_token,
+    ou None. Renova a partir da cadeia do cmon ou, na falta, da credencial do Claude Code —
+    então funciona mesmo se um CLAUDE_OAUTH_TOKEN velho (env/.env) estiver sombreando tudo."""
+    blob = _auto_load() or _claude_code_cred() or {}
+    if rt := blob.get("refreshToken"):
+        if new := _oauth_refresh(rt):
+            _auto_save(new)
+            return new["accessToken"]
     return None
 
 
@@ -76,9 +158,7 @@ def _resolve_token() -> tuple[str | None, str | None]:
                 return f"cofre do SO ({kr.get_keyring().name})", tok
         except Exception:
             pass
-    if tok := _claude_code_token():
-        return "credencial do Claude Code", tok
-    return None, None
+    return _auto_token()
 
 
 def get_token() -> str:
@@ -118,17 +198,26 @@ def token_status(_):
         print("Nenhum token disponível. Rode 'cmon token set'.")
         return
     print(f"Fonte : {src}\nToken : {_mask(tok)}")
+    if auto := _auto_load():  # cadeia renovada pelo cmon
+        exp = auto.get("expiresAt")
+        if exp:
+            import time
+            rem = (exp / 1000 - time.time()) / 3600
+            print(f"Auto  : renovado; expira em {rem:.1f}h" if rem > 0 else "Auto  : expirado (renova no próximo uso)")
 
 
 def token_clear(_):
     kr = _keyring()
     if not kr:
         sys.exit("Biblioteca 'keyring' ausente. Rode 'uv sync' para instalá-la.")
-    try:
-        kr.delete_password(SERVICE, ACCOUNT)
-        print("Token removido do cofre do SO.")
-    except Exception:
-        print("Nada havia guardado no cofre do SO.")
+    n = 0
+    for acct in (ACCOUNT, AUTO_ACCOUNT):
+        try:
+            kr.delete_password(SERVICE, acct)
+            n += 1
+        except Exception:
+            pass
+    print(f"Removido do cofre do SO ({n} entrada(s))." if n else "Nada havia guardado no cofre do SO.")
 
 
 def _retry_after(r) -> float | None:
@@ -146,15 +235,19 @@ def fetch(retries: int = RETRIES) -> dict:
     import time
 
     import requests
-    headers = {"Authorization": f"Bearer {get_token()}",
-               "anthropic-beta": "oauth-2025-04-20", "User-Agent": UA}
-    last = "?"
+    last, override = "?", None
     for attempt in range(retries):
+        # override = token recém-renovado após um 401; vence até um CLAUDE_OAUTH_TOKEN velho.
+        headers = {"Authorization": f"Bearer {override or get_token()}",
+                   "anthropic-beta": "oauth-2025-04-20", "User-Agent": UA}
         try:
             r = requests.get(URL, timeout=30, headers=headers)
             if r.status_code == 401:
-                raise FetchError("401 — token inválido ou expirado. Faça login no "
-                                 "Claude Code ou rode 'cmon token set'.")
+                if override is None and (new := _force_refresh()):
+                    override = new
+                    continue
+                raise FetchError("401 — token inválido ou expirado. Abra o Claude Code p/ "
+                                 "renovar, defina CLAUDE_OAUTH_TOKEN, ou rode 'cmon token set'.")
             if r.status_code == 403:
                 raise FetchError("403 — bloqueado (Cloudflare/User-Agent) ou sem "
                                  "acesso. O endpoint privado pode ter mudado.")
