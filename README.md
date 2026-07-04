@@ -1,5 +1,10 @@
 # cmon — Claude Monitor
 
+[![CI](https://github.com/LkHideki/cmon/actions/workflows/ci.yml/badge.svg)](https://github.com/LkHideki/cmon/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+
 CLI para rastrear o consumo do seu plano Claude ao longo do tempo. Lê o mesmo
 endpoint que o app usa (`https://claude.ai/api/oauth/usage`), guarda snapshots
 em DuckDB e mostra ritmo de consumo, projeções e gráficos.
@@ -7,9 +12,13 @@ em DuckDB e mostra ritmo de consumo, projeções e gráficos.
 ## Instalação
 
 ```bash
-git clone <seu-fork> cmon && cd cmon
-uv sync
+git clone https://github.com/LkHideki/cmon && cd cmon
+uv sync                  # instalação enxuta (sem libs de gráfico)
+uv sync --extra plot     # opcional: habilita o comando `plot` (matplotlib/seaborn)
 ```
+
+Requer Python ≥ 3.11 e [uv](https://docs.astral.sh/uv/). Sem uv, um
+`pip install -e .` também funciona.
 
 ## Token
 
@@ -168,7 +177,24 @@ se for esse o seu caso. Preferir cron na mão? Continua valendo:
   leituras muito próximas (`CMON_DEDUP_SECS`, padrão 60s; `--force` ignora) e sai
   com código ≠ 0 em falha, então o cron registra o erro em vez de silenciar.
 
+## Desenvolvimento
+
+Tudo vive num único arquivo, [`cmon.py`](cmon.py) — comandos são funções `now`,
+`collect`, `watch`, etc., ligadas ao argparse em `main()`. Fácil de ler de cima a baixo.
+
+```bash
+uv sync --extra plot         # instala tudo, inclusive libs de gráfico
+uv run ruff check .          # lint (config em pyproject.toml)
+uv run ruff check --fix .    # corrige o que dá
+uv run cmon <cmd>            # roda direto do fonte
+```
+
+O CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) roda ruff + um smoke
+do CLI em Python 3.11–3.13. PRs bem-vindos: mantenha o `ruff` verde e o estilo
+enxuto do arquivo. Variáveis de ambiente úteis: `CMON_DB` (caminho do banco),
+`CMON_RETRIES`, `CMON_DEDUP_SECS`.
+
 ## Aviso
 
 Usa um endpoint privado e não documentado da Anthropic; pode mudar sem aviso.
-Só acessa a sua própria conta. MIT.
+Só acessa a sua própria conta. Licença [MIT](LICENSE).
