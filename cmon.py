@@ -387,7 +387,7 @@ def _parse_since(s: str | None):
     if not s:
         return None
     s = s.strip().lower()
-    if s in ("all", "todos", "tudo", "*"):
+    if s in ("all", "*"):
         return None
     now_utc = datetime.now(UTC)
     if s.endswith("h"):
@@ -445,7 +445,7 @@ def plot(args):
     sns.lineplot(df, x="ts", y="percent", hue="label", marker="o", ax=ax[0])
     sns.barplot(b, x="hora", y="delta", hue="label", estimator="sum", errorbar=None, ax=ax[1])
     sns.barplot(b, x="dia", y="delta", hue="label", estimator="sum", errorbar=None, order=dias, ax=ax[2])
-    titulos = ["Utilização (%) no tempo", "Consumo por hora do dia", "Consumo por dia da semana"]
+    titulos = ["Usage (%) over time", "Consumption by hour of day", "Consumption by day of week"]
     for a, t in zip(ax, titulos, strict=True):
         a.set_title(t)
         a.set_xlabel("")
