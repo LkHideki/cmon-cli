@@ -194,7 +194,7 @@ def db(create: bool = True):
     return con
 
 
-def burn(con):
+def deltas(con):
     """delta = percent - snapshot anterior da mesma janela; delta<0 = reset (não é consumo)."""
     df = con.execute(
         "SELECT ts, key, label, percent, percent - lag(percent) "
@@ -297,7 +297,7 @@ def _parse_since(s: str | None):
 
 
 def report(args):
-    df = burn(db())
+    df = deltas(db())
     since = _parse_since(getattr(args, "since", None))
     if since is not None:
         df = df[df.ts >= since]
@@ -321,7 +321,7 @@ def plot(args):
         sys.exit("Os gráficos precisam dos extras de plot. Instale com:\n"
                  "  uv sync --extra plot         (no repositório)\n"
                  "  pip install 'cmon[plot]'     (via PyPI)")
-    df = burn(db())
+    df = deltas(db())
     df["hora"], df["dia"] = df.ts.dt.hour, df.ts.dt.day_name()
     b = df[df.delta > 0]
     dias = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
@@ -643,6 +643,154 @@ def trends(args):
                 print(f"  ⚠ ciclo atual {peaks[-1]:.0f}% vs média {avg:.0f}% (+{peaks[-1] / avg * 100 - 100:.0f}%)")
 
 
+# --- Camada de logs: minera ~/.claude/projects/**/*.jsonl p/ tokens & custo ---
+LOGS_ROOT = os.path.expanduser("~/.claude/projects")
+# US$ por milhão de tokens: (input, output, cache_read, cache_write_5m). Estimativa — ajuste aqui.
+PRICES = {
+    "fable":  (10.0, 50.0, 1.00, 12.50),
+    "opus":   (5.0, 25.0, 0.50, 6.25),
+    "sonnet": (3.0, 15.0, 0.30, 3.75),
+    "haiku":  (1.0, 5.0, 0.10, 1.25),
+}
+
+
+def _price(model: str):
+    m = (model or "").lower()
+    for k, p in PRICES.items():
+        if k in m:
+            return p
+    return (0.0, 0.0, 0.0, 0.0)
+
+
+def _short_model(model: str) -> str:
+    m = (model or "").lower()
+    for k in ("opus", "sonnet", "haiku"):
+        if k in m:
+            return k.capitalize()
+    return model or "?"
+
+
+def _parse_jsonl(path: str):
+    """Extrai as mensagens do assistant com usage de um transcript JSONL."""
+    proj_fallback = os.path.basename(os.path.dirname(path))
+    out = []
+    try:
+        f = open(path, encoding="utf-8")
+    except OSError:
+        return out
+    with f:
+        for line in f:
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            msg = o.get("message")
+            uid = o.get("uuid")
+            if not isinstance(msg, dict) or not uid:
+                continue
+            u = msg.get("usage")
+            ts = o.get("timestamp")
+            if not isinstance(u, dict) or not ts:
+                continue
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            cwd = o.get("cwd")
+            proj = os.path.basename(cwd.rstrip("/")) if cwd else proj_fallback
+            out.append((uid, dt, msg.get("model") or "?", proj, o.get("sessionId") or "?",
+                        int(u.get("input_tokens") or 0), int(u.get("output_tokens") or 0),
+                        int(u.get("cache_read_input_tokens") or 0),
+                        int(u.get("cache_creation_input_tokens") or 0)))
+    return out
+
+
+def scan_logs(con, since=None, quiet: bool = False) -> None:
+    """Varredura incremental dos JSONL -> tabela token_log. Cacheia por (mtime,size),
+    deduplica por uuid; com `since` pula arquivos mais antigos que a janela."""
+    import glob
+    con.execute("CREATE TABLE IF NOT EXISTS token_log("
+                "uuid TEXT PRIMARY KEY, ts TIMESTAMPTZ, model TEXT, project TEXT, session TEXT, "
+                "in_tok BIGINT, out_tok BIGINT, cache_read BIGINT, cache_create BIGINT)")
+    con.execute("CREATE TABLE IF NOT EXISTS scanned(path TEXT PRIMARY KEY, mtime DOUBLE, size BIGINT)")
+    seen = {p: (m, s) for p, m, s in con.execute("SELECT path, mtime, size FROM scanned").fetchall()}
+    since_epoch = since.timestamp() if since else None
+    todo = []
+    for f in glob.glob(os.path.join(LOGS_ROOT, "**", "*.jsonl"), recursive=True):
+        try:
+            st = os.stat(f)
+        except OSError:
+            continue
+        if seen.get(f) == (st.st_mtime, st.st_size):
+            continue
+        if since_epoch and st.st_mtime < since_epoch:
+            continue  # fora da janela; não marca como scanned p/ uma varredura futura pegar
+        todo.append((f, st))
+    if todo and not quiet:
+        print(f"varrendo {len(todo)} arquivo(s) de log…", file=sys.stderr)
+    for f, st in todo:
+        rows = _parse_jsonl(f)
+        if rows:
+            con.executemany("INSERT INTO token_log VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING", rows)
+        con.execute("INSERT INTO scanned VALUES (?,?,?) ON CONFLICT (path) DO UPDATE "
+                    "SET mtime=excluded.mtime, size=excluded.size", [f, st.st_mtime, st.st_size])
+
+
+def _burn_rows(con, since):
+    """Tokens por (janela, modelo) desde `since`, já com custo estimado por linha."""
+    where = "WHERE ts >= ?" if since else ""
+    df = con.execute(
+        f"SELECT model, sum(in_tok) i, sum(out_tok) o, sum(cache_read) r, sum(cache_create) c "
+        f"FROM token_log {where} GROUP BY model", [since] if since else []).df()
+    return df
+
+
+def _burn_summary(df):
+    """(tokens_total, custo_usd, 'Opus 80% · Sonnet 20%') a partir de _burn_rows, ou None."""
+    if df.empty:
+        return None
+    tok, cost, bym = 0, 0.0, {}
+    for _, r in df.iterrows():
+        p = _price(r.model)
+        cost += (r.i * p[0] + r.o * p[1] + r.r * p[2] + r.c * p[3]) / 1e6
+        t = int(r.i + r.o + r.r + r.c)
+        tok += t
+        bym[_short_model(r.model)] = bym.get(_short_model(r.model), 0) + t
+    mix = " · ".join(f"{k} {v / tok * 100:.0f}%" for k, v in sorted(bym.items(), key=lambda x: -x[1])) if tok else ""
+    return tok, cost, mix
+
+
+def burn(args):
+    """Relatório de tokens & US$ estimado a partir dos logs locais do Claude Code."""
+    con = db()
+    since = _parse_since(getattr(args, "since", None))
+    scan_logs(con, since)
+    col = {"model": "model", "day": "CAST(ts AS DATE)", "project": "project", "session": "session"}[args.by]
+    where = "WHERE ts >= ?" if since else ""
+    df = con.execute(
+        f"SELECT {col} grp, model, sum(in_tok) i, sum(out_tok) o, sum(cache_read) r, sum(cache_create) c "
+        f"FROM token_log {where} GROUP BY grp, model", [since] if since else []).df()
+    if df.empty:
+        sys.exit("Sem dados de log do Claude Code no período.")
+    df["custo"] = [
+        (row.i * _price(row.model)[0] + row.o * _price(row.model)[1]
+         + row.r * _price(row.model)[2] + row.c * _price(row.model)[3]) / 1e6
+        for row in df.itertuples()]
+    df["tok"] = df.i + df.o + df.r + df.c
+    g = df.groupby("grp").agg(tok=("tok", "sum"), custo=("custo", "sum")).reset_index()
+    g = g.sort_values("custo", ascending=False)
+    if getattr(args, "json", False):
+        print(g.to_json(orient="records", force_ascii=False))
+        return
+    per = {"model": "modelo", "day": "dia", "project": "projeto", "session": "sessão"}[args.by]
+    janela = f" desde {since:%Y-%m-%d %H:%M} UTC" if since else ""
+    print(f"Consumo por {per}{janela} (estimado):")
+    for row in g.itertuples():
+        print(f"  {str(row.grp):24} {row.tok / 1e6:8.2f}M tok   US$ {row.custo:8.2f}")
+    print(f"  {'TOTAL':24} {g.tok.sum() / 1e6:8.2f}M tok   US$ {g.custo.sum():8.2f}")
+    print("\n(estimativa; só uso do Claude Code CLI — não inclui claude.ai web/desktop.)")
+
+
 def watch(args):
     """TUI ao vivo: re-consulta o uso a cada N segundos e redesenha. Ctrl-C sai.
     Com --collect, grava cada leitura no banco (respeitando o dedup)."""
@@ -866,6 +1014,11 @@ def main():
     ps = sub.add_parser("status", help="linha única p/ statusline/tmux/prompt (lê cache local)")
     ps.add_argument("--live", action="store_true", help="consulta a API em vez do cache local")
     sub.add_parser("trends", help="consumo por ciclo: pico, delta e anomalia")
+    pb = sub.add_parser("burn", help="tokens & US$ estimado dos logs locais do Claude Code")
+    pb.add_argument("--by", choices=["model", "day", "project", "session"], default="model",
+                    help="agrupa por modelo (padrão), dia, projeto ou sessão")
+    pb.add_argument("--since", help="filtra a partir de '24h', '7d' ou data ISO")
+    pb.add_argument("--json", action="store_true", help="saída em JSON")
     pc = sub.add_parser("collect", help="grava 1 snapshot no banco")
     pc.add_argument("--force", action="store_true", help="grava mesmo com snapshot recente (ignora dedup)")
     pc.add_argument("--alert", action="store_true",
@@ -909,7 +1062,7 @@ def main():
         return
     try:
         {"now": now, "status": status, "trends": trends, "collect": collect, "report": report,
-         "watch": watch, "wait": wait, "plot": plot, "tips": tips,
+         "burn": burn, "watch": watch, "wait": wait, "plot": plot, "tips": tips,
          "install": install, "uninstall": uninstall}[args.cmd](args)
     except FetchError as e:
         sys.exit(f"cmon: {e}")
