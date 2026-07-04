@@ -428,6 +428,20 @@ def _open_file(path):
         pass
 
 
+def _time_formatter(tz):
+    """Axis time labels as '16h' / '16h40' (drop ':00'); date ('Jul 05') at day boundaries so
+    multi-day panels keep a reference. tz-aware via the axis' own tz (else labels shift by UTC offset)."""
+    import matplotlib.dates as mdates
+    from matplotlib.ticker import FuncFormatter
+
+    def fmt(x, _pos=None):
+        dt = mdates.num2date(x, tz=tz)
+        if dt.hour == 0 and dt.minute == 0:
+            return dt.strftime("%b %d")
+        return f"{dt:%H}h" if dt.minute == 0 else f"{dt:%H}h{dt:%M}"
+    return FuncFormatter(fmt)
+
+
 def _pace_ax(ax, con, key: str, title: str, now_utc) -> None:
     """Actual cumulative % of the CURRENT cycle vs. the even-pace line to 100% at reset.
     Above the line = burning faster than even → hits 100% before reset; below = buffer left.
@@ -457,6 +471,7 @@ def _pace_ax(ax, con, key: str, title: str, now_utc) -> None:
     ax.set_title(title)
     ax.set_xlabel("")
     ax.legend(loc="upper left", fontsize=8)
+    ax.xaxis.set_major_formatter(_time_formatter(seg.ts.dt.tz))
     ax.tick_params(axis="x", rotation=30)
 
 
@@ -477,12 +492,14 @@ def _burn_ax(ax, con, since) -> None:
                    + r.r * _price(r.model)[2] + r.c * _price(r.model)[3]) / 1e6
                   for r in df.itertuples()]
     df["m"] = df.model.map(_short_model)
+    import pandas as pd
     piv = df.pivot_table(index="d", columns="m", values="cost", aggfunc="sum", fill_value=0)
     piv.plot(kind="bar", stacked=True, ax=ax)
     ax.set_title("Burn — API-equivalent cost/day by model (US$)")
     ax.set_ylabel("US$")
     ax.set_xlabel("")
-    ax.tick_params(axis="x", rotation=45)
+    # pandas labels bars with the raw datetime index ('2026-06-09 00:00:00'): reformat to 'Jun 09'.
+    ax.set_xticklabels(pd.to_datetime(piv.index).strftime("%b %d"), rotation=45, ha="right", fontsize=8)
     ax.legend(fontsize=8, title="")
 
 
@@ -505,6 +522,7 @@ def plot(args):
     axd["traj"].set_title("Usage (%) over time")
     axd["traj"].set_xlabel("")
     axd["traj"].set_ylim(0, 105)
+    axd["traj"].xaxis.set_major_formatter(_time_formatter(df.ts.dt.tz))
     _pace_ax(axd["pace_s"], con, "session", "Pace — 5h window (stay below line = don't block)", now_utc)
     _pace_ax(axd["pace_w"], con, "weekly_all", "Pace — Weekly all models (aim for line = full use)", now_utc)
     _burn_ax(axd["burn"], con, since)
