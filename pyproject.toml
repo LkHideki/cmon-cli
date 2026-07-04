@@ -4,28 +4,57 @@ version = "0.1.0"
 description = "Claude Monitor — rastreia o consumo do seu plano Claude ao longo do tempo"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.14"
-dependencies = [
-    "duckdb>=1.5.4",
-    "keyring>=25.6.0",
-    "matplotlib>=3.11.0",
-    "python-dotenv>=1.2.2",
-    "requests>=2.34.2",
-    "rich>=14.0.0",
-    "seaborn>=0.13.2",
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "Lucas Hideki", email = "lucas.hideki.07@gmail.com" }]
+keywords = ["claude", "anthropic", "cli", "usage", "monitor", "quota", "duckdb", "tui"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Utilities",
 ]
+dependencies = [
+    "duckdb>=1.1",
+    "pandas>=2.0",
+    "keyring>=25.0",
+    "python-dotenv>=1.0",
+    "requests>=2.32",
+    "rich>=13.0",
+]
+
+# Gráficos são opcionais: matplotlib+seaborn são pesados e só o comando `plot`
+# os usa. `uv sync` padrão fica enxuto; para gráficos: `uv sync --extra plot`.
+[project.optional-dependencies]
+plot = ["matplotlib>=3.8", "seaborn>=0.13"]
 
 [project.scripts]
-cmon = "main:main"
+cmon = "cmon:main"
+
+[project.urls]
+Homepage = "https://github.com/LkHideki/cmon"
+Repository = "https://github.com/LkHideki/cmon"
+Issues = "https://github.com/LkHideki/cmon/issues"
 
 [dependency-groups]
-dev = [
-    "ruff>=0.15.20",
-]
+dev = ["ruff>=0.6"]
 
 [tool.hatch.build.targets.wheel]
-only-include = ["main.py"]
+only-include = ["cmon.py"]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

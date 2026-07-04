@@ -21,7 +21,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 DB = os.environ.get("CMON_DB", "usage.duckdb")
 URL = "https://claude.ai/api/oauth/usage"
@@ -144,6 +144,7 @@ def fetch(retries: int = RETRIES) -> dict:
     mensagem legível — 401/403 falham na hora (não adianta repetir); 429 e 5xx
     e erros de rede tentam de novo com espera exponencial (respeitando Retry-After)."""
     import time
+
     import requests
     headers = {"Authorization": f"Bearer {get_token()}",
                "anthropic-beta": "oauth-2025-04-20", "User-Agent": UA}
@@ -212,7 +213,7 @@ def bar(pct: float, width: int = 20) -> str:
 def fmt_eta(iso: str | None) -> str:
     if not iso:
         return "-"
-    secs = (datetime.fromisoformat(iso) - datetime.now(timezone.utc)).total_seconds()
+    secs = (datetime.fromisoformat(iso) - datetime.now(UTC)).total_seconds()
     if secs < 0:
         return "expirado"
     h, m = divmod(int(secs // 60), 60)
@@ -246,7 +247,7 @@ def now(_):
         print("Ritmo: sem consumo mensurável nesta janela.")
         return
     rate = dpct / dt_h
-    rem_h = (end - datetime.now(timezone.utc)).total_seconds() / 3600
+    rem_h = (end - datetime.now(UTC)).total_seconds() / 3600
     proj = min(pct + rate * rem_h, 100)
     print(f"Ritmo: {rate:.1f}%/h → projeção no reset: {proj:.0f}%.")
     if pct < 100:
@@ -261,7 +262,7 @@ def now(_):
 
 def collect(args):
     con = db()
-    ts = datetime.now(timezone.utc)
+    ts = datetime.now(UTC)
     if not getattr(args, "force", False):
         recent = con.execute("SELECT count(*) FROM snapshots WHERE ts > ?",
                              [ts - timedelta(seconds=DEDUP_SECS)]).fetchone()[0]
@@ -286,13 +287,13 @@ def _parse_since(s: str | None):
     if not s:
         return None
     s = s.strip().lower()
-    now_utc = datetime.now(timezone.utc)
+    now_utc = datetime.now(UTC)
     if s.endswith("h"):
         return now_utc - timedelta(hours=float(s[:-1]))
     if s.endswith("d"):
         return now_utc - timedelta(days=float(s[:-1]))
     dt = datetime.fromisoformat(s)
-    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
 
 def report(args):
@@ -313,8 +314,13 @@ def report(args):
 
 
 def plot(args):
-    import matplotlib.pyplot as plt
-    import seaborn as sns
+    try:
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+    except ImportError:
+        sys.exit("Os gráficos precisam dos extras de plot. Instale com:\n"
+                 "  uv sync --extra plot         (no repositório)\n"
+                 "  pip install 'cmon[plot]'     (via PyPI)")
     df = burn(db())
     df["hora"], df["dia"] = df.ts.dt.hour, df.ts.dt.day_name()
     b = df[df.delta > 0]
@@ -324,7 +330,8 @@ def plot(args):
     sns.lineplot(df, x="ts", y="percent", hue="label", marker="o", ax=ax[0])
     sns.barplot(b, x="hora", y="delta", hue="label", estimator="sum", errorbar=None, ax=ax[1])
     sns.barplot(b, x="dia", y="delta", hue="label", estimator="sum", errorbar=None, order=dias, ax=ax[2])
-    for a, t in zip(ax, ["Utilização (%) no tempo", "Consumo por hora do dia", "Consumo por dia da semana"]):
+    titulos = ["Utilização (%) no tempo", "Consumo por hora do dia", "Consumo por dia da semana"]
+    for a, t in zip(ax, titulos, strict=True):
         a.set_title(t)
         a.set_xlabel("")
     fig.tight_layout()
@@ -352,7 +359,7 @@ def _rate(con, key) -> float | None:
 def _alerts(rows, con) -> list[str]:
     """Avisa quando, no ritmo atual, uma janela bate 100% antes do reset.
     Precisa de histórico (via _rate); sem banco/ritmo não gera nada."""
-    now_utc = datetime.now(timezone.utc)
+    now_utc = datetime.now(UTC)
     msgs = []
     for key, lbl, pct, reset, _a in rows:
         if not reset or pct >= 100:
@@ -428,10 +435,12 @@ def _window_tips(lbl: str, pct: float, reset: str | None, rate: float | None, no
     if proj < 97:
         gap = tgt - rate
         extra = f" (~+{gap:.2f}%/h)" if gap > 0 else ""
-        out.append(f"  ↑ upside: ~{100 - proj:.0f}% ficariam na mesa — dá p/ intensificar{extra} ou usar modelo mais forte")
+        out.append(f"  ↑ upside: ~{100 - proj:.0f}% ficariam na mesa — dá p/ intensificar{extra} "
+                   "ou usar modelo mais forte")
     elif proj > 103:
         eta = (100 - pct) / rate
-        out.append(f"  ⚠ vai faltar: bate 100% em ~{eta:.0f}h ({rem_h - eta:.0f}h antes do reset) — freie p/ ~{tgt:.2f}%/h ou troque p/ modelo mais barato")
+        out.append(f"  ⚠ vai faltar: bate 100% em ~{eta:.0f}h ({rem_h - eta:.0f}h antes do reset) — "
+                   f"freie p/ ~{tgt:.2f}%/h ou troque p/ modelo mais barato")
     else:
         out.append("  ✓ no ritmo certo p/ chegar perto de 100% no reset")
     return out, summ
@@ -440,7 +449,7 @@ def _window_tips(lbl: str, pct: float, reset: str | None, rate: float | None, no
 def tips(args):
     rows = limits(fetch())
     con = db(create=False)
-    now_utc = datetime.now(timezone.utc)
+    now_utc = datetime.now(UTC)
     print("cmon tips — usar ~100% do semanal sem faltar nem travar a janela de 5h.\n")
 
     summaries = []
@@ -494,7 +503,7 @@ def _read_cache():
         with open(CACHE, encoding="utf-8") as f:
             d = json.load(f)
         ts = datetime.fromisoformat(d["ts"])
-        return [tuple(r) for r in d["rows"]], (datetime.now(timezone.utc) - ts).total_seconds()
+        return [tuple(r) for r in d["rows"]], (datetime.now(UTC) - ts).total_seconds()
     except Exception:
         return None
 
@@ -511,7 +520,7 @@ def _rows_from_db():
     rows = [(r.key, r.label, float(r.percent),
              r.resets_at.isoformat() if r.resets_at is not None else None,
              bool(r.is_active)) for r in df.itertuples()]
-    return rows, (datetime.now(timezone.utc) - df.ts.iloc[0]).total_seconds()
+    return rows, (datetime.now(UTC) - df.ts.iloc[0]).total_seconds()
 
 
 def status(args):
@@ -578,7 +587,7 @@ def wait(args):
         target = datetime.fromisoformat(reset)
         print(f"Aguardando {lbl} resetar (~{fmt_eta(reset)}, {pct0:.0f}% usado agora)… Ctrl-C sai.")
         while True:
-            now_utc = datetime.now(timezone.utc)
+            now_utc = datetime.now(UTC)
             if now_utc >= target:
                 r = get()
                 if r is None or r[2] < pct0 or r[3] != reset:
@@ -638,6 +647,7 @@ def watch(args):
     """TUI ao vivo: re-consulta o uso a cada N segundos e redesenha. Ctrl-C sai.
     Com --collect, grava cada leitura no banco (respeitando o dedup)."""
     import time
+
     from rich.console import Console, Group
     from rich.live import Live
     from rich.panel import Panel
@@ -656,13 +666,13 @@ def watch(args):
             return Panel(Text(f"{e}\nnova tentativa em {args.interval}s", style="red"),
                          title="cmon watch — erro", border_style="red")
         if args.collect:
-            ts = datetime.now(timezone.utc)
+            ts = datetime.now(UTC)
             recent = con.execute("SELECT count(*) FROM snapshots WHERE ts > ?",
                                  [ts - timedelta(seconds=DEDUP_SECS)]).fetchone()[0]
             if not recent:
                 con.executemany("INSERT INTO snapshots VALUES (?,?,?,?,?,?)",
                                 [[ts, k, lbl, pct, reset, act] for k, lbl, pct, reset, act in rows])
-        now_utc = datetime.now(timezone.utc)
+        now_utc = datetime.now(UTC)
         t = Table(expand=True, header_style="bold")
         t.add_column("Janela")
         t.add_column("Uso", ratio=1)
@@ -858,7 +868,8 @@ def main():
     sub.add_parser("trends", help="consumo por ciclo: pico, delta e anomalia")
     pc = sub.add_parser("collect", help="grava 1 snapshot no banco")
     pc.add_argument("--force", action="store_true", help="grava mesmo com snapshot recente (ignora dedup)")
-    pc.add_argument("--alert", action="store_true", help="avisa (stderr + notificação) se projetar 100%% antes do reset")
+    pc.add_argument("--alert", action="store_true",
+                    help="avisa (stderr + notificação) se projetar 100%% antes do reset")
     pr = sub.add_parser("report", help="resumo do consumo acumulado")
     pr.add_argument("--since", help="filtra a partir de '24h', '7d' ou data ISO")
     pr.add_argument("--json", action="store_true", help="saída em JSON")
