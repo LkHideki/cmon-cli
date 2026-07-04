@@ -37,10 +37,40 @@ para o resto.
 
 ```bash
 uv run cmon now       # uso atual + tempo até o reset + ritmo/projeção
+uv run cmon watch     # TUI ao vivo, atualiza sozinho (Ctrl-C sai)
 uv run cmon collect   # grava 1 snapshot no banco (com timestamp UTC)
 uv run cmon report    # resumo do consumo acumulado
 uv run cmon plot      # gráficos -> usage.png
 uv run cmon tips      # dicas de pacing (usar ~100% do semanal sem travar o 5h)
+```
+
+### `cmon watch` — TUI ao vivo
+
+Painel que se atualiza sozinho: barras coloridas por janela (verde/amarelo/
+vermelho), ritmo `%/h`, projeção no reset e alertas quando você vai bater 100%
+antes do reset. Ótimo pra deixar aberto num canto do terminal.
+
+```bash
+uv run cmon watch                 # atualiza a cada 30s
+uv run cmon watch -n 10           # a cada 10s
+uv run cmon watch --collect       # grava cada leitura no banco enquanto observa
+```
+
+### Alertas
+
+`_alerts` avisa quando, **no ritmo atual, a janela bate 100% antes do reset**.
+Aparecem em `now` e `watch`; no `collect --alert` vão pro stderr (o cron manda
+por e-mail) e disparam uma notificação nativa best-effort (macOS/Linux):
+
+```cron
+*/20 * * * * cd ~/cmon && /caminho/para/uv run cmon collect --alert
+```
+
+### `cmon report`
+
+```bash
+uv run cmon report --since 24h    # só as últimas 24h (aceita 7d ou data ISO)
+uv run cmon report --json         # saída em JSON p/ script/pipe
 ```
 
 ### `cmon tips`
@@ -89,6 +119,10 @@ O `report`/`plot` ficam úteis com histórico. Agende o `collect` no cron:
   (descartadas), não consumo.
 - É preciso o header `User-Agent: claude-cli/...`, senão o Cloudflare do
   claude.ai responde 403.
+- **Robustez**: `fetch` tenta de novo em 429/5xx/rede com backoff (respeita
+  `Retry-After`); 401/403 falham na hora com mensagem clara. `collect` deduplica
+  leituras muito próximas (`CMON_DEDUP_SECS`, padrão 60s; `--force` ignora) e sai
+  com código ≠ 0 em falha, então o cron registra o erro em vez de silenciar.
 
 ## Aviso
 
