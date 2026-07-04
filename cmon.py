@@ -383,10 +383,12 @@ def collect(args):
 
 
 def _parse_since(s: str | None):
-    """'24h', '7d' ou uma data/hora ISO -> datetime UTC. None se vazio."""
+    """'24h', '7d' ou uma data/hora ISO -> datetime UTC. None se vazio ou 'all' (tudo)."""
     if not s:
         return None
     s = s.strip().lower()
+    if s in ("all", "todos", "tudo", "*"):
+        return None
     now_utc = datetime.now(UTC)
     if s.endswith("h"):
         return now_utc - timedelta(hours=float(s[:-1]))
@@ -1187,7 +1189,8 @@ def main():
     pb = sub.add_parser("burn", help="tokens & US$ estimado dos logs locais do Claude Code")
     pb.add_argument("--by", choices=["model", "surface", "day", "project", "session"], default="model",
                     help="agrupa por modelo (padrão), surface (terminal/vscode/app/sdk), dia, projeto ou sessão")
-    pb.add_argument("--since", help="filtra a partir de '24h', '7d' ou data ISO")
+    pb.add_argument("--since", default="30d",
+                    help="janela: '24h', '7d', '30d' (padrão), data ISO, ou 'all' p/ tudo")
     pb.add_argument("--json", action="store_true", help="saída em JSON")
     pc = sub.add_parser("collect", help="grava 1 snapshot no banco")
     pc.add_argument("--force", action="store_true", help="grava mesmo com snapshot recente (ignora dedup)")

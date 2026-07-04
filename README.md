@@ -104,12 +104,17 @@ o endpoint não expõe: **tokens e US$ estimado por modelo, dia, projeto ou sess
 — retroativo, offline, sem token.
 
 ```bash
-uv run cmon burn                    # por modelo
+uv run cmon burn                    # por modelo, últimos 30 dias (padrão)
 uv run cmon burn --by surface       # por cliente: terminal / vscode / app / sdk (-p)
 uv run cmon burn --by project       # atribuição por projeto (onde seu plano foi)
-uv run cmon burn --by day --since 7d
+uv run cmon burn --since 7d         # janela menor (24h, 7d, data ISO…)
+uv run cmon burn --since all        # histórico completo (mas o Claude Code só guarda ~30d)
 uv run cmon burn --json
 ```
+
+A janela padrão é **30 dias** — o Claude Code apaga transcripts mais antigos que
+isso, então além de 30d normalmente não há dado. Use `--since all` p/ tudo o que
+houver, ou `--since 7d`/`24h`/data ISO p/ janelas menores.
 
 `--by surface` separa por onde você usou (campo `entrypoint` dos logs). Só do
 Claude Code, porém — contas diferentes (por email) **não** são separáveis: os
