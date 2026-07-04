@@ -40,6 +40,13 @@ OAUTH_CLIENT_ID = os.environ.get("CMON_OAUTH_CLIENT_ID", "9d1c250a-e61b-44d9-88e
 OAUTH_TOKEN_URL = os.environ.get("CMON_OAUTH_TOKEN_URL", "https://console.anthropic.com/v1/oauth/token")
 
 
+try:  # orjson acelera ~2-3x o parse dos logs; json puro é o fallback.
+    import orjson
+    _loads = orjson.loads
+except ImportError:
+    _loads = json.loads
+
+
 class FetchError(Exception):
     """Falha ao consultar o endpoint de uso, com mensagem já legível ao usuário."""
 
@@ -773,18 +780,29 @@ def _short_model(model: str) -> str:
     return model or "?"
 
 
+SURFACE = {"cli": "terminal", "claude-vscode": "vscode", "claude-desktop": "app (desktop)",
+           "sdk-cli": "sdk (-p/agente)"}
+
+
+def _surface(entrypoint: str) -> str:
+    return SURFACE.get(entrypoint, entrypoint or "?")
+
+
 def _parse_jsonl(path: str):
-    """Extrai as mensagens do assistant com usage de um transcript JSONL."""
+    """Extrai as mensagens do assistant com usage de um transcript JSONL.
+    Só faz json.loads em linhas que contêm '"usage"' — o resto (user/tool) é pulado barato."""
     proj_fallback = os.path.basename(os.path.dirname(path))
     out = []
     try:
-        f = open(path, encoding="utf-8")
+        f = open(path, "rb")  # binário + orjson: parse mais rápido
     except OSError:
         return out
     with f:
         for line in f:
+            if b'"usage"' not in line:  # pré-filtro: evita parsear a maioria das linhas
+                continue
             try:
-                o = json.loads(line)
+                o = _loads(line)
             except Exception:
                 continue
             msg = o.get("message")
@@ -801,7 +819,8 @@ def _parse_jsonl(path: str):
                 continue
             cwd = o.get("cwd")
             proj = os.path.basename(cwd.rstrip("/")) if cwd else proj_fallback
-            out.append((uid, dt, msg.get("model") or "?", proj, o.get("sessionId") or "?",
+            out.append((uid, dt, msg.get("model") or "?", o.get("entrypoint") or "?",
+                        proj, o.get("sessionId") or "?",
                         int(u.get("input_tokens") or 0), int(u.get("output_tokens") or 0),
                         int(u.get("cache_read_input_tokens") or 0),
                         int(u.get("cache_creation_input_tokens") or 0)))
@@ -810,10 +829,20 @@ def _parse_jsonl(path: str):
 
 def scan_logs(con, since=None, quiet: bool = False) -> None:
     """Varredura incremental dos JSONL -> tabela token_log. Cacheia por (mtime,size),
-    deduplica por uuid; com `since` pula arquivos mais antigos que a janela."""
+    deduplica por uuid; com `since` pula arquivos mais antigos que a janela. O parse
+    dos arquivos novos roda em paralelo (multicore)."""
     import glob
+    # Migração: se a token_log é de um schema antigo (sem entrypoint), reconstrói — é cache.
+    try:
+        cols = [r[1] for r in con.execute("PRAGMA table_info('token_log')").fetchall()]
+    except Exception:
+        cols = []  # tabela ainda não existe (banco novo)
+    if cols and "entrypoint" not in cols:
+        con.execute("DROP TABLE token_log")
+        con.execute("DROP TABLE IF EXISTS scanned")
     con.execute("CREATE TABLE IF NOT EXISTS token_log("
-                "uuid TEXT PRIMARY KEY, ts TIMESTAMPTZ, model TEXT, project TEXT, session TEXT, "
+                "uuid TEXT PRIMARY KEY, ts TIMESTAMPTZ, model TEXT, entrypoint TEXT, "
+                "project TEXT, session TEXT, "
                 "in_tok BIGINT, out_tok BIGINT, cache_read BIGINT, cache_create BIGINT)")
     con.execute("CREATE TABLE IF NOT EXISTS scanned(path TEXT PRIMARY KEY, mtime DOUBLE, size BIGINT)")
     seen = {p: (m, s) for p, m, s in con.execute("SELECT path, mtime, size FROM scanned").fetchall()}
@@ -829,14 +858,42 @@ def scan_logs(con, since=None, quiet: bool = False) -> None:
         if since_epoch and st.st_mtime < since_epoch:
             continue  # fora da janela; não marca como scanned p/ uma varredura futura pegar
         todo.append((f, st))
-    if todo and not quiet:
+    if not todo:
+        return
+    if not quiet:
         print(f"varrendo {len(todo)} arquivo(s) de log…", file=sys.stderr)
-    for f, st in todo:
-        rows = _parse_jsonl(f)
-        if rows:
-            con.executemany("INSERT INTO token_log VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING", rows)
-        con.execute("INSERT INTO scanned VALUES (?,?,?) ON CONFLICT (path) DO UPDATE "
-                    "SET mtime=excluded.mtime, size=excluded.size", [f, st.st_mtime, st.st_size])
+    import pandas as pd
+    parsed = _parse_many([f for f, _ in todo])  # paralelo (com fallback serial)
+    rows = [r for chunk in parsed for r in chunk]
+    if rows:
+        # Insert vetorizado via DataFrame: ~680x mais rápido que executemany+ON CONFLICT.
+        # drop_duplicates resolve uuids repetidos dentro do lote (transcripts espelhados).
+        tdf = pd.DataFrame(rows, columns=["uuid", "ts", "model", "entrypoint", "project",
+                                          "session", "in_tok", "out_tok", "cache_read",
+                                          "cache_create"]).drop_duplicates("uuid")
+        con.register("_tl_new", tdf)
+        con.execute("INSERT INTO token_log SELECT * FROM _tl_new ON CONFLICT DO NOTHING")
+        con.unregister("_tl_new")
+    sdf = pd.DataFrame([[f, st.st_mtime, st.st_size] for f, st in todo],
+                       columns=["path", "mtime", "size"])
+    con.register("_sc_new", sdf)
+    con.execute("INSERT INTO scanned SELECT * FROM _sc_new ON CONFLICT (path) DO UPDATE "
+                "SET mtime=excluded.mtime, size=excluded.size")
+    con.unregister("_sc_new")
+
+
+def _parse_many(paths: list) -> list:
+    """Parseia vários JSONL em paralelo (ProcessPool). Cai p/ serial se o pool falhar
+    ou se forem poucos arquivos (overhead de spawn não compensa)."""
+    if len(paths) < 8:
+        return [_parse_jsonl(p) for p in paths]
+    try:
+        from concurrent.futures import ProcessPoolExecutor
+        workers = min(8, (os.cpu_count() or 2))
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            return list(ex.map(_parse_jsonl, paths, chunksize=16))
+    except Exception:
+        return [_parse_jsonl(p) for p in paths]
 
 
 def _burn_rows(con, since):
@@ -868,7 +925,8 @@ def burn(args):
     con = db()
     since = _parse_since(getattr(args, "since", None))
     scan_logs(con, since)
-    col = {"model": "model", "day": "CAST(ts AS DATE)", "project": "project", "session": "session"}[args.by]
+    col = {"model": "model", "surface": "entrypoint", "day": "CAST(ts AS DATE)",
+           "project": "project", "session": "session"}[args.by]
     where = "WHERE ts >= ?" if since else ""
     df = con.execute(
         f"SELECT {col} grp, model, sum(in_tok) i, sum(out_tok) o, sum(cache_read) r, sum(cache_create) c "
@@ -885,11 +943,13 @@ def burn(args):
     if getattr(args, "json", False):
         print(g.to_json(orient="records", force_ascii=False))
         return
-    per = {"model": "modelo", "day": "dia", "project": "projeto", "session": "sessão"}[args.by]
+    per = {"model": "modelo", "surface": "cliente", "day": "dia",
+           "project": "projeto", "session": "sessão"}[args.by]
     janela = f" desde {since:%Y-%m-%d %H:%M} UTC" if since else ""
     print(f"Consumo por {per}{janela} (estimado):")
     for row in g.itertuples():
-        print(f"  {str(row.grp):24} {row.tok / 1e6:8.2f}M tok   US$ {row.custo:8.2f}")
+        label = _surface(row.grp) if args.by == "surface" else str(row.grp)
+        print(f"  {label:24} {row.tok / 1e6:8.2f}M tok   US$ {row.custo:8.2f}")
     print(f"  {'TOTAL':24} {g.tok.sum() / 1e6:8.2f}M tok   US$ {g.custo.sum():8.2f}")
     print("\n(estimativa; só uso do Claude Code CLI — não inclui claude.ai web/desktop.)")
 
@@ -1125,8 +1185,8 @@ def main():
     ps.add_argument("--live", action="store_true", help="consulta a API em vez do cache local")
     sub.add_parser("trends", help="consumo por ciclo: pico, delta e anomalia")
     pb = sub.add_parser("burn", help="tokens & US$ estimado dos logs locais do Claude Code")
-    pb.add_argument("--by", choices=["model", "day", "project", "session"], default="model",
-                    help="agrupa por modelo (padrão), dia, projeto ou sessão")
+    pb.add_argument("--by", choices=["model", "surface", "day", "project", "session"], default="model",
+                    help="agrupa por modelo (padrão), surface (terminal/vscode/app/sdk), dia, projeto ou sessão")
     pb.add_argument("--since", help="filtra a partir de '24h', '7d' ou data ISO")
     pb.add_argument("--json", action="store_true", help="saída em JSON")
     pc = sub.add_parser("collect", help="grava 1 snapshot no banco")

@@ -25,6 +25,7 @@ classifiers = [
 dependencies = [
     "duckdb>=1.1",
     "pandas>=2.0",
+    "orjson>=3.10",
     "keyring>=25.0",
     "python-dotenv>=1.0",
     "requests>=2.32",
