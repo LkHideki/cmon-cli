@@ -37,10 +37,20 @@ O `cmon` resolve o token nesta ordem, parando no primeiro que encontrar:
    Keychain (macOS) ou de `~/.claude/.credentials.json` (Linux/Windows). Zero
    atrito: nada a configurar.
 
-Ou seja, com o Claude Code logado não precisa de nada. Sem ele, `cmon token set`
-guarda o token com segurança em qualquer sistema. `.env` continua funcionando
-para o passo 1 (veja `.env.example`). Rode `cmon --help` ou `cmon token --help`
-para o resto.
+**Auto-refresh:** quando o access token expira, o `cmon` o renova sozinho via
+`refresh_token` e guarda a nova cadeia num cofre próprio (`claude-oauth-auto`),
+**sem** regravar a credencial do Claude Code. Renova de forma proativa (lê o
+`expiresAt`) e reativa (se a API devolver 401 — inclusive quando um
+`CLAUDE_OAUTH_TOKEN` velho está sombreando tudo). Efeito colateral: a 1ª
+renovação gira o `refresh_token` do Claude Code, então **ele pode pedir login uma
+vez** na próxima vez que for renovar — depois disso as duas cadeias ficam
+independentes. `token status` mostra a validade; `client_id`/endpoint são
+configuráveis por `CMON_OAUTH_CLIENT_ID` / `CMON_OAUTH_TOKEN_URL`.
+
+Ou seja, com o Claude Code logado não precisa de nada — e continua funcionando
+mesmo com o token vencido. Sem ele, `cmon token set` guarda o token com segurança
+em qualquer sistema. `.env` continua funcionando para o passo 1 (veja
+`.env.example`). Rode `cmon --help` ou `cmon token --help` para o resto.
 
 ## Uso
 
