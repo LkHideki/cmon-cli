@@ -37,12 +37,44 @@ para o resto.
 
 ```bash
 uv run cmon now       # uso atual + tempo até o reset + ritmo/projeção
+uv run cmon status    # linha única p/ statusline/tmux/prompt
 uv run cmon watch     # TUI ao vivo, atualiza sozinho (Ctrl-C sai)
+uv run cmon wait      # bloqueia até a janela de 5h resetar, então notifica
 uv run cmon collect   # grava 1 snapshot no banco (com timestamp UTC)
 uv run cmon report    # resumo do consumo acumulado
+uv run cmon trends    # consumo por ciclo (pico, delta vs anterior, anomalia)
 uv run cmon plot      # gráficos -> usage.png
 uv run cmon tips      # dicas de pacing (usar ~100% do semanal sem travar o 5h)
+uv run cmon install   # agenda a coleta de fundo no agendador do SO
 ```
+
+Opção global `--db PATH` (antes do subcomando) sobrepõe `CMON_DB`:
+`uv run cmon --db ~/.cmon/usage.duckdb now`.
+
+### `cmon status` — statusline
+
+Uma linha compacta, ideal pra barra de status / tmux / prompt. Sai com código 0
+e imprime `cmon offline` se a rede falhar (não quebra a statusline):
+
+```
+5h 18% · sem 42% · reset 3h18m
+```
+
+### `cmon wait` — avisa quando liberar
+
+Bloqueia até a janela resetar e então dispara uma notificação nativa — pra você
+retomar no segundo em que o 5h libera. Ou use `--at N` p/ avisar ao *atingir* N%:
+
+```bash
+uv run cmon wait                      # espera o 5h resetar
+uv run cmon wait --window weekly_all  # espera o semanal resetar
+uv run cmon wait --at 80              # avisa quando o 5h chegar a 80%
+```
+
+### `cmon trends` — tendência entre ciclos
+
+Segmenta o histórico em ciclos (corta em cada reset) e mostra o pico de cada um,
+o delta em relação ao ciclo anterior e um aviso se o ciclo atual destoa da média.
 
 ### `cmon watch` — TUI ao vivo
 
@@ -95,20 +127,32 @@ se já houver histórico, projeta se você vai bater o limite antes disso:
 
 ```
 Uso atual:
-  Current session  █·················· 7.0%    reseta em   4h 25min
-  All models       ████████·········· 41.0%    reseta em 3d 22h
-  Fable only       ████████·········· 43.0%    reseta em 3d 22h  ←ativo
+  Current session  █··················   7%    reseta em   4h 25min
+  All models       ████████··········  41%    reseta em 3d 22h
+  Fable only       ████████··········  43%    reseta em 3d 22h  ←ativo
 
-Janela de 5h: 7.0% usada — expira em 4h 25min.
+Janela de 5h: 7% usada — expira em 4h 25min.
 Ritmo: 2.1%/h → projeção no reset: 16%.
 ```
 
 ## Coleta contínua
 
-O `report`/`plot` ficam úteis com histórico. Agende o `collect` no cron:
+`report`/`plot`/`trends`/alertas ficam úteis com histórico. O jeito fácil é deixar
+o `collect` agendado no agendador nativo do SO:
+
+```bash
+uv run cmon install            # a cada 20min (launchd/systemd/schtasks)
+uv run cmon install -i 10      # a cada 10min
+uv run cmon install --dry-run  # só mostra o que faria
+uv run cmon uninstall          # remove
+```
+
+No background o token vem do cofre do SO ou da credencial do Claude Code — a env
+`CLAUDE_OAUTH_TOKEN` do seu shell **não** é herdada, então rode `cmon token set`
+se for esse o seu caso. Preferir cron na mão? Continua valendo:
 
 ```cron
-*/20 * * * * cd ~/cmon && /caminho/para/uv run cmon collect
+*/20 * * * * cd ~/cmon && /caminho/para/uv run cmon collect --alert
 ```
 
 ## Como funciona
