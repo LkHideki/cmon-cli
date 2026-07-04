@@ -29,6 +29,12 @@ URL = "https://claude.ai/api/oauth/usage"
 UA = "claude-cli/1.0 (external, cli)"
 LABELS = {"session": "Current session", "weekly_all": "All models"}
 SERVICE, ACCOUNT = "cmon", "claude-oauth"  # entrada no cofre seguro do SO
+RETRIES = int(os.environ.get("CMON_RETRIES", "3"))
+DEDUP_SECS = int(os.environ.get("CMON_DEDUP_SECS", "60"))  # janela p/ deduplicar collect
+
+
+class FetchError(Exception):
+    """Falha ao consultar o endpoint de uso, com mensagem já legível ao usuário."""
 
 
 def _keyring():
@@ -125,14 +131,42 @@ def token_clear(_):
         print("Nada havia guardado no cofre do SO.")
 
 
-def fetch() -> dict:
+def _retry_after(r) -> float | None:
+    """Segundos pedidos pelo header Retry-After (429/503), se numérico."""
+    try:
+        return float(r.headers.get("Retry-After") or "")
+    except ValueError:
+        return None
+
+
+def fetch(retries: int = RETRIES) -> dict:
+    """Consulta o endpoint de uso com retry/backoff. Levanta FetchError com
+    mensagem legível — 401/403 falham na hora (não adianta repetir); 429 e 5xx
+    e erros de rede tentam de novo com espera exponencial (respeitando Retry-After)."""
+    import time
     import requests
-    r = requests.get(URL, timeout=30, headers={
-        "Authorization": f"Bearer {get_token()}",
-        "anthropic-beta": "oauth-2025-04-20",
-        "User-Agent": UA})
-    r.raise_for_status()
-    return r.json()
+    headers = {"Authorization": f"Bearer {get_token()}",
+               "anthropic-beta": "oauth-2025-04-20", "User-Agent": UA}
+    last = "?"
+    for attempt in range(retries):
+        try:
+            r = requests.get(URL, timeout=30, headers=headers)
+            if r.status_code == 401:
+                raise FetchError("401 — token inválido ou expirado. Faça login no "
+                                 "Claude Code ou rode 'cmon token set'.")
+            if r.status_code == 403:
+                raise FetchError("403 — bloqueado (Cloudflare/User-Agent) ou sem "
+                                 "acesso. O endpoint privado pode ter mudado.")
+            if r.status_code == 429 or r.status_code >= 500:
+                last, wait = f"HTTP {r.status_code}", _retry_after(r) or 2 ** attempt
+            else:
+                r.raise_for_status()
+                return r.json()
+        except requests.RequestException as e:
+            last, wait = f"rede: {e}", 2 ** attempt
+        if attempt < retries - 1:
+            time.sleep(wait)
+    raise FetchError(f"Falha ao consultar {URL} após {retries} tentativas ({last}).")
 
 
 def limits(data: dict) -> list[tuple]:
@@ -220,24 +254,61 @@ def now(_):
         if to100 < rem_h:
             print(f"⚠ No ritmo atual você atinge 100% em ~{to100:.1f}h, antes do reset.")
 
+    for m in _alerts(rows, con):
+        if not m.startswith("Current session"):  # 5h já coberta acima
+            print(f"⚠ {m}")
 
-def collect(_):
-    rows = limits(fetch())
-    ts = datetime.now(timezone.utc)
+
+def collect(args):
     con = db()
+    ts = datetime.now(timezone.utc)
+    if not getattr(args, "force", False):
+        recent = con.execute("SELECT count(*) FROM snapshots WHERE ts > ?",
+                             [ts - timedelta(seconds=DEDUP_SECS)]).fetchone()[0]
+        if recent:
+            print(f"Snapshot há <{DEDUP_SECS}s — pulado (use --force p/ gravar assim mesmo).")
+            return
+    rows = limits(fetch())
     con.executemany("INSERT INTO snapshots VALUES (?,?,?,?,?,?)",
                     [[ts, k, lbl, pct, reset, act] for k, lbl, pct, reset, act in rows])
     print(f"{ts:%Y-%m-%d %H:%M} coletado:")
     for _k, lbl, pct, reset, _a in rows:
         print(f"  {lbl:16} {pct:5.1f}%  reset {reset[:16] if reset else '-'}")
+    if getattr(args, "alert", False):
+        for m in _alerts(rows, con):
+            print(f"⚠ {m}", file=sys.stderr)
+            _notify("cmon — limite Claude", m)
 
 
-def report(_):
-    g = burn(db()).groupby("label").agg(
+def _parse_since(s: str | None):
+    """'24h', '7d' ou uma data/hora ISO -> datetime UTC. None se vazio."""
+    if not s:
+        return None
+    s = s.strip().lower()
+    now_utc = datetime.now(timezone.utc)
+    if s.endswith("h"):
+        return now_utc - timedelta(hours=float(s[:-1]))
+    if s.endswith("d"):
+        return now_utc - timedelta(days=float(s[:-1]))
+    dt = datetime.fromisoformat(s)
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def report(args):
+    df = burn(db())
+    since = _parse_since(getattr(args, "since", None))
+    if since is not None:
+        df = df[df.ts >= since]
+        if df.empty:
+            sys.exit(f"Sem dados desde {since:%Y-%m-%d %H:%M} UTC.")
+    g = df.groupby("label").agg(
         snapshots=("percent", "size"),
         pico_pct=("percent", "max"),
         consumo_total_pct=("delta", lambda s: s[s > 0].sum())).round(1)
-    print(g.to_string())
+    if getattr(args, "json", False):
+        print(g.reset_index().to_json(orient="records", force_ascii=False))
+    else:
+        print(g.to_string())
 
 
 def plot(args):
@@ -275,6 +346,43 @@ def _rate(con, key) -> float | None:
     dt_h = (seg.ts.iloc[-1] - seg.ts.iloc[0]).total_seconds() / 3600
     dpct = seg.percent.iloc[-1] - seg.percent.iloc[0]
     return dpct / dt_h if dt_h > 0 and dpct > 0 else None
+
+
+def _alerts(rows, con) -> list[str]:
+    """Avisa quando, no ritmo atual, uma janela bate 100% antes do reset.
+    Precisa de histórico (via _rate); sem banco/ritmo não gera nada."""
+    now_utc = datetime.now(timezone.utc)
+    msgs = []
+    for key, lbl, pct, reset, _a in rows:
+        if not reset or pct >= 100:
+            continue
+        rate = _rate(con, key)
+        if not rate:
+            continue
+        rem_h = (datetime.fromisoformat(reset) - now_utc).total_seconds() / 3600
+        if rem_h <= 0:
+            continue
+        eta = (100 - pct) / rate
+        if eta < rem_h:
+            msgs.append(f"{lbl}: no ritmo de {rate:.1f}%/h bate 100% em ~{eta:.1f}h "
+                        f"(~{rem_h - eta:.1f}h antes do reset).")
+    return msgs
+
+
+def _notify(title: str, body: str) -> None:
+    """Notificação nativa best-effort (osascript no macOS, notify-send no Linux).
+    Silenciosa se a ferramenta não existir — nunca derruba o comando."""
+    import shutil
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["osascript", "-e",
+                            f"display notification {json.dumps(body)} "
+                            f"with title {json.dumps(title)}"],
+                           capture_output=True, timeout=10)
+        elif shutil.which("notify-send"):
+            subprocess.run(["notify-send", title, body], capture_output=True, timeout=10)
+    except Exception:
+        pass
 
 
 def _ai_tip(summary: str) -> str | None:
@@ -358,6 +466,68 @@ def tips(args):
         print("(Dica IA indisponível — 'claude' não encontrado no PATH. Use --no-ai p/ silenciar.)")
 
 
+def watch(args):
+    """TUI ao vivo: re-consulta o uso a cada N segundos e redesenha. Ctrl-C sai.
+    Com --collect, grava cada leitura no banco (respeitando o dedup)."""
+    import time
+    from rich.console import Console, Group
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+
+    con = db() if args.collect else db(create=False)
+
+    def color(pct: float) -> str:
+        return "red" if pct >= 90 else "yellow" if pct >= 70 else "green"
+
+    def render():
+        try:
+            rows = limits(fetch())
+        except FetchError as e:
+            return Panel(Text(f"{e}\nnova tentativa em {args.interval}s", style="red"),
+                         title="cmon watch — erro", border_style="red")
+        if args.collect:
+            ts = datetime.now(timezone.utc)
+            recent = con.execute("SELECT count(*) FROM snapshots WHERE ts > ?",
+                                 [ts - timedelta(seconds=DEDUP_SECS)]).fetchone()[0]
+            if not recent:
+                con.executemany("INSERT INTO snapshots VALUES (?,?,?,?,?,?)",
+                                [[ts, k, lbl, pct, reset, act] for k, lbl, pct, reset, act in rows])
+        now_utc = datetime.now(timezone.utc)
+        t = Table(expand=True, header_style="bold")
+        t.add_column("Janela")
+        t.add_column("Uso", ratio=1)
+        t.add_column("%", justify="right")
+        t.add_column("reseta em", justify="right")
+        t.add_column("ritmo", justify="right")
+        t.add_column("projeção", justify="right")
+        for key, lbl, pct, reset, act in rows:
+            rate = _rate(con, key)
+            rem_h = ((datetime.fromisoformat(reset) - now_utc).total_seconds() / 3600
+                     if reset else None)
+            proj = f"{min(pct + rate * rem_h, 999):.0f}%" if rate and rem_h and rem_h > 0 else "-"
+            t.add_row(lbl + (" ●" if act else ""),
+                      Text(bar(pct, 28), style=color(pct)),
+                      f"{pct:.1f}", fmt_eta(reset),
+                      f"{rate:.1f}%/h" if rate else "-", proj)
+        body = [t]
+        alerts = _alerts(rows, con)
+        if alerts:
+            body.append(Text("\n".join("⚠ " + m for m in alerts), style="bold red"))
+        body.append(Text(f"{now_utc:%H:%M:%S} UTC · atualiza a cada {args.interval}s"
+                         f"{' · gravando' if args.collect else ''} · Ctrl-C sai", style="dim"))
+        return Panel(Group(*body), title="cmon watch", border_style="cyan")
+
+    with Live(render(), console=Console(), screen=True, refresh_per_second=4) as live:
+        try:
+            while True:
+                time.sleep(args.interval)
+                live.update(render())
+        except KeyboardInterrupt:
+            pass
+
+
 def main():
     try:
         from dotenv import load_dotenv
@@ -371,8 +541,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("now", help="uso atual + tempo até o reset + ritmo/projeção")
-    sub.add_parser("collect", help="grava 1 snapshot no banco")
-    sub.add_parser("report", help="resumo do consumo acumulado")
+    pc = sub.add_parser("collect", help="grava 1 snapshot no banco")
+    pc.add_argument("--force", action="store_true", help="grava mesmo com snapshot recente (ignora dedup)")
+    pc.add_argument("--alert", action="store_true", help="avisa (stderr + notificação) se projetar 100%% antes do reset")
+    pr = sub.add_parser("report", help="resumo do consumo acumulado")
+    pr.add_argument("--since", help="filtra a partir de '24h', '7d' ou data ISO")
+    pr.add_argument("--json", action="store_true", help="saída em JSON")
+    pw = sub.add_parser("watch", help="TUI ao vivo com o uso atual (Ctrl-C sai)")
+    pw.add_argument("-n", "--interval", type=int, default=30, help="segundos entre atualizações (padrão 30)")
+    pw.add_argument("--collect", action="store_true", help="grava cada leitura no banco enquanto observa")
     pp = sub.add_parser("plot", help="gera gráficos -> PNG")
     pp.add_argument("-o", "--out", default="usage.png")
 
@@ -393,7 +570,11 @@ def main():
     if args.cmd == "token":
         {"set": token_set, "status": token_status, "clear": token_clear}[args.action](args)
         return
-    {"now": now, "collect": collect, "report": report, "plot": plot, "tips": tips}[args.cmd](args)
+    try:
+        {"now": now, "collect": collect, "report": report,
+         "watch": watch, "plot": plot, "tips": tips}[args.cmd](args)
+    except FetchError as e:
+        sys.exit(f"cmon: {e}")
 
 
 if __name__ == "__main__":
