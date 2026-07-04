@@ -105,10 +105,15 @@ o endpoint não expõe: **tokens e US$ estimado por modelo, dia, projeto ou sess
 
 ```bash
 uv run cmon burn                    # por modelo
+uv run cmon burn --by surface       # por cliente: terminal / vscode / app / sdk (-p)
 uv run cmon burn --by project       # atribuição por projeto (onde seu plano foi)
 uv run cmon burn --by day --since 7d
 uv run cmon burn --json
 ```
+
+`--by surface` separa por onde você usou (campo `entrypoint` dos logs). Só do
+Claude Code, porém — contas diferentes (por email) **não** são separáveis: os
+transcripts não gravam a conta, e o chat do claude.ai nem escreve logs.
 
 A varredura é incremental (cacheia por `mtime`+tamanho, deduplica por `uuid`): a
 primeira vez lê tudo (~dezenas de segundos em bases grandes), as seguintes levam
