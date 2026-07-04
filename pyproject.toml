@@ -1,0 +1,29 @@
+[project]
+name = "cmon"
+version = "0.1.0"
+description = "Claude Monitor — rastreia o consumo do seu plano Claude ao longo do tempo"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.14"
+dependencies = [
+    "duckdb>=1.5.4",
+    "matplotlib>=3.11.0",
+    "python-dotenv>=1.2.2",
+    "requests>=2.34.2",
+    "seaborn>=0.13.2",
+]
+
+[project.scripts]
+cmon = "main:main"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.20",
+]
+
+[tool.hatch.build.targets.wheel]
+only-include = ["main.py"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

@@ -1,0 +1,19 @@
+# Segredos — NUNCA versionar
+.env
+
+# Dados e saídas geradas pelo cmon
+*.duckdb
+*.png
+
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Ambientes e caches
+.venv
+.ruff_cache
+.mypy_cache
