@@ -13,7 +13,7 @@ CLAUDE_OAUTH_TOKEN returns 401, cmon refreshes and uses the new one anyway.
   cmon now         # current usage + time to reset + rate/projection
   cmon collect     # save 1 snapshot to database (run via cron every ~20min)
   cmon report      # summary of accumulated consumption
-  cmon plot        # seaborn charts -> PNG
+  cmon plot        # charts -> PNG: trajectory, pace-vs-target, burn by model
   cmon tips        # pacing tips to use ~100% of weekly without blocking 5h
   cmon token set   # save token to OS secure vault (cross-platform)
 """
@@ -428,6 +428,64 @@ def _open_file(path):
         pass
 
 
+def _pace_ax(ax, con, key: str, title: str, now_utc) -> None:
+    """Actual cumulative % of the CURRENT cycle vs. the even-pace line to 100% at reset.
+    Above the line = burning faster than even → hits 100% before reset; below = buffer left.
+    Faceted per window because session (5h) and weekly (7d) horizons share no time axis.
+    Reading differs by goal: weekly → aim for the line (full use); session → stay below it
+    (crossing 100% early blocks you)."""
+    import pandas as pd
+    segs = _cycles(con, key)
+    if not segs or len(segs[-1]) < 1:
+        ax.text(0.5, 0.5, "no data yet", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title(title)
+        return
+    seg = segs[-1]  # current cycle (after last reset)
+    ax.plot(seg.ts, seg.percent, marker="o", label="actual")
+    # .df() not .fetchone(): scalar TIMESTAMPTZ->python needs pytz; the DataFrame path doesn't.
+    rdf = con.execute("SELECT resets_at FROM snapshots WHERE key=? AND resets_at IS NOT NULL "
+                      "ORDER BY ts DESC LIMIT 1", [key]).df()
+    if not rdf.empty and rdf.resets_at.iloc[0] is not None:
+        reset = pd.Timestamp(rdf.resets_at.iloc[0])
+        x0, y0 = seg.ts.iloc[0], float(seg.percent.iloc[0])
+        ax.plot([x0, reset], [y0, 100], ls="--", color="gray", label="even pace → 100% at reset")
+        ax.axvline(reset, color="red", ls=":", lw=1)
+        now_ts = pd.Timestamp(now_utc)
+        if x0 <= now_ts <= reset:
+            ax.axvline(now_ts, color="green", ls=":", lw=1, label="now")
+    ax.set_ylim(0, 105)
+    ax.set_title(title)
+    ax.set_xlabel("")
+    ax.legend(loc="upper left", fontsize=8)
+    ax.tick_params(axis="x", rotation=30)
+
+
+def _burn_ax(ax, con, since) -> None:
+    """Stacked API-equivalent cost/day by model from token_log — the richest table (where the
+    tokens actually go). You pay a subscription, not this; it's for relative comparison."""
+    scan_logs(con, since=since, quiet=True)
+    where = "WHERE ts >= ?" if since else ""
+    df = con.execute(
+        f"SELECT CAST(ts AS DATE) d, model, sum(in_tok) i, sum(out_tok) o, "
+        f"sum(cache_read) r, sum(cache_create) c FROM token_log {where} GROUP BY d, model",
+        [since] if since else []).df()
+    if df.empty:
+        ax.text(0.5, 0.5, "no Claude Code log data", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title("Burn — cost/day by model")
+        return
+    df["cost"] = [(r.i * _price(r.model)[0] + r.o * _price(r.model)[1]
+                   + r.r * _price(r.model)[2] + r.c * _price(r.model)[3]) / 1e6
+                  for r in df.itertuples()]
+    df["m"] = df.model.map(_short_model)
+    piv = df.pivot_table(index="d", columns="m", values="cost", aggfunc="sum", fill_value=0)
+    piv.plot(kind="bar", stacked=True, ax=ax)
+    ax.set_title("Burn — API-equivalent cost/day by model (US$)")
+    ax.set_ylabel("US$")
+    ax.set_xlabel("")
+    ax.tick_params(axis="x", rotation=45)
+    ax.legend(fontsize=8, title="")
+
+
 def plot(args):
     try:
         import matplotlib.pyplot as plt
@@ -436,19 +494,20 @@ def plot(args):
         sys.exit("Plots need plot extras. Install with:\n"
                  "  uv sync --extra plot         (in repo)\n"
                  "  pip install 'cmon[plot]'     (via PyPI)")
-    df = deltas(db())
-    df["hora"], df["dia"] = df.ts.dt.hour, df.ts.dt.day_name()
-    b = df[df.delta > 0]
-    dias = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    con = db()
+    df = deltas(con)
+    now_utc = datetime.now(UTC)
+    since = _parse_since(getattr(args, "since", None) or "30d")
     sns.set_theme(style="whitegrid")
-    fig, ax = plt.subplots(3, 1, figsize=(12, 13))
-    sns.lineplot(df, x="ts", y="percent", hue="label", marker="o", ax=ax[0])
-    sns.barplot(b, x="hora", y="delta", hue="label", estimator="sum", errorbar=None, ax=ax[1])
-    sns.barplot(b, x="dia", y="delta", hue="label", estimator="sum", errorbar=None, order=dias, ax=ax[2])
-    titles = ["Usage (%) over time", "Consumption by hour of day", "Consumption by day of week"]
-    for a, t in zip(ax, titles, strict=True):
-        a.set_title(t)
-        a.set_xlabel("")
+    fig, axd = plt.subplot_mosaic(
+        [["traj", "traj"], ["pace_s", "pace_w"], ["burn", "burn"]], figsize=(14, 15))
+    sns.lineplot(df, x="ts", y="percent", hue="label", marker="o", ax=axd["traj"])
+    axd["traj"].set_title("Usage (%) over time")
+    axd["traj"].set_xlabel("")
+    axd["traj"].set_ylim(0, 105)
+    _pace_ax(axd["pace_s"], con, "session", "Pace — 5h window (stay below line = don't block)", now_utc)
+    _pace_ax(axd["pace_w"], con, "weekly_all", "Pace — Weekly all models (aim for line = full use)", now_utc)
+    _burn_ax(axd["burn"], con, since)
     fig.tight_layout()
     out = args.out or f"usage_{datetime.now():%y%m%d_%H%M%S}.png"
     fig.savefig(out, dpi=150)
@@ -1248,9 +1307,11 @@ def main():
     pin.add_argument("-i", "--interval", type=int, default=20, help="minutes between collections (default 20)")
     pin.add_argument("--dry-run", action="store_true", help="show what it would do, don't install")
     sub.add_parser("uninstall", help="remove scheduling created by install")
-    pp = sub.add_parser("plot", help="generate charts -> PNG")
+    pp = sub.add_parser("plot", help="generate charts -> PNG (trajectory, pace-vs-target, burn)")
     pp.add_argument("-o", "--out", default=None,
                     help="PNG path (default: usage_YYMMDD_HHMMSS.png)")
+    pp.add_argument("--since", default="30d",
+                    help="burn panel window: '24h', '7d', '30d' (default), ISO date, or 'all'")
 
     pd_ = sub.add_parser("tips", help="pacing tips to use ~100%% of weekly without blocking 5h",
                          description="Projects consumption per window and suggests speed up/slow down/swap "
