@@ -1043,11 +1043,13 @@ def burn(args):
            "project": "project", "session": "session"}[args.by]
     window = f" since {since:%Y-%m-%d %H:%M} UTC" if since else ""
     print(f"Consumption by {per}{window} (API equivalent):")
-    for row in g.itertuples():
-        label = _surface(row.grp) if args.by == "surface" else str(row.grp)
-        print(f"  {label:24} {row.tok / 1e6:9.1f}M tok   US$ {row.custo:9.2f}")
+    lines = [(_surface(row.grp) if args.by == "surface" else str(row.grp),
+              row.tok / 1e6, row.custo) for row in g.itertuples()]
+    w = max([len(lbl) for lbl, _, _ in lines] + [len("TOTAL")])  # widest label incl. long model ids
+    for lbl, tok_m, cost in lines:
+        print(f"  {lbl:<{w}} {tok_m:9.1f}M tok   US$ {cost:9.2f}")
     total_c = g.custo.sum()
-    print(f"  {'TOTAL':24} {g.tok.sum() / 1e6:9.1f}M tok   US$ {total_c:9.2f}")
+    print(f"  {'TOTAL':<{w}} {g.tok.sum() / 1e6:9.1f}M tok   US$ {total_c:9.2f}")
 
     # Breakdown by component: cache read usually dominates (context re-reading).
     comp = {"input": (0, 0.0, 0), "output": (0, 0.0, 1),
