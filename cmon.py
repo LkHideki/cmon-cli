@@ -616,8 +616,8 @@ def _rate(con, key) -> float | None:
     df = con.execute("SELECT ts, percent FROM snapshots WHERE key=? ORDER BY ts", [key]).df()
     if len(df) < 2:
         return None
-    drops = [i for i in range(1, len(df)) if df.percent.iloc[i] < df.percent.iloc[i - 1]]
-    seg = df.iloc[drops[-1]:] if drops else df  # only segment after last reset
+    drop_pos = (df.percent.diff() < 0).to_numpy().nonzero()[0]  # vectorized reset detection
+    seg = df.iloc[drop_pos[-1]:] if len(drop_pos) else df  # only segment after last reset
     if len(seg) < 2:
         return None
     dt_h = (seg.ts.iloc[-1] - seg.ts.iloc[0]).total_seconds() / 3600
@@ -991,13 +991,9 @@ def _cycles(con, key: str) -> list:
     df = con.execute("SELECT ts, percent FROM snapshots WHERE key=? ORDER BY ts", [key]).df()
     if df.empty:
         return []
-    segs, start = [], 0
-    for i in range(1, len(df)):
-        if df.percent.iloc[i] < df.percent.iloc[i - 1]:
-            segs.append(df.iloc[start:i])
-            start = i
-    segs.append(df.iloc[start:])
-    return segs
+    cut_pos = (df.percent.diff() < 0).to_numpy().nonzero()[0]  # vectorized reset boundaries
+    bounds = [0, *cut_pos.tolist(), len(df)]
+    return [df.iloc[a:b] for a, b in zip(bounds, bounds[1:], strict=False) if a < b]
 
 
 def trends(args):
