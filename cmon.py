@@ -355,7 +355,36 @@ def db(create: bool = True):
     con.execute("CREATE TABLE IF NOT EXISTS snapshots("
                 "ts TIMESTAMPTZ, key TEXT, label TEXT, percent DOUBLE, "
                 "resets_at TIMESTAMPTZ, is_active BOOL)")
+    con.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT, ts TEXT)")
     return con
+
+
+def _meta_get(con, key: str) -> tuple[str, float] | None:
+    """(value, age_seconds) for a learned-state key, or None. age lets callers ignore stale state."""
+    if con is None:
+        return None
+    try:
+        r = con.execute("SELECT value, ts FROM meta WHERE key=?", [key]).fetchone()
+    except Exception:
+        return None
+    if not r:
+        return None
+    try:
+        age = (datetime.now(UTC) - datetime.fromisoformat(r[1])).total_seconds() if r[1] else 1e9
+    except (ValueError, TypeError):
+        age = 1e9
+    return r[0], age
+
+
+def _meta_set(con, key: str, value: str) -> None:
+    if con is None:
+        return
+    try:
+        con.execute("INSERT INTO meta VALUES (?,?,?) ON CONFLICT (key) DO UPDATE SET "
+                    "value=excluded.value, ts=excluded.ts",
+                    [key, value, datetime.now(UTC).isoformat()])
+    except Exception:
+        pass
 
 
 def deltas(con):
@@ -1286,6 +1315,7 @@ def burn(args):
 def watch(args):
     """Live TUI: re-queries usage every N seconds and redraws; each read is saved to the
     database (deduped) so watching also builds history. Ctrl-C quits."""
+    import random
     import time
 
     from rich.console import Console, Group
@@ -1295,6 +1325,15 @@ def watch(args):
     from rich.text import Text
 
     con = db()  # writable: records each read (deduped), plus _rate and burn from logs
+    base = float(args.interval)
+    cur = base  # adaptive poll interval: grows on 403/errors, eases back on sustained success
+    learned = _meta_get(con, "watch_interval")
+    if learned and learned[1] < 7200:  # reuse an interval learned safe within the last 2h
+        try:
+            cur = max(base, min(float(learned[0]), 300.0))
+        except (ValueError, TypeError):
+            pass
+    ok_streak = 0
 
     def color(pct: float) -> str:
         return "red" if pct >= 90 else "yellow" if pct >= 70 else "green"
@@ -1303,8 +1342,8 @@ def watch(args):
         try:
             rows, _ts = _snapshot(con)  # persists each read (deduped) via watch's own con
         except FetchError as e:
-            return Panel(Text(f"{e}\nretrying in {args.interval}s", style="red"),
-                         title="cmon watch — error", border_style="red")
+            return Panel(Text(f"{e}\nbacking off — next try in ~{cur:.0f}s", style="red"),
+                         title="cmon watch — error", border_style="red"), False
         now_utc = datetime.now(UTC)
         t = Table(expand=True, header_style="bold")
         t.add_column("Window")
@@ -1333,15 +1372,28 @@ def watch(args):
         alerts = _alerts(rows, con)
         if alerts:
             body.append(Text("\n".join("⚠ " + m for m in alerts), style="bold red"))
-        body.append(Text(f"{now_utc:%H:%M:%S} UTC · updates every {args.interval}s"
+        body.append(Text(f"{now_utc:%H:%M:%S} UTC · every ~{cur:.0f}s"
                          " · recording · Ctrl-C quits", style="dim"))
-        return Panel(Group(*body), title="cmon watch", border_style="cyan")
+        return Panel(Group(*body), title="cmon watch", border_style="cyan"), True
 
-    with Live(render(), console=Console(), screen=True, refresh_per_second=4) as live:
+    panel, _ok = render()
+    with Live(panel, console=Console(), screen=True, refresh_per_second=4) as live:
         try:
             while True:
-                time.sleep(args.interval)
-                live.update(render())
+                # jitter breaks the exact robotic cadence Cloudflare bot-detection flags
+                time.sleep(cur * random.uniform(0.85, 1.15))
+                panel, ok = render()
+                live.update(panel)
+                if ok:
+                    ok_streak += 1
+                    if ok_streak >= 5 and cur > base:  # stable again → ease back toward base
+                        cur = max(base, cur / 1.5)
+                        _meta_set(con, "watch_interval", str(cur))
+                        ok_streak = 0
+                else:  # 403/blocked/error → back off (cap 5 min), remember for next session
+                    cur = min(cur * 1.8, 300.0)
+                    ok_streak = 0
+                    _meta_set(con, "watch_interval", str(cur))
         except KeyboardInterrupt:
             pass
 
