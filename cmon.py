@@ -81,14 +81,36 @@ def _claude_code_cred() -> dict | None:
     return None
 
 
+def _session():
+    """requests.Session with trust_env=False: ignores ambient HTTP(S)_PROXY / netrc / CA
+    from the environment, so a stray .env can't route token-bearing calls through a MITM."""
+    import requests
+    s = requests.Session()
+    s.trust_env = False
+    return s
+
+
+def _anthropic_host(url: str) -> bool:
+    """True only if url targets Anthropic. Guards the CMON_OAUTH_TOKEN_URL override so a
+    stray .env can't redirect the refresh_token POST to an attacker endpoint (secperf F1)."""
+    from urllib.parse import urlparse
+    host = (urlparse(url).hostname or "").lower()
+    if host == "anthropic.com" or host.endswith(".anthropic.com"):
+        return True
+    print(f"cmon: refusing token refresh to non-Anthropic host {host!r} "
+          "(CMON_OAUTH_TOKEN_URL). Unset it to use the default.", file=sys.stderr)
+    return False
+
+
 def _oauth_refresh(refresh_token: str) -> dict | None:
     """Exchange refresh_token for a new access_token. Best-effort; None if it fails.
-    Only talks to Anthropic OAuth endpoint — doesn't re-save Claude Code credentials."""
+    Only talks to Anthropic's OAuth endpoint (host-allowlisted) over a trust_env=False
+    session, so a stray .env proxy/endpoint override can't exfiltrate the token."""
     import time
-
-    import requests
+    if not _anthropic_host(OAUTH_TOKEN_URL):
+        return None
     try:
-        r = requests.post(OAUTH_TOKEN_URL, timeout=30, json={
+        r = _session().post(OAUTH_TOKEN_URL, timeout=30, json={
             "grant_type": "refresh_token", "refresh_token": refresh_token,
             "client_id": OAUTH_CLIENT_ID})
         if r.status_code != 200:
@@ -257,12 +279,13 @@ def fetch(retries: int = RETRIES) -> dict:
 
     import requests
     last, override = "?", None
+    s = _session()  # trust_env=False: don't leak the Bearer token through an ambient proxy
     for attempt in range(retries):
         # override = newly refreshed token after 401; overrides even old CLAUDE_OAUTH_TOKEN.
         headers = {"Authorization": f"Bearer {override or get_token()}",
                    "anthropic-beta": "oauth-2025-04-20", "User-Agent": UA}
         try:
-            r = requests.get(URL, timeout=30, headers=headers)
+            r = s.get(URL, timeout=30, headers=headers)
             if r.status_code == 401:
                 if override is None and (new := _force_refresh()):
                     override = new
@@ -1442,7 +1465,9 @@ def uninstall(args):
 def main():
     try:
         from dotenv import load_dotenv
-        load_dotenv()
+        # cwd only: the no-path form walks every ancestor dir for a .env, letting a stray
+        # parent .env inject HTTPS_PROXY / CMON_OAUTH_TOKEN_URL to exfil the token (secperf F1).
+        load_dotenv(dotenv_path=os.path.join(os.getcwd(), ".env"))
     except Exception:
         pass
     p = argparse.ArgumentParser(
