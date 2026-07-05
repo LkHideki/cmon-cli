@@ -12,7 +12,7 @@ First development line toward `0.1.0`. No release published yet.
 ### Added
 
 - **CLI `cmon`** to track Claude plan consumption over time:
-  commands `now`, `collect`, `report`, and `plot`, reading `limits[]` from
+  commands `now`, `collect`, `trends`, and `plot`, reading `limits[]` from
   `claude.ai/api/oauth/usage` and writing snapshots to DuckDB.
 - **Cross-platform token vault** via keyring (Keychain / Credential Manager /
   Secret Service), with resolution `env -> OS vault -> Claude Code credential`
@@ -20,8 +20,10 @@ First development line toward `0.1.0`. No release published yet.
 - **OAuth token auto-refresh**: proactive renewal (reads `expiresAt`, 60s grace period)
   and reactive (on 401), with the refresh chain stored in its own vault, separate from
   Claude Code credential. `client_id`/endpoint configurable via env.
-- **`cmon tips`**: window-based projection, %/h target, and tips generated via
+- **`cmon now --advice`**: window-based projection, %/h target, and tips generated via
   `claude -p` (Sonnet), grounded in the actual model mix from the last 5h.
+- **`cmon trends`** folds in the former `report`: a per-label summary (`--since`, `--json`)
+  followed by the reset-aware per-cycle breakdown with anomaly detection.
 - **`cmon watch`**: live TUI (rich) with colored bars, burn rate, projection,
   alerts, and the `burn 5h (logs)` line; records each read (deduped) while watching.
 - **Unified persistence**: every command that queries the API (`now`, `tips`, `watch`,

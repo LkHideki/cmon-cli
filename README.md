@@ -55,16 +55,14 @@ or `cmon token --help` for the rest.
 ## Usage
 
 ```bash
-uv run cmon now       # current usage + time to reset + rate/projection
+uv run cmon now       # current usage + reset + rate/projection (--advice adds pacing tips)
 uv run cmon status    # one-liner for statusline/tmux/prompt
 uv run cmon watch     # live TUI, self-updating (Ctrl-C exits)
 uv run cmon wait      # block until 5h window resets, then notify
 uv run cmon collect   # save 1 snapshot to database (with UTC timestamp)
-uv run cmon report    # summary of accumulated consumption
-uv run cmon trends    # consumption by cycle (peak, delta vs previous, anomaly)
+uv run cmon trends    # consumption history: per-label summary + per-cycle peaks/anomaly
 uv run cmon burn      # tokens & estimated US$ (from local Claude Code logs)
 uv run cmon plot      # charts -> usage.png
-uv run cmon tips      # pacing tips (use ~100% of weekly without exhausting 5h)
 uv run cmon install   # schedule background collection in OS scheduler
 ```
 
@@ -91,10 +89,18 @@ uv run cmon wait --window weekly_all  # wait for weekly to reset
 uv run cmon wait --at 80              # notify when 5h reaches 80%
 ```
 
-### `cmon trends` — cycle trends
+### `cmon trends` — consumption history
 
-Segments the history into cycles (cuts at each reset) and shows the peak of each,
-the delta versus the previous cycle, and a warning if the current cycle deviates from the average.
+Prints a per-label **summary** first — snapshots, peak %, and total consumed % over the
+window (`--since 24h`/`7d`/ISO date; `--json` for scripts/pipes) — then the reset-aware
+**cycle breakdown**: it segments history at each reset and shows the peak of each cycle, the
+delta versus the previous one, and a warning if the current cycle deviates from the average.
+
+```bash
+uv run cmon trends                # summary + cycle breakdown
+uv run cmon trends --since 24h    # summary over the last 24h (accepts 7d or ISO date)
+uv run cmon trends --json         # JSON summary for script/pipe
+```
 
 ### `cmon burn` — tokens & cost (from logs)
 
@@ -167,27 +173,7 @@ them) and trigger a best-effort native notification (macOS/Linux):
 */20 * * * * cd ~/cmon && /path/to/uv run cmon collect --alert
 ```
 
-### `cmon report`
-
-```bash
-uv run cmon report --since 24h    # last 24h only (accepts 7d or ISO date)
-uv run cmon report --json         # JSON output for script/pipe
-```
-
-### `cmon tips`
-
-Goal: spend close to **100% of the weekly limit** by reset — without exhausting
-early and without hitting the **5h window**, which locks you out. For each window shows
-the observed rate, the target `%/h` to zero slack, and the projection at reset:
-
-- **projection < 100%** → *upside*: quota left, you can intensify or use a stronger model;
-- **projection > 100%** → *shortfall*: how many hours until you hit 100% before
-  reset and how much you need to throttle.
-
-The rate automatically cuts at the last reset, so it adapts to 5h, 7d windows
-(or 72h — Anthropic resets the "weekly" at a fixed time, not always exactly 7 days).
-Finally, it sends the numbers to **Claude Sonnet** (`claude -p`, cheap) which returns
-3 actionable tips. Use `--no-ai` for local projections only, no quota cost.
+### `cmon now` — current usage & pacing
 
 `cmon now` answers immediately "how long until my 5h window resets" and,
 if there's history, projects whether you'll hit the limit before then:
@@ -201,6 +187,20 @@ Current usage:
 5h window: 7% used — expires in 4h 25min.
 Rate: 2.1%/h → projection at reset: 16%.
 ```
+
+Add **`--advice`** for the full pacing view — the goal being to spend close to **100% of the
+weekly limit** by reset, without exhausting early and without hitting the **5h window** (which
+locks you out). For each window it shows the observed rate, the target `%/h` to zero slack, and
+the projection at reset:
+
+- **projection < 100%** → *upside*: quota left, you can intensify or use a stronger model;
+- **projection > 100%** → *shortfall*: how many hours until you hit 100% before reset and how
+  much you need to throttle.
+
+The rate automatically cuts at the last reset, so it adapts to 5h, 7d windows (or 72h — Anthropic
+resets the "weekly" at a fixed time, not always exactly 7 days). Finally, `--advice` sends the
+numbers to **Claude Sonnet** (`claude -p`, cheap) for 3 actionable tips; use `--no-ai` for local
+projections only, no quota cost.
 
 ## Continuous collection
 

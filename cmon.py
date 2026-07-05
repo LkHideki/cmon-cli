@@ -10,11 +10,10 @@ When the access token expires, cmon automatically renews it via refresh_token an
 the new string in its vault (doesn't re-save Claude Code credentials). If an old
 CLAUDE_OAUTH_TOKEN returns 401, cmon refreshes and uses the new one anyway.
 
-  cmon now         # current usage + time to reset + rate/projection
+  cmon now         # current usage + reset + rate/projection (--advice adds pacing tips)
   cmon collect     # save 1 snapshot to database (run via cron every ~20min)
-  cmon report      # summary of accumulated consumption
+  cmon trends      # consumption history: per-label summary + per-cycle peaks/anomaly
   cmon plot        # charts -> PNG: trajectory, pace-vs-target, burn by model
-  cmon tips        # pacing tips to use ~100% of weekly without blocking 5h
   cmon token set   # save token to OS secure vault (cross-platform)
 """
 
@@ -320,11 +319,17 @@ def fmt_eta(iso: str | None) -> str:
     return f"{h}h {m}m" if h else f"{m}m"
 
 
-def now(_):
+def now(args):
     rows, _ts = _snapshot()  # fetch + best-effort persist so every 'now' also feeds history
     print("Current usage:")
     for _k, lbl, pct, reset, _act in rows:
         print(f"  {lbl:16} {bar(pct)} {pct:4.0f}%   resets in {fmt_eta(reset):>9}")
+
+    con = _read_db()
+    if getattr(args, "advice", False):  # 'now --advice' = usage + full pacing tips (was 'cmon tips')
+        print("\nPacing — spend ~100% of weekly without blocking the 5h window:\n")
+        _advice(rows, con, no_ai=getattr(args, "no_ai", False))
+        return
 
     sess = next((r for r in rows if r[0] == "session"), None)
     if not sess:
@@ -332,7 +337,6 @@ def now(_):
     _k, _lbl, pct, reset, _a = sess
     print(f"\n5h window: {pct:.0f}% used — expires in {fmt_eta(reset)}.")
 
-    con = _read_db()
     if con is None or not reset:
         return
     end = datetime.fromisoformat(reset)
@@ -378,7 +382,7 @@ def _read_db():
 
 def _snapshot(con=None):
     """Fetch usage, best-effort persist it (deduped) and refresh the cache; return (rows, ts).
-    Single path for the read-mostly commands (now/tips/watch/wait) so no fetch is wasted — they
+    Single path for the read-mostly commands (now/watch/wait) so no fetch is wasted — they
     all feed the same history rate/projection/trends read. Persist is best-effort: with no `con`
     a short-lived write connection is opened and closed (so long-running watch/wait never hold
     the single-writer lock), and any DB-busy error is swallowed — the fetch still returns."""
@@ -433,21 +437,18 @@ def _parse_since(s: str | None):
     return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
 
-def report(args):
-    df = deltas(db())
-    since = _parse_since(getattr(args, "since", None))
+def _summary(con, since):
+    """Per-label aggregate over the optional --since window: snapshots, peak %, and total
+    consumed % (sum of positive deltas). The headline table shown by 'trends'."""
+    df = deltas(con)
     if since is not None:
         df = df[df.ts >= since]
         if df.empty:
             sys.exit(f"No data since {since:%Y-%m-%d %H:%M} UTC.")
-    g = df.groupby("label").agg(
+    return df.groupby("label").agg(
         snapshots=("percent", "size"),
-        pico_pct=("percent", "max"),
-        consumo_total_pct=("delta", lambda s: s[s > 0].sum())).round().astype(int)
-    if getattr(args, "json", False):
-        print(g.reset_index().to_json(orient="records", force_ascii=False))
-    else:
-        print(g.to_string())
+        peak_pct=("percent", "max"),
+        consumed_pct=("delta", lambda s: s[s > 0].sum())).round().astype(int)
 
 
 def _open_file(path):
@@ -681,12 +682,11 @@ def _window_tips(lbl: str, pct: float, reset: str | None, rate: float | None, no
     return out, summ
 
 
-def tips(args):
-    rows, _ts = _snapshot()  # fetch + best-effort persist
-    con = _read_db()         # None if DB busy (e.g. 'watch' running): mix/rate degrade, not crash
+def _advice(rows, con, no_ai: bool = False):
+    """Pacing advice for 'now --advice': per-window target %/h + projection + upside/shortfall,
+    the real last-5h model mix (grounds the model-swap tip) and — unless no_ai — 3 one-line
+    tips from Claude Sonnet. Skips the mix if the DB is busy."""
     now_utc = datetime.now(UTC)
-    print("cmon tips — use ~100% of weekly without running out or blocking 5h window.\n")
-
     summaries = []
     for key, want in (("weekly_all", "Weekly (All models)"), ("session", "5h window")):
         row = next((r for r in rows if r[0] == key), None)
@@ -713,7 +713,7 @@ def tips(args):
             print(line + "\n")
             summaries.append("- " + line)
 
-    if getattr(args, "no_ai", False):
+    if no_ai:
         return
     tip = _ai_tip("\n".join(summaries))
     if tip:
@@ -887,11 +887,17 @@ def _cycles(con, key: str) -> list:
 
 
 def trends(args):
-    """Consumption per cycle (reset-aware): peak per cycle, delta vs. previous, and
-    anomaly alert if current cycle differs from average of previous ones."""
+    """Consumption history: a per-label summary (snapshots/peak/total consumed over --since,
+    --json for scripts) followed by the reset-aware per-cycle breakdown — peak per cycle,
+    delta vs. previous, and an anomaly alert if the current cycle exceeds the average."""
     con = db(create=False)
     if con is None:
         sys.exit("No history — run 'cmon collect' a few times first.")
+    g = _summary(con, _parse_since(getattr(args, "since", None)))
+    if getattr(args, "json", False):
+        print(g.reset_index().to_json(orient="records", force_ascii=False))
+        return
+    print(g.to_string())
     for key, lbl in (("weekly_all", "Weekly (All models)"), ("session", "5h window")):
         segs = _cycles(con, key)
         if not segs:
@@ -1355,10 +1361,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--db", help="DuckDB database path (overrides CMON_DB)")
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("now", help="current usage + time to reset + rate/projection")
+    pn = sub.add_parser("now", help="current usage + reset + rate/projection (--advice for pacing tips)")
+    pn.add_argument("--advice", action="store_true",
+                    help="append pacing tips: per-window targets, model mix, Claude Sonnet advice")
+    pn.add_argument("--no-ai", action="store_true", help="with --advice: local projections only, skip Claude")
     ps = sub.add_parser("status", help="single line for statusline/tmux/prompt (reads local cache)")
     ps.add_argument("--live", action="store_true", help="query API instead of local cache")
-    sub.add_parser("trends", help="consumption per cycle: peak, delta and anomaly")
+    ptr = sub.add_parser("trends", help="consumption history: per-label summary + per-cycle peaks/anomaly")
+    ptr.add_argument("--since", help="filter the summary from '24h', '7d' or ISO date")
+    ptr.add_argument("--json", action="store_true", help="JSON output of the summary")
     pb = sub.add_parser("burn", help="tokens & estimated US$ from local Claude Code logs")
     pb.add_argument("--by", choices=["model", "surface", "day", "project", "session"], default="model",
                     help="group by model (default), surface (terminal/vscode/app/sdk), day, project or session")
@@ -1369,9 +1380,6 @@ def main():
     pc.add_argument("--force", action="store_true", help="save even with recent snapshot (bypass dedup)")
     pc.add_argument("--alert", action="store_true",
                     help="alert (stderr + notification) if projected to hit 100%% before reset")
-    pr = sub.add_parser("report", help="summary of accumulated consumption")
-    pr.add_argument("--since", help="filter from '24h', '7d' or ISO date")
-    pr.add_argument("--json", action="store_true", help="JSON output")
     pw = sub.add_parser("watch", help="live TUI with current usage, recording each read (Ctrl-C quits)")
     pw.add_argument("-n", "--interval", type=int, default=30, help="seconds between updates (default 30)")
     pwa = sub.add_parser("wait", help="block until window resets (or --at N%%), then notify")
@@ -1387,11 +1395,6 @@ def main():
                     help="PNG path (default: usage_YYMMDD_HHMMSS.png)")
     pp.add_argument("--since", default="30d",
                     help="burn panel window: '24h', '7d', '30d' (default), ISO date, or 'all'")
-
-    pd_ = sub.add_parser("tips", help="pacing tips to use ~100%% of weekly without blocking 5h",
-                         description="Projects consumption per window and suggests speed up/slow down/swap "
-                                     "model. Enriches with Claude Sonnet via 'claude -p'.")
-    pd_.add_argument("--no-ai", action="store_true", help="only local projections, don't call Claude")
 
     pt = sub.add_parser("token", help="manage OAuth token securely (cross-platform)",
                         description="Stores token in OS native vault (Keychain on macOS, "
@@ -1409,8 +1412,8 @@ def main():
         {"set": token_set, "status": token_status, "clear": token_clear}[args.action](args)
         return
     try:
-        {"now": now, "status": status, "trends": trends, "collect": collect, "report": report,
-         "burn": burn, "watch": watch, "wait": wait, "plot": plot, "tips": tips,
+        {"now": now, "status": status, "trends": trends, "collect": collect,
+         "burn": burn, "watch": watch, "wait": wait, "plot": plot,
          "install": install, "uninstall": uninstall}[args.cmd](args)
     except FetchError as e:
         sys.exit(f"cmon: {e}")
