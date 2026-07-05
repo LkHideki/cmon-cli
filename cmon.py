@@ -321,7 +321,7 @@ def fmt_eta(iso: str | None) -> str:
 
 
 def now(_):
-    rows = limits(fetch())
+    rows, _ts = _snapshot()  # fetch + best-effort persist so every 'now' also feeds history
     print("Current usage:")
     for _k, lbl, pct, reset, _act in rows:
         print(f"  {lbl:16} {bar(pct)} {pct:4.0f}%   resets in {fmt_eta(reset):>9}")
@@ -332,7 +332,7 @@ def now(_):
     _k, _lbl, pct, reset, _a = sess
     print(f"\n5h window: {pct:.0f}% used — expires in {fmt_eta(reset)}.")
 
-    con = db(create=False)
+    con = _read_db()
     if con is None or not reset:
         return
     end = datetime.fromisoformat(reset)
@@ -360,15 +360,50 @@ def now(_):
             print(f"⚠ {m}")
 
 
-def collect(args):
-    con = db()
+def _recent(con, ts) -> bool:
+    """True if a snapshot was saved within DEDUP_SECS of ts (dedup guard, shared by collectors)."""
+    return bool(con.execute("SELECT count(*) FROM snapshots WHERE ts > ?",
+                            [ts - timedelta(seconds=DEDUP_SECS)]).fetchone()[0])
+
+
+def _read_db():
+    """Open the DB for reading, or None if it's absent or busy — never raises. DuckDB is
+    single-writer, so a running 'watch'/'collect' holds the lock; read paths degrade instead
+    of crashing."""
+    try:
+        return db(create=False)
+    except Exception:
+        return None
+
+
+def _snapshot(con=None):
+    """Fetch usage, best-effort persist it (deduped) and refresh the cache; return (rows, ts).
+    Single path for the read-mostly commands (now/tips/watch/wait) so no fetch is wasted — they
+    all feed the same history rate/projection/trends read. Persist is best-effort: with no `con`
+    a short-lived write connection is opened and closed (so long-running watch/wait never hold
+    the single-writer lock), and any DB-busy error is swallowed — the fetch still returns."""
+    rows = limits(fetch())
     ts = datetime.now(UTC)
-    if not getattr(args, "force", False):
-        recent = con.execute("SELECT count(*) FROM snapshots WHERE ts > ?",
-                             [ts - timedelta(seconds=DEDUP_SECS)]).fetchone()[0]
-        if recent:
-            print(f"Snapshot <{DEDUP_SECS}s ago — skipped (use --force to save anyway).")
-            return
+    own = con is None
+    try:
+        c = db() if own else con
+        if not _recent(c, ts):
+            c.executemany("INSERT INTO snapshots VALUES (?,?,?,?,?,?)",
+                          [[ts, k, lbl, pct, reset, act] for k, lbl, pct, reset, act in rows])
+        if own:
+            c.close()
+    except Exception:
+        pass  # DB busy/unavailable → best-effort; cache still refreshes below
+    _write_cache(rows, ts)
+    return rows, ts
+
+
+def collect(args):
+    con = db()  # dedicated collector: hold the write lock and surface errors (cron logs them)
+    ts = datetime.now(UTC)
+    if not getattr(args, "force", False) and _recent(con, ts):
+        print(f"Snapshot <{DEDUP_SECS}s ago — skipped (use --force to save anyway).")
+        return
     rows = limits(fetch())
     con.executemany("INSERT INTO snapshots VALUES (?,?,?,?,?,?)",
                     [[ts, k, lbl, pct, reset, act] for k, lbl, pct, reset, act in rows])
@@ -647,8 +682,8 @@ def _window_tips(lbl: str, pct: float, reset: str | None, rate: float | None, no
 
 
 def tips(args):
-    rows = limits(fetch())
-    con = db()  # writable: _rate + model mix from logs
+    rows, _ts = _snapshot()  # fetch + best-effort persist
+    con = _read_db()         # None if DB busy (e.g. 'watch' running): mix/rate degrade, not crash
     now_utc = datetime.now(UTC)
     print("cmon tips — use ~100% of weekly without running out or blocking 5h window.\n")
 
@@ -667,15 +702,16 @@ def tips(args):
         if key not in ("weekly_all", "session"):
             summaries.append(f"- {lbl}: {pct:.0f}% used, resets in {fmt_eta(reset)}")
 
-    # real model mix in last 5h (from logs) — grounds model swap advice
-    win = now_utc - timedelta(hours=5)
-    scan_logs(con, since=win, quiet=True)
-    bs = _burn_summary(_burn_rows(con, win))
-    if bs:
-        tok, cost, mix = bs
-        line = f"Model mix (last 5h): {tok / 1e6:.2f}M tok · US$ {cost:.2f} · {mix}"
-        print(line + "\n")
-        summaries.append("- " + line)
+    # real model mix in last 5h (from logs) — grounds model swap advice; skipped if DB busy
+    if con is not None:
+        win = now_utc - timedelta(hours=5)
+        scan_logs(con, since=win, quiet=True)
+        bs = _burn_summary(_burn_rows(con, win))
+        if bs:
+            tok, cost, mix = bs
+            line = f"Model mix (last 5h): {tok / 1e6:.2f}M tok · US$ {cost:.2f} · {mix}"
+            print(line + "\n")
+            summaries.append("- " + line)
 
     if getattr(args, "no_ai", False):
         return
@@ -755,6 +791,7 @@ def status(args):
     if args.live:
         try:
             rows = limits(fetch())
+            _write_cache(rows, datetime.now(UTC))  # warm the cache so plain 'status' stays fresh
         except FetchError:
             print("cmon offline")
             return
@@ -792,7 +829,8 @@ def wait(args):
     key = args.window
 
     def get():
-        return next((r for r in limits(fetch()) if r[0] == key), None)
+        rows, _ts = _snapshot()  # con-less: best-effort short-lived persist, no long-held lock
+        return next((r for r in rows if r[0] == key), None)
 
     try:
         row = get()
@@ -1099,8 +1137,8 @@ def burn(args):
 
 
 def watch(args):
-    """Live TUI: re-queries usage every N seconds and redraws. Ctrl-C quits.
-    With --collect, saves each read to database (respecting dedup)."""
+    """Live TUI: re-queries usage every N seconds and redraws; each read is saved to the
+    database (deduped) so watching also builds history. Ctrl-C quits."""
     import time
 
     from rich.console import Console, Group
@@ -1109,24 +1147,17 @@ def watch(args):
     from rich.table import Table
     from rich.text import Text
 
-    con = db()  # writable: used for snapshots (--collect), _rate and burn from logs
+    con = db()  # writable: records each read (deduped), plus _rate and burn from logs
 
     def color(pct: float) -> str:
         return "red" if pct >= 90 else "yellow" if pct >= 70 else "green"
 
     def render():
         try:
-            rows = limits(fetch())
+            rows, _ts = _snapshot(con)  # persists each read (deduped) via watch's own con
         except FetchError as e:
             return Panel(Text(f"{e}\nretrying in {args.interval}s", style="red"),
                          title="cmon watch — error", border_style="red")
-        if args.collect:
-            ts = datetime.now(UTC)
-            recent = con.execute("SELECT count(*) FROM snapshots WHERE ts > ?",
-                                 [ts - timedelta(seconds=DEDUP_SECS)]).fetchone()[0]
-            if not recent:
-                con.executemany("INSERT INTO snapshots VALUES (?,?,?,?,?,?)",
-                                [[ts, k, lbl, pct, reset, act] for k, lbl, pct, reset, act in rows])
         now_utc = datetime.now(UTC)
         t = Table(expand=True, header_style="bold")
         t.add_column("Window")
@@ -1156,7 +1187,7 @@ def watch(args):
         if alerts:
             body.append(Text("\n".join("⚠ " + m for m in alerts), style="bold red"))
         body.append(Text(f"{now_utc:%H:%M:%S} UTC · updates every {args.interval}s"
-                         f"{' · recording' if args.collect else ''} · Ctrl-C quits", style="dim"))
+                         " · recording · Ctrl-C quits", style="dim"))
         return Panel(Group(*body), title="cmon watch", border_style="cyan")
 
     with Live(render(), console=Console(), screen=True, refresh_per_second=4) as live:
@@ -1341,9 +1372,8 @@ def main():
     pr = sub.add_parser("report", help="summary of accumulated consumption")
     pr.add_argument("--since", help="filter from '24h', '7d' or ISO date")
     pr.add_argument("--json", action="store_true", help="JSON output")
-    pw = sub.add_parser("watch", help="live TUI with current usage (Ctrl-C quits)")
+    pw = sub.add_parser("watch", help="live TUI with current usage, recording each read (Ctrl-C quits)")
     pw.add_argument("-n", "--interval", type=int, default=30, help="seconds between updates (default 30)")
-    pw.add_argument("--collect", action="store_true", help="save each read to database while watching")
     pwa = sub.add_parser("wait", help="block until window resets (or --at N%%), then notify")
     pwa.add_argument("--window", default="session", help="window to watch (default session = 5h; e.g., weekly_all)")
     pwa.add_argument("--at", type=float, help="instead of reset, wait for usage to reach N%%")

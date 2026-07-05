@@ -23,7 +23,11 @@ First development line toward `0.1.0`. No release published yet.
 - **`cmon tips`**: window-based projection, %/h target, and tips generated via
   `claude -p` (Sonnet), grounded in the actual model mix from the last 5h.
 - **`cmon watch`**: live TUI (rich) with colored bars, burn rate, projection,
-  alerts, and the `burn 5h (logs)` line; `--collect` records while watching.
+  alerts, and the `burn 5h (logs)` line; records each read (deduped) while watching.
+- **Unified persistence**: every command that queries the API (`now`, `tips`, `watch`,
+  `wait`) records its reading to DuckDB (deduped, best-effort — skipped if the
+  single-writer DB is busy), so history accrues from normal use, not only scheduled
+  `collect`. Read paths degrade gracefully instead of crashing when the DB is locked.
 - **`cmon status`**: single line for statusline/tmux/prompt, gracefully degrading
   when offline.
 - **`cmon wait`**: blocks until the window resets (or `--at N%`) and fires

@@ -149,12 +149,12 @@ ignore — real consumption is under `Opus`/`Sonnet`/`Haiku`/`Fable`.
 
 Self-updating dashboard: colored bars by window (green/yellow/red), rate `%/h`,
 projection at reset, and alerts when you'll hit 100% before reset. Great to leave open
-in a corner of the terminal.
+in a corner of the terminal. Each read is recorded to the database (deduped), so leaving
+`watch` open also builds history.
 
 ```bash
 uv run cmon watch                 # update every 30s
 uv run cmon watch -n 10           # every 10s
-uv run cmon watch --collect       # save each reading to database while watching
 ```
 
 ### Alerts
@@ -204,7 +204,11 @@ Rate: 2.1%/h → projection at reset: 16%.
 
 ## Continuous collection
 
-`report`/`plot`/`trends`/alerts become useful with history. The easy way is to leave
+`report`/`plot`/`trends`/alerts become useful with history. Every command that queries the
+API — `now`, `tips`, `watch`, `wait` — already records its reading (deduped within
+`CMON_DEDUP_SECS`), so history accrues from normal use, not only from scheduled `collect`.
+Persisting is best-effort: if the single-writer DB is busy (e.g. `watch` is open) the read
+still succeeds, it just doesn't save that one point. For unattended, regular sampling, leave
 `collect` scheduled in the OS native scheduler:
 
 ```bash
