@@ -436,17 +436,10 @@ def now(args):
     if con is None:
         return
     end = datetime.fromisoformat(reset)
-    win = con.execute(
-        "SELECT ts, percent FROM snapshots WHERE key='session' AND ts >= ? ORDER BY ts",
-        [end - timedelta(hours=5)]).df()
-    if len(win) < 2:
-        return
-    dt_h = (win.ts.iloc[-1] - win.ts.iloc[0]).total_seconds() / 3600
-    dpct = win.percent.iloc[-1] - win.percent.iloc[0]
-    if dt_h <= 0 or dpct <= 0:
+    rate = _rate(con, "session")  # unified EWMA rate: same source as watch/advice/alerts
+    if rate is None:
         print("Rate: no measurable consumption in this window.")
         return
-    rate = dpct / dt_h
     rem_h = (end - datetime.now(UTC)).total_seconds() / 3600
     proj = min(pct + rate * rem_h, 100)
     print(f"Rate: {rate:.1f}%/h → projection at reset: {proj:.0f}%.")
@@ -667,20 +660,33 @@ def plot(args):
 
 
 def _rate(con, key) -> float | None:
-    """%/h observed in current window. Cuts at last reset (percent drop),
-    so it self-adapts to 5h, 7d windows or whatever the API uses."""
+    """Weighted %/h in the current window (segment since the last reset). Exponentially
+    weighted least-squares slope: recent snapshots dominate (half-life ~1h for the 5h window,
+    ~12h weekly), so the projection tracks your current pace instead of a flat cycle average.
+    None if there's no net rise to project. Self-adapts to 5h/7d/etc. by cutting at each reset."""
     if con is None:
         return None
     df = con.execute("SELECT ts, percent FROM snapshots WHERE key=? ORDER BY ts", [key]).df()
     if len(df) < 2:
         return None
     drop_pos = (df.percent.diff() < 0).to_numpy().nonzero()[0]  # vectorized reset detection
-    seg = df.iloc[drop_pos[-1]:] if len(drop_pos) else df  # only segment after last reset
+    seg = df.iloc[drop_pos[-1]:] if len(drop_pos) else df  # only the segment after last reset
     if len(seg) < 2:
         return None
-    dt_h = (seg.ts.iloc[-1] - seg.ts.iloc[0]).total_seconds() / 3600
-    dpct = seg.percent.iloc[-1] - seg.percent.iloc[0]
-    return dpct / dt_h if dt_h > 0 and dpct > 0 else None
+    import numpy as np
+    # t = hours relative to the newest sample (<=0); exp(t/half_life) decays weight into the past.
+    t = (seg.ts - seg.ts.iloc[-1]).dt.total_seconds().to_numpy() / 3600.0
+    y = seg.percent.to_numpy(dtype=float)
+    half_life = 1.0 if key == "session" else 12.0
+    w = np.exp(t / half_life)
+    sw = w.sum()
+    tm = (w * t).sum() / sw
+    denom = (w * (t - tm) ** 2).sum()
+    if denom <= 0:  # all samples effectively at one instant
+        return None
+    ym = (w * y).sum() / sw
+    slope = (w * (t - tm) * (y - ym)).sum() / denom  # %/h, exponentially weighted
+    return float(slope) if slope > 0 else None
 
 
 def _alerts(rows, con) -> list[str]:
