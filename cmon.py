@@ -1425,6 +1425,11 @@ def _cron(line, dry, remove=False):
 
 
 def _install_windows(cmd, interval_min, dry):
+    # A '"' can't appear in a valid Windows path anyway; reject it rather than emit a
+    # broken schtasks /tr line (secperf F5) — matches the escaped Linux/macOS install paths.
+    if any('"' in x for x in cmd):
+        sys.exit("Refusing to schedule: an argument contains '\"', which breaks schtasks "
+                 "/tr quoting. Use a --db path without double-quotes.")
     tr = " ".join(f'"{x}"' for x in cmd)
     a = ["schtasks", "/create", "/tn", "cmon-collect", "/tr", tr,
          "/sc", "minute", "/mo", str(interval_min), "/f"]
