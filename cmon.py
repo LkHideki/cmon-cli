@@ -60,6 +60,20 @@ def _keyring():
         return None
 
 
+def _insecure_backend(kr) -> str | None:
+    """Backend name if keyring would store the token in cleartext (the plaintext/null/fail
+    fallback keyring silently picks on headless/CI), else None — so we never persist a token
+    unencrypted while the user believes it sits in a secure vault (secperf F2)."""
+    try:
+        backend = kr.get_keyring()
+    except Exception:
+        return None  # can't introspect -> don't block the caller
+    cls = f"{type(backend).__module__}.{type(backend).__name__}".lower()
+    if any(bad in cls for bad in ("plaintext", ".null.", ".fail.")):
+        return getattr(backend, "name", cls)
+    return None
+
+
 def _claude_code_cred() -> dict | None:
     """Claude Code claudeAiOauth blob if logged in: {accessToken, refreshToken, expiresAt}.
     Cross-platform (file on Linux/Windows, Keychain on macOS)."""
@@ -138,8 +152,8 @@ def _auto_load() -> dict | None:
 
 def _auto_save(blob: dict) -> None:
     kr = _keyring()
-    if not kr:
-        return
+    if not kr or _insecure_backend(kr):
+        return  # never persist the refresh chain in cleartext on an insecure backend (F2)
     try:
         kr.set_password(SERVICE, AUTO_ACCOUNT, json.dumps(blob))
     except Exception:
@@ -226,6 +240,10 @@ def token_set(_):
            else sys.stdin.readline()).strip()
     if not tok:
         sys.exit("Empty token — nothing saved.")
+    if (bad := _insecure_backend(kr)) and os.environ.get("CMON_ALLOW_PLAINTEXT_KEYRING") != "1":
+        sys.exit(f"Refusing to save: keyring backend '{bad}' stores secrets in cleartext.\n"
+                 "Install a secure backend (macOS Keychain / gnome-keyring / Windows Credential\n"
+                 "Manager), or use CLAUDE_OAUTH_TOKEN. Override with CMON_ALLOW_PLAINTEXT_KEYRING=1.")
     try:
         kr.set_password(SERVICE, ACCOUNT, tok)
     except Exception as e:
