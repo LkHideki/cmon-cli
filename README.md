@@ -135,8 +135,9 @@ don't record the account, and claude.ai chat doesn't write logs.
 
 Scanning is incremental (caches by `mtime`+size, deduplicates by `uuid`): the
 first run reads everything (~tens of seconds on large bases), subsequent runs take
-fractions of a second. The same numbers appear in `watch` (line *burn 5h*) and in
-`now --advice` (model mix from the last 5h, which grounds the model-switch tip).
+fractions of a second. The same numbers appear in `watch` (line *burn this 5h window*) and in
+`now --advice` (model mix). Both are scoped to the **current 5h rate-limit window** (since the
+last reset), not a rolling 5h, so they reflect only what you spent in this cycle.
 
 `burn` also shows a **component breakdown** (input / output / cache read
 / cache write). Don't be alarmed by the total: in agentic use, **cache read + write

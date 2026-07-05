@@ -44,6 +44,10 @@ Security hardening (secperf audit), Cloudflare-403 resilience, and a smarter pro
   401 force-refresh fall back to Claude Code's fresh credential and re-seed the chain, instead
   of stranding on the expired access token — the persistent `401` that "Open Claude Code"
   could not clear.
+- **`burn`/model-mix scoped to the current 5h window**: `watch`'s *burn this 5h window* line
+  and `now --advice`'s model mix anchored to the session reset (`resets_at − 5h … now`) instead
+  of a rolling `now − 5h`, so right after a reset they no longer count spend from the previous
+  cycle.
 
 ### Performance
 
