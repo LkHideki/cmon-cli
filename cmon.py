@@ -882,12 +882,12 @@ def _advice(rows, con, no_ai: bool = False):
 
     # real model mix in last 5h (from logs) — grounds model swap advice; skipped if DB busy
     if con is not None:
-        win = now_utc - timedelta(hours=5)
+        win = _session_window_start(rows, now_utc)
         scan_logs(con, since=win, quiet=True)
         bs = _burn_summary(_burn_rows(con, win))
         if bs:
             tok, cost, mix = bs
-            line = f"Model mix (last 5h): {tok / 1e6:.2f}M tok · US$ {cost:.2f} · {mix}"
+            line = f"Model mix (this 5h window): {tok / 1e6:.2f}M tok · US$ {cost:.2f} · {mix}"
             print(line + "\n")
             summaries.append("- " + line)
 
@@ -1236,6 +1236,20 @@ def _parse_many(paths: list) -> list:
         return [_parse_jsonl(p) for p in paths]
 
 
+def _session_window_start(rows, now_utc):
+    """Start of the CURRENT 5h rate-limit window (session resets_at − 5h), not a rolling
+    now−5h — so burn/model-mix reflect only what you spent in this cycle. Falls back to
+    now−5h when there's no session reset in rows."""
+    for key, _lbl, _pct, reset, _a in rows:
+        if key == "session" and reset:
+            try:
+                start = datetime.fromisoformat(reset) - timedelta(hours=5)
+                return min(start, now_utc)  # guard: never a future start
+            except (ValueError, TypeError):
+                break
+    return now_utc - timedelta(hours=5)
+
+
 def _burn_rows(con, since):
     """Tokens by (window, model) since `since`, already with estimated cost per row."""
     where = "WHERE ts >= ?" if since else ""
@@ -1368,12 +1382,12 @@ def watch(args):
                       f"{pct:.0f}", fmt_eta(reset),
                       f"{rate:.1f}%/h" if rate else "-", proj)
         body = [t]
-        win = now_utc - timedelta(hours=5)
+        win = _session_window_start(rows, now_utc)
         scan_logs(con, since=win, quiet=True)
         bs = _burn_summary(_burn_rows(con, win))
         if bs:
             tok, cost, mix = bs
-            body.append(Text(f"burn 5h (logs): {tok / 1e6:.2f}M tok · US$ {cost:.2f} · {mix}",
+            body.append(Text(f"burn this 5h window (logs): {tok / 1e6:.2f}M tok · US$ {cost:.2f} · {mix}",
                              style="cyan"))
         alerts = _alerts(rows, con)
         if alerts:
