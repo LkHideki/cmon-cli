@@ -24,6 +24,9 @@ First development line toward `0.1.0`. No release published yet.
   `claude -p` (Sonnet), grounded in the actual model mix from the last 5h.
 - **`cmon trends`** folds in the former `report`: a per-label summary (`--since`, `--json`)
   followed by the reset-aware per-cycle breakdown with anomaly detection.
+- **Time-based 5h alert**: `collect --alert` also warns when the 5h window resets within
+  `CMON_ALERT_LEAD` minutes (default 60), once per cycle, via stderr + native notification
+  and an optional **`CMON_HOOK`** command (message in `$CMON_ALERT_MSG`).
 - **`cmon watch`**: live TUI (rich) with colored bars, burn rate, projection,
   alerts, and the `burn 5h (logs)` line; records each read (deduped) while watching.
 - **Unified persistence**: every command that queries the API (`now`, `tips`, `watch`,

@@ -165,12 +165,25 @@ uv run cmon watch -n 10           # every 10s
 
 ### Alerts
 
-`_alerts` warns when, **at the current rate, the window hits 100% before reset**.
-They appear in `now` and `watch`; in `collect --alert` they go to stderr (cron emails
-them) and trigger a best-effort native notification (macOS/Linux):
+`collect --alert` fires two kinds of alert to stderr (cron emails them) plus a best-effort
+native notification (macOS/Linux):
+
+- **rate-based** — at the current pace a window will hit **100% before reset** (also shown by
+  `cmon now`);
+- **time-based** — the **5h window resets in ≤ `CMON_ALERT_LEAD` minutes** (default 60), fired
+  once per cycle (deduped on the reset).
+
+Set **`CMON_HOOK`** to run your own command on the time-based alert: cmon executes it via the
+shell with the message in `$CMON_ALERT_MSG` (best-effort — a broken hook never breaks
+collection). Pipe it into a bell, a webhook, `tmux display-message`, etc.
 
 ```cron
 */20 * * * * cd ~/cmon && /path/to/uv run cmon collect --alert
+```
+
+```bash
+export CMON_ALERT_LEAD=30                                        # alert 30min before the 5h reset
+export CMON_HOOK='tmux display-message "cmon: $CMON_ALERT_MSG"'  # run on that alert
 ```
 
 ### `cmon now` — current usage & pacing
@@ -253,7 +266,8 @@ uv run cmon <cmd>            # run straight from source
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs ruff + CLI smoke tests
 on Python 3.11–3.13. PRs welcome: keep `ruff` green and the file style lean. Useful
-environment variables: `CMON_DB` (database path), `CMON_RETRIES`, `CMON_DEDUP_SECS`.
+environment variables: `CMON_DB` (database path), `CMON_RETRIES`, `CMON_DEDUP_SECS`,
+`CMON_ALERT_LEAD` (minutes before the 5h reset to alert), `CMON_HOOK` (command run on that alert).
 
 ## Warning
 

@@ -34,6 +34,7 @@ SERVICE, ACCOUNT = "cmon", "claude-oauth"  # entry in the OS secure vault (manua
 AUTO_ACCOUNT = "claude-oauth-auto"  # chain refreshed by cmon, separate from Claude Code
 RETRIES = int(os.environ.get("CMON_RETRIES", "3"))
 DEDUP_SECS = int(os.environ.get("CMON_DEDUP_SECS", "60"))  # window to deduplicate collect
+ALERT_LEAD_MIN = int(os.environ.get("CMON_ALERT_LEAD", "60"))  # minutes-before-reset to alert (5h window)
 # Claude Code OAuth — public values from login flow; used only for token renewal.
 OAUTH_CLIENT_ID = os.environ.get("CMON_OAUTH_CLIENT_ID", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
 OAUTH_TOKEN_URL = os.environ.get("CMON_OAUTH_TOKEN_URL", "https://console.anthropic.com/v1/oauth/token")
@@ -416,9 +417,10 @@ def collect(args):
     for _k, lbl, pct, reset, _a in rows:
         print(f"  {lbl:16} {pct:4.0f}%  reset {reset[:16] if reset else '-'}")
     if getattr(args, "alert", False):
-        for m in _alerts(rows, con):
+        for m in _alerts(rows, con):  # rate-based: at current pace hits 100% before reset
             print(f"⚠ {m}", file=sys.stderr)
             _notify("cmon — Claude limit", m)
+        _fire_lead_alert(rows)  # time-based: 5h window resets in <= CMON_ALERT_LEAD min (+ hook)
 
 
 def _parse_since(s: str | None):
@@ -621,6 +623,81 @@ def _notify(title: str, body: str) -> None:
             subprocess.run(["notify-send", title, body], capture_output=True, timeout=10)
     except Exception:
         pass
+
+
+def _run_hook(msg: str) -> None:
+    """Run the user's CMON_HOOK command on an alert (best-effort), with the alert text in the
+    CMON_ALERT_MSG env var. Shell command, so it can be anything. Never raises — a broken hook
+    must not break collection."""
+    hook = os.environ.get("CMON_HOOK")
+    if not hook:
+        return
+    try:
+        subprocess.run(hook, shell=True, timeout=30,
+                       env={**os.environ, "CMON_ALERT_MSG": msg}, capture_output=True)
+    except Exception:
+        pass
+
+
+ALERT_STATE = os.path.expanduser("~/.cmon/alerts.json")  # dedup markers: alert kind -> last marker
+
+
+def _alert_fired(key: str, marker) -> bool:
+    """Best-effort dedup: True if alert `key` was already fired for `marker` (e.g. a resets_at)."""
+    try:
+        with open(ALERT_STATE, encoding="utf-8") as f:
+            return json.load(f).get(key) == marker
+    except Exception:
+        return False
+
+
+def _mark_alert(key: str, marker) -> None:
+    try:
+        os.makedirs(os.path.dirname(ALERT_STATE), exist_ok=True)
+        d = {}
+        try:
+            with open(ALERT_STATE, encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            pass
+        d[key] = marker
+        with open(ALERT_STATE, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+    except Exception:
+        pass
+
+
+def _lead_alert(rows) -> str | None:
+    """Message if the 5h (session) window is within CMON_ALERT_LEAD minutes of resetting, else
+    None. Purely time-based (uses resets_at), independent of consumption rate."""
+    sess = next((r for r in rows if r[0] == "session"), None)
+    if not sess or not sess[3]:
+        return None
+    reset = datetime.fromisoformat(sess[3]) if isinstance(sess[3], str) else sess[3]
+    rem_min = (reset - datetime.now(UTC)).total_seconds() / 60
+    if 0 < rem_min <= ALERT_LEAD_MIN:
+        return f"5h window resets in ~{rem_min:.0f}m (used {sess[2]:.0f}%)."
+    return None
+
+
+def _fire_lead_alert(rows) -> None:
+    """Fire the time-based 5h alert once per cycle: stderr + native notification + CMON_HOOK.
+    Deduped on the session reset bucketed to the nearest minute — the API's resets_at jitters
+    ~1s between calls, so an exact-string marker would re-fire every collect."""
+    msg = _lead_alert(rows)
+    if not msg:
+        return
+    reset = next((r[3] for r in rows if r[0] == "session"), None)
+    if not reset:
+        return
+    rdt = datetime.fromisoformat(reset) if isinstance(reset, str) else reset
+    marker = round(rdt.timestamp() / 60)  # nearest-minute bucket, robust to ~1s API jitter
+    if _alert_fired("lead_session", marker):
+        return
+    print(f"⚠ {msg}", file=sys.stderr)
+    _notify("cmon — 5h window", msg)
+    _run_hook(msg)
+    _mark_alert("lead_session", marker)
 
 
 def _ai_tip(summary: str) -> str | None:
@@ -1379,7 +1456,8 @@ def main():
     pc = sub.add_parser("collect", help="save 1 snapshot to database")
     pc.add_argument("--force", action="store_true", help="save even with recent snapshot (bypass dedup)")
     pc.add_argument("--alert", action="store_true",
-                    help="alert (stderr + notification) if projected to hit 100%% before reset")
+                    help="alerts (stderr + notification + CMON_HOOK): rate hits 100%% before "
+                         "reset, or 5h window resets within CMON_ALERT_LEAD min")
     pw = sub.add_parser("watch", help="live TUI with current usage, recording each read (Ctrl-C quits)")
     pw.add_argument("-n", "--interval", type=int, default=30, help="seconds between updates (default 30)")
     pwa = sub.add_parser("wait", help="block until window resets (or --at N%%), then notify")
