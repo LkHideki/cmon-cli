@@ -35,6 +35,7 @@ AUTO_ACCOUNT = "claude-oauth-auto"  # chain refreshed by cmon, separate from Cla
 RETRIES = int(os.environ.get("CMON_RETRIES", "3"))
 DEDUP_SECS = int(os.environ.get("CMON_DEDUP_SECS", "60"))  # window to deduplicate collect
 ALERT_LEAD_MIN = int(os.environ.get("CMON_ALERT_LEAD", "60"))  # minutes-before-reset to alert (5h window)
+MAX_JSONL_LINE = 4 << 20  # 4 MiB: skip parsing absurdly large transcript lines (secperf F4 DoS guard)
 # Claude Code OAuth — public values from login flow; used only for token renewal.
 OAUTH_CLIENT_ID = os.environ.get("CMON_OAUTH_CLIENT_ID", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
 OAUTH_TOKEN_URL = os.environ.get("CMON_OAUTH_TOKEN_URL", "https://console.anthropic.com/v1/oauth/token")
@@ -229,6 +230,13 @@ def get_token() -> str:
 def _mask(tok: str) -> str:
     """Never print the full token: only prefix and suffix."""
     return f"{tok[:12]}…{tok[-4:]}" if len(tok) > 20 else "…"
+
+
+def _safe(s, limit: int = 200) -> str:
+    """Strip control/ANSI chars from untrusted log-derived strings (model/project/session
+    ids) and cap length, before they reach the DB or terminal — blocks terminal-escape
+    injection from a crafted transcript (secperf F4)."""
+    return "".join(c for c in str(s) if c.isprintable())[:limit] or "?"
 
 
 def token_set(_):
@@ -1094,6 +1102,8 @@ def _parse_jsonl(path: str):
         for line in f:
             if b'"usage"' not in line:  # pre-filter: avoids parsing most lines
                 continue
+            if len(line) > MAX_JSONL_LINE:  # DoS guard: don't parse a giant/deeply-nested line
+                continue
             try:
                 o = _loads(line)
             except Exception:
@@ -1112,8 +1122,8 @@ def _parse_jsonl(path: str):
                 continue
             cwd = o.get("cwd")
             proj = os.path.basename(cwd.rstrip("/")) if cwd else proj_fallback
-            out.append((uid, dt, msg.get("model") or "?", o.get("entrypoint") or "?",
-                        proj, o.get("sessionId") or "?",
+            out.append((uid, dt, _safe(msg.get("model") or "?"), _safe(o.get("entrypoint") or "?"),
+                        _safe(proj), _safe(o.get("sessionId") or "?"),
                         int(u.get("input_tokens") or 0), int(u.get("output_tokens") or 0),
                         int(u.get("cache_read_input_tokens") or 0),
                         int(u.get("cache_creation_input_tokens") or 0)))
