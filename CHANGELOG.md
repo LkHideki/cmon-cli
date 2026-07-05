@@ -5,7 +5,7 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.2.0] — 2026-07-05
+## [0.1.2] — 2026-07-05
 
 Security hardening (secperf audit), Cloudflare-403 resilience, and a smarter projection.
 
@@ -59,7 +59,7 @@ Security hardening (secperf audit), Cloudflare-403 resilience, and a smarter pro
 
 ## [0.1.0]
 
-First development line. Everything below predates the 0.2.0 hardening pass.
+First development line. Everything below predates the 0.1.2 hardening pass.
 
 ### Added
 

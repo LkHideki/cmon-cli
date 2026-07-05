@@ -2,7 +2,7 @@
 # The terminal command remains 'cmon' via [project.scripts] below.
 [project]
 name = "cmon-cli"
-version = "0.2.0"
+version = "0.1.2"
 description = "Claude Monitor — tracks your Claude plan consumption over time"
 readme = "README.md"
 license = "MIT"
