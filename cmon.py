@@ -1602,7 +1602,7 @@ def main():
                     help="alerts (stderr + notification + CMON_HOOK): rate hits 100%% before "
                          "reset, or 5h window resets within CMON_ALERT_LEAD min")
     pw = sub.add_parser("watch", help="live TUI with current usage, recording each read (Ctrl-C quits)")
-    pw.add_argument("-n", "--interval", type=int, default=30, help="seconds between updates (default 30)")
+    pw.add_argument("-n", "--interval", type=int, default=45, help="seconds between updates (default 45)")
     pwa = sub.add_parser("wait", help="block until window resets (or --at N%%), then notify")
     pwa.add_argument("--window", default="session", help="window to watch (default session = 5h; e.g., weekly_all)")
     pwa.add_argument("--at", type=float, help="instead of reset, wait for usage to reach N%%")
