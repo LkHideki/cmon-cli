@@ -183,8 +183,9 @@ native notification (macOS/Linux):
 
 - **rate-based** — at the current pace a window will hit **100% before reset** (also shown by
   `cmon now`);
-- **time-based** — the **5h window resets in ≤ `CMON_ALERT_LEAD` minutes** (default 60), fired
-  once per cycle (deduped on the reset).
+- **time-based** — a window is within its lead of resetting: the **5h window in ≤ `CMON_ALERT_LEAD`
+  minutes** (default 60) and the **weekly window in ≤ `CMON_ALERT_LEAD_WEEKLY` minutes** (default
+  180). Each fires once per cycle (deduped on its own reset), as a desktop notification.
 
 Set **`CMON_HOOK`** to run your own command on the time-based alert: cmon executes it via the
 shell with the message in `$CMON_ALERT_MSG` (best-effort — a broken hook never breaks
@@ -196,6 +197,7 @@ collection). Pipe it into a bell, a webhook, `tmux display-message`, etc.
 
 ```bash
 export CMON_ALERT_LEAD=30                                        # alert 30min before the 5h reset
+export CMON_ALERT_LEAD_WEEKLY=180                               # alert 3h before the weekly reset
 export CMON_HOOK='tmux display-message "cmon: $CMON_ALERT_MSG"'  # run on that alert
 ```
 
@@ -284,7 +286,8 @@ uv run cmon <cmd>            # run straight from source
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs ruff + CLI smoke tests
 on Python 3.11–3.13. PRs welcome: keep `ruff` green and the file style lean. Useful
 environment variables: `CMON_DB` (database path), `CMON_RETRIES`, `CMON_DEDUP_SECS`,
-`CMON_ALERT_LEAD` (minutes before the 5h reset to alert), `CMON_HOOK` (command run on that alert),
+`CMON_ALERT_LEAD` / `CMON_ALERT_LEAD_WEEKLY` (minutes before the 5h / weekly reset to alert),
+`CMON_HOOK` (command run on that alert),
 `CMON_OAUTH_CLIENT_ID` / `CMON_OAUTH_TOKEN_URL` (OAuth refresh overrides; URL allowlisted to
 `*.anthropic.com`), `CMON_ALLOW_PLAINTEXT_KEYRING` (permit saving to a cleartext keyring backend).
 

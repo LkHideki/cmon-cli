@@ -5,6 +5,19 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Per-window time-based alerts**: `collect --alert` now fires a desktop notification when the
+  **weekly** window nears its reset too, not just the 5h window. New `CMON_ALERT_LEAD_WEEKLY`
+  (default 180min) sets the weekly lead; `CMON_ALERT_LEAD` still governs the 5h session (default
+  60min). Each window deduplicates on its own reset, so both fire once per cycle, independently.
+
+### Changed
+
+- **`cmon watch` default poll interval** raised 30s → 45s (fewer requests, lighter background use).
+
 ## [0.1.2] — 2026-07-05
 
 Security hardening (secperf audit), Cloudflare-403 resilience, and a smarter projection.
