@@ -390,10 +390,9 @@ def now(args):
     for _k, lbl, pct, reset, _act in rows:
         print(f"  {lbl:16} {bar(pct)} {pct:4.0f}%   resets in {fmt_eta(reset):>9}")
 
-    con = _read_db()
     if getattr(args, "advice", False):  # 'now --advice' = usage + full pacing tips (was 'cmon tips')
         print("\nPacing — spend ~100% of weekly without blocking the 5h window:\n")
-        _advice(rows, con, no_ai=getattr(args, "no_ai", False))
+        _advice(rows, _read_db(), no_ai=getattr(args, "no_ai", False))
         return
 
     sess = next((r for r in rows if r[0] == "session"), None)
@@ -402,7 +401,10 @@ def now(args):
     _k, _lbl, pct, reset, _a = sess
     print(f"\n5h window: {pct:.0f}% used — expires in {fmt_eta(reset)}.")
 
-    if con is None or not reset:
+    if not reset:
+        return
+    con = _read_db()  # lazy: only import/open DuckDB once we know the projection is needed (F10)
+    if con is None:
         return
     end = datetime.fromisoformat(reset)
     win = con.execute(
@@ -1175,7 +1177,7 @@ def scan_logs(con, since=None, quiet: bool = False) -> None:
                                           "session", "in_tok", "out_tok", "cache_read",
                                           "cache_create"]).drop_duplicates("uuid")
         con.register("_tl_new", tdf)
-        con.execute("INSERT INTO token_log SELECT * FROM _tl_new ON CONFLICT DO NOTHING")
+        con.execute("INSERT INTO token_log SELECT * FROM _tl_new ORDER BY ts ON CONFLICT DO NOTHING")
         con.unregister("_tl_new")
     sdf = pd.DataFrame([[f, st.st_mtime, st.st_size] for f, st in todo],
                        columns=["path", "mtime", "size"])
