@@ -71,3 +71,12 @@ First development line toward `0.1.0`. No release published yet.
   since `cmon` was already taken.
 - `burn` now uses a default window of 30 days (Claude Code removes transcripts
   older than 30d); `--since all` scans the entire available history.
+
+### Fixed
+
+- **OAuth self-heal on a dead refresh chain**: when cmon's own refresh chain can't
+  renew (its `refresh_token` was rotated/revoked after a Claude Code re-login), token
+  resolution and the 401 force-refresh now fall back to Claude Code's fresh credential
+  and re-seed the chain, instead of stranding on the expired access token. Previously
+  this surfaced as a persistent `401 — invalid or expired token` that "Open Claude Code"
+  could not clear, because the fresh credential was never consulted.

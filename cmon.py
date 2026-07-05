@@ -125,33 +125,47 @@ def _auto_save(blob: dict) -> None:
 
 
 def _auto_token() -> tuple[str | None, str | None]:
-    """(source, access_token) from self-managed chain: prefers cmon's, else bootstraps
-    from Claude Code. Renews via refresh_token when access expires. (None, None) if none."""
+    """(source, access_token) from self-managed chain: prefers cmon's own, then re-bootstraps
+    from Claude Code. Renews via refresh_token when access expires. (None, None) if none.
+    Falls back to Claude Code's credentials (fresh after any re-login) when cmon's chain can't
+    renew, so a dead/rotated refresh_token never strands us on an expired access token."""
     import time
-    blob, src = _auto_load(), "cmon auto-refresh"
-    if not blob:
-        blob, src = _claude_code_cred(), "Claude Code credentials"
-    if not blob:
-        return None, None
-    exp = blob.get("expiresAt") or 0
-    if blob.get("accessToken") and time.time() * 1000 < exp - 60_000:  # 60s buffer
-        return src, blob["accessToken"]
-    if rt := blob.get("refreshToken"):
-        if new := _oauth_refresh(rt):
+    now = time.time() * 1000
+    auto = _auto_load()
+    # 1. Unexpired access token already in cmon's chain (60s buffer).
+    if auto and auto.get("accessToken") and now < (auto.get("expiresAt") or 0) - 60_000:
+        return "cmon auto-refresh", auto["accessToken"]
+    # 2. Renew cmon's chain via its own refresh_token.
+    if auto and (rt := auto.get("refreshToken")) and (new := _oauth_refresh(rt)):
+        _auto_save(new)
+        return "cmon auto-refresh", new["accessToken"]
+    # 3. cmon's chain is missing or its refresh_token is dead -> (re-)bootstrap from Claude Code.
+    if cc := _claude_code_cred():
+        if cc.get("accessToken") and now < (cc.get("expiresAt") or 0) - 60_000:
+            _auto_save(cc)  # seed chain so the next run starts from a known-good blob
+            return "Claude Code credentials", cc["accessToken"]
+        if (rt := cc.get("refreshToken")) and (new := _oauth_refresh(rt)):
             _auto_save(new)
             return "cmon auto-refresh", new["accessToken"]
-    return (src, blob["accessToken"]) if blob.get("accessToken") else (None, None)
+    # 4. Nothing renewable: hand back any stale token (fetch() force-refreshes on the 401).
+    if auto and auto.get("accessToken"):
+        return "cmon auto-refresh", auto["accessToken"]
+    return None, None
 
 
 def _force_refresh() -> str | None:
     """Force a refresh (used when API returns 401). Returns new access_token or None.
-    Refreshes from cmon's chain or, failing that, Claude Code credentials — so it works
-    even if an old CLAUDE_OAUTH_TOKEN (env/.env) is shadowing everything."""
-    blob = _auto_load() or _claude_code_cred() or {}
-    if rt := blob.get("refreshToken"):
-        if new := _oauth_refresh(rt):
-            _auto_save(new)
-            return new["accessToken"]
+    Tries cmon's chain refresh_token first, then Claude Code's — so a dead/rotated chain
+    token self-heals from Claude Code's fresh one, even if an old CLAUDE_OAUTH_TOKEN (env/.env)
+    is shadowing everything."""
+    seen: set[str] = set()
+    for blob in (_auto_load(), _claude_code_cred()):
+        rt = (blob or {}).get("refreshToken")
+        if rt and rt not in seen:
+            seen.add(rt)
+            if new := _oauth_refresh(rt):
+                _auto_save(new)
+                return new["accessToken"]
     return None
 
 
