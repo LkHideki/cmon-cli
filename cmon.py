@@ -35,6 +35,10 @@ AUTO_ACCOUNT = "claude-oauth-auto"  # chain refreshed by cmon, separate from Cla
 RETRIES = int(os.environ.get("CMON_RETRIES", "3"))
 DEDUP_SECS = int(os.environ.get("CMON_DEDUP_SECS", "60"))  # window to deduplicate collect
 ALERT_LEAD_MIN = int(os.environ.get("CMON_ALERT_LEAD", "60"))  # minutes-before-reset to alert (5h window)
+ALERT_LEAD_WEEKLY_MIN = int(os.environ.get("CMON_ALERT_LEAD_WEEKLY", "180"))  # same, for the weekly window
+# Per-window lead (minutes-before-reset) for the time-based alert. Extend here to cover more windows.
+LEAD_MIN_BY_KEY = {"session": ALERT_LEAD_MIN, "weekly_all": ALERT_LEAD_WEEKLY_MIN}
+LEAD_LABEL_BY_KEY = {"session": "5h window", "weekly_all": "Weekly limit"}
 MAX_JSONL_LINE = 4 << 20  # 4 MiB: skip parsing absurdly large transcript lines (secperf F4 DoS guard)
 # Claude Code OAuth — public values from login flow; used only for token renewal.
 OAUTH_CLIENT_ID = os.environ.get("CMON_OAUTH_CLIENT_ID", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
@@ -768,37 +772,35 @@ def _mark_alert(key: str, marker) -> None:
         pass
 
 
-def _lead_alert(rows) -> str | None:
-    """Message if the 5h (session) window is within CMON_ALERT_LEAD minutes of resetting, else
-    None. Purely time-based (uses resets_at), independent of consumption rate."""
-    sess = next((r for r in rows if r[0] == "session"), None)
-    if not sess or not sess[3]:
-        return None
-    reset = datetime.fromisoformat(sess[3]) if isinstance(sess[3], str) else sess[3]
-    rem_min = (reset - datetime.now(UTC)).total_seconds() / 60
-    if 0 < rem_min <= ALERT_LEAD_MIN:
-        return f"5h window resets in ~{rem_min:.0f}m (used {sess[2]:.0f}%)."
-    return None
+def _lead_alerts(rows):
+    """Time-based lead alerts for every window in LEAD_MIN_BY_KEY (5h session + weekly). Yields
+    (key, reset_dt, message) for each window within its own lead of resetting. Purely time-based
+    (uses resets_at), independent of consumption rate."""
+    by_key = {r[0]: r for r in rows}
+    for key, lead_min in LEAD_MIN_BY_KEY.items():
+        row = by_key.get(key)
+        if not row or not row[3]:
+            continue
+        reset = datetime.fromisoformat(row[3]) if isinstance(row[3], str) else row[3]
+        rem_min = (reset - datetime.now(UTC)).total_seconds() / 60
+        if 0 < rem_min <= lead_min:
+            lbl = LEAD_LABEL_BY_KEY.get(key, row[1])
+            yield key, reset, f"{lbl} resets in ~{fmt_eta(row[3])} (used {row[2]:.0f}%)."
 
 
 def _fire_lead_alert(rows) -> None:
-    """Fire the time-based 5h alert once per cycle: stderr + native notification + CMON_HOOK.
-    Deduped on the session reset bucketed to the nearest minute — the API's resets_at jitters
-    ~1s between calls, so an exact-string marker would re-fire every collect."""
-    msg = _lead_alert(rows)
-    if not msg:
-        return
-    reset = next((r[3] for r in rows if r[0] == "session"), None)
-    if not reset:
-        return
-    rdt = datetime.fromisoformat(reset) if isinstance(reset, str) else reset
-    marker = round(rdt.timestamp() / 60)  # nearest-minute bucket, robust to ~1s API jitter
-    if _alert_fired("lead_session", marker):
-        return
-    print(f"⚠ {msg}", file=sys.stderr)
-    _notify("cmon — 5h window", msg)
-    _run_hook(msg)
-    _mark_alert("lead_session", marker)
+    """Fire the time-based lead alert per window (5h + weekly), once per cycle each: stderr +
+    native desktop notification + CMON_HOOK. Deduped per window on its own reset bucketed to the
+    nearest minute — the API's resets_at jitters ~1s between calls, so an exact-string marker
+    would re-fire every collect."""
+    for key, reset, msg in _lead_alerts(rows):
+        marker = round(reset.timestamp() / 60)  # nearest-minute bucket, robust to ~1s API jitter
+        if _alert_fired(f"lead_{key}", marker):
+            continue
+        print(f"⚠ {msg}", file=sys.stderr)
+        _notify(f"cmon — {LEAD_LABEL_BY_KEY.get(key, key)}", msg)
+        _run_hook(msg)
+        _mark_alert(f"lead_{key}", marker)
 
 
 def _ai_tip(summary: str) -> str | None:
@@ -1599,8 +1601,9 @@ def main():
     pc = sub.add_parser("collect", help="save 1 snapshot to database")
     pc.add_argument("--force", action="store_true", help="save even with recent snapshot (bypass dedup)")
     pc.add_argument("--alert", action="store_true",
-                    help="alerts (stderr + notification + CMON_HOOK): rate hits 100%% before "
-                         "reset, or 5h window resets within CMON_ALERT_LEAD min")
+                    help="alerts (stderr + desktop notification + CMON_HOOK): rate hits 100%% "
+                         "before reset, or a window is within its lead of resetting "
+                         "(CMON_ALERT_LEAD / CMON_ALERT_LEAD_WEEKLY min)")
     pw = sub.add_parser("watch", help="live TUI with current usage, recording each read (Ctrl-C quits)")
     pw.add_argument("-n", "--interval", type=int, default=45, help="seconds between updates (default 45)")
     pwa = sub.add_parser("wait", help="block until window resets (or --at N%%), then notify")
