@@ -5,9 +5,57 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.0] — 2026-07-05
 
-First development line toward `0.1.0`. No release published yet.
+Security hardening (secperf audit), Cloudflare-403 resilience, and a smarter projection.
+
+### Added
+
+- **`cmon watch` adaptive backoff**: the poll interval self-tunes to survive Cloudflare
+  bot-detection (403) — ×1.8 on any 403/error (cap 5min), eases back ×/1.5 after 5 clean
+  reads, with ±15% jitter to break the fixed robotic cadence. The learned-safe interval is
+  persisted (new `meta` table) and reused on the next `watch` within 2h.
+
+### Changed
+
+- **EWMA-weighted projection rate**: `_rate` now computes an exponentially-weighted
+  least-squares slope over the current window (half-life ~1h for the 5h window, ~12h weekly)
+  instead of a flat cycle average — recent snapshots dominate, so the projection tracks your
+  current pace. `now` drops its duplicated inline rate calc and shares this one source with
+  `watch`/`--advice`/alerts.
+
+### Security
+
+- **F1 — OAuth token exfil via stray `.env` closed**: `load_dotenv` scoped to cwd (no
+  ancestor-dir walk); token-bearing HTTP calls use a `trust_env=False` session (no ambient
+  proxy MITM); `CMON_OAUTH_TOKEN_URL` host-allowlisted to `*.anthropic.com`.
+- **F2 — cleartext keyring refused**: `token set` aborts on a plaintext/null/fail backend
+  (override `CMON_ALLOW_PLAINTEXT_KEYRING=1`) and auto-refresh won't persist the chain there.
+- **F3 — `Retry-After` clamped** to [0,60]s so a hostile/garbage value can't hang the CLI.
+- **F4 — log-derived labels sanitized** (control/ANSI chars stripped at the parse boundary)
+  and JSONL lines > 4 MiB skipped (parser DoS guard).
+- **F5 — Windows `schtasks` install** rejects an argument containing `"` instead of emitting
+  a broken quoted command.
+
+### Fixed
+
+- **OAuth self-heal on a dead refresh chain**: when cmon's own refresh chain can't renew (its
+  `refresh_token` was rotated/revoked after a Claude Code re-login), token resolution and the
+  401 force-refresh fall back to Claude Code's fresh credential and re-seed the chain, instead
+  of stranding on the expired access token — the persistent `401` that "Open Claude Code"
+  could not clear.
+
+### Performance
+
+- **Vectorized reset detection** in `_rate`/`_cycles` (`df.percent.diff()<0` instead of an
+  O(n) Python loop with scalar `.iloc`).
+- **History-query scale hardening**: `--since` pushed into the `deltas()` SQL (F8), `token_log`
+  inserted `ORDER BY ts` for zonemap pruning (F9), and `now` defers the DuckDB import until the
+  projection is actually needed (F10).
+
+## [0.1.0]
+
+First development line. Everything below predates the 0.2.0 hardening pass.
 
 ### Added
 
@@ -71,12 +119,3 @@ First development line toward `0.1.0`. No release published yet.
   since `cmon` was already taken.
 - `burn` now uses a default window of 30 days (Claude Code removes transcripts
   older than 30d); `--since all` scans the entire available history.
-
-### Fixed
-
-- **OAuth self-heal on a dead refresh chain**: when cmon's own refresh chain can't
-  renew (its `refresh_token` was rotated/revoked after a Claude Code re-login), token
-  resolution and the 401 force-refresh now fall back to Claude Code's fresh credential
-  and re-seed the chain, instead of stranding on the expired access token. Previously
-  this surfaced as a persistent `401 — invalid or expired token` that "Open Claude Code"
-  could not clear, because the fresh credential was never consulted.

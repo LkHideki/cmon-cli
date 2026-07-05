@@ -33,6 +33,10 @@ Requires Python ≥ 3.11 and [uv](https://docs.astral.sh/uv/). Without uv,
    cmon token status     # where the token comes from, masked
    cmon token clear      # remove from vault
    ```
+
+   On a headless/CI box with no secure backend, `token set` refuses to write in
+   cleartext (keyring's plaintext fallback) — override with
+   `CMON_ALLOW_PLAINTEXT_KEYRING=1`, or just use `CLAUDE_OAUTH_TOKEN`.
 3. **Claude Code credential** — if you're logged in, read directly from
    Keychain (macOS) or `~/.claude/.credentials.json` (Linux/Windows). Zero
    friction: nothing to configure.
@@ -41,11 +45,14 @@ Requires Python ≥ 3.11 and [uv](https://docs.astral.sh/uv/). Without uv,
 `refresh_token` and stores the new token in its own vault (`claude-oauth-auto`),
 **without** rewriting the Claude Code credential. Renews proactively (reads
 `expiresAt`) and reactively (if the API returns 401 — including when an old
-`CLAUDE_OAUTH_TOKEN` is shadowing everything). Side effect: the first renewal
-rotates Claude Code's `refresh_token`, so **it may ask for login once** the next
-time it renews — after that the two tokens become independent. `token status`
-shows validity; `client_id`/endpoint are configurable via `CMON_OAUTH_CLIENT_ID` /
-`CMON_OAUTH_TOKEN_URL`.
+`CLAUDE_OAUTH_TOKEN` is shadowing everything). **Self-heals:** if cmon's own refresh
+chain dies (its `refresh_token` gets rotated/revoked after a Claude Code re-login), it
+falls back to Claude Code's fresh credential and re-seeds the chain instead of getting
+stuck on a `401`. Side effect: the first renewal rotates Claude Code's `refresh_token`,
+so **it may ask for login once** the next time it renews — after that the two tokens
+become independent. `token status` shows validity; `client_id`/endpoint are configurable
+via `CMON_OAUTH_CLIENT_ID` / `CMON_OAUTH_TOKEN_URL` (the latter host-allowlisted to
+`*.anthropic.com`, so a stray `.env` can't redirect the refresh POST).
 
 In short, with Claude Code logged in you need nothing — and it keeps working
 even with an expired token. Without it, `cmon token set` stores the token securely
@@ -129,7 +136,7 @@ don't record the account, and claude.ai chat doesn't write logs.
 Scanning is incremental (caches by `mtime`+size, deduplicates by `uuid`): the
 first run reads everything (~tens of seconds on large bases), subsequent runs take
 fractions of a second. The same numbers appear in `watch` (line *burn 5h*) and in
-`tips` (model mix from the last 5h, which grounds the model-switch tip).
+`now --advice` (model mix from the last 5h, which grounds the model-switch tip).
 
 `burn` also shows a **component breakdown** (input / output / cache read
 / cache write). Don't be alarmed by the total: in agentic use, **cache read + write
@@ -159,9 +166,14 @@ in a corner of the terminal. Each read is recorded to the database (deduped), so
 `watch` open also builds history.
 
 ```bash
-uv run cmon watch                 # update every 30s
-uv run cmon watch -n 10           # every 10s
+uv run cmon watch                 # ~30s, self-tuning
+uv run cmon watch -n 10           # start at ~10s
 ```
+
+If claude.ai's Cloudflare starts returning **403** (bot-detection on the fixed polling
+cadence), `watch` self-tunes: it backs the interval off on each error (up to 5min), adds
+jitter, eases back once reads succeed again, and remembers the safe interval for the next
+run — so you can leave it open without tripping the block.
 
 ### Alerts
 
@@ -210,15 +222,17 @@ the projection at reset:
 - **projection > 100%** → *shortfall*: how many hours until you hit 100% before reset and how
   much you need to throttle.
 
-The rate automatically cuts at the last reset, so it adapts to 5h, 7d windows (or 72h — Anthropic
-resets the "weekly" at a fixed time, not always exactly 7 days). Finally, `--advice` sends the
+The rate cuts at the last reset (so it adapts to 5h, 7d, or 72h windows — Anthropic resets the
+"weekly" at a fixed time, not always exactly 7 days) and is **exponentially weighted**: recent
+snapshots count more (half-life ~1h for the 5h window, ~12h weekly), so the projection tracks your
+current pace rather than a flat cycle average. Finally, `--advice` sends the
 numbers to **Claude Sonnet** (`claude -p`, cheap) for 3 actionable tips; use `--no-ai` for local
 projections only, no quota cost.
 
 ## Continuous collection
 
-`report`/`plot`/`trends`/alerts become useful with history. Every command that queries the
-API — `now`, `tips`, `watch`, `wait` — already records its reading (deduped within
+`plot`/`trends`/alerts become useful with history. Every command that queries the
+API — `now`, `watch`, `wait` — already records its reading (deduped within
 `CMON_DEDUP_SECS`), so history accrues from normal use, not only from scheduled `collect`.
 Persisting is best-effort: if the single-writer DB is busy (e.g. `watch` is open) the read
 still succeeds, it just doesn't save that one point. For unattended, regular sampling, leave
@@ -247,10 +261,12 @@ if that's your case. Prefer manual cron? Still works:
   (discarded), not consumption.
 - Requires the `User-Agent: claude-cli/...` header, otherwise claude.ai's Cloudflare
   responds with 403.
-- **Resilience**: `fetch` retries on 429/5xx/network with backoff (respects
-  `Retry-After`); 401/403 fail immediately with clear message. `collect` deduplicates
-  very close readings (`CMON_DEDUP_SECS`, default 60s; `--force` ignores) and exits
-  with code ≠ 0 on failure, so cron logs the error instead of silencing it.
+- **Resilience**: `fetch` retries on 429/5xx/network with backoff (respects a clamped
+  `Retry-After`); 401/403 fail with a clear message, but `watch` turns a 403 into an adaptive
+  backoff (see above) rather than giving up, and token resolution self-heals a dead refresh
+  chain from the Claude Code credential. `collect` deduplicates very close readings
+  (`CMON_DEDUP_SECS`, default 60s; `--force` ignores) and exits with code ≠ 0 on failure, so
+  cron logs the error instead of silencing it.
 
 ## Development
 
@@ -267,7 +283,9 @@ uv run cmon <cmd>            # run straight from source
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs ruff + CLI smoke tests
 on Python 3.11–3.13. PRs welcome: keep `ruff` green and the file style lean. Useful
 environment variables: `CMON_DB` (database path), `CMON_RETRIES`, `CMON_DEDUP_SECS`,
-`CMON_ALERT_LEAD` (minutes before the 5h reset to alert), `CMON_HOOK` (command run on that alert).
+`CMON_ALERT_LEAD` (minutes before the 5h reset to alert), `CMON_HOOK` (command run on that alert),
+`CMON_OAUTH_CLIENT_ID` / `CMON_OAUTH_TOKEN_URL` (OAuth refresh overrides; URL allowlisted to
+`*.anthropic.com`), `CMON_ALLOW_PLAINTEXT_KEYRING` (permit saving to a cleartext keyring backend).
 
 ## Warning
 
