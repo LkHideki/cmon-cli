@@ -264,9 +264,10 @@ def token_clear(_):
 
 
 def _retry_after(r) -> float | None:
-    """Seconds requested by Retry-After header (429/503), if numeric."""
+    """Seconds from a Retry-After header (429/503), clamped to [0, 60]; None if non-numeric.
+    The clamp caps a malicious/garbage value so it can't hang the CLI (secperf F3)."""
     try:
-        return float(r.headers.get("Retry-After") or "")
+        return min(max(float(r.headers.get("Retry-After") or ""), 0.0), 60.0)
     except ValueError:
         return None
 
