@@ -293,6 +293,115 @@ def token_clear(_):
     print(f"Removed from OS vault ({n} entry/entries)." if n else "Nothing was saved in OS vault.")
 
 
+# --- Config: persisted user preferences (~/.cmon/config.json) ---
+CONFIG = os.path.expanduser("~/.cmon/config.json")
+CONFIG_KEYS = {"timezone"}  # allowlist; extend here as new preferences are added
+
+
+def _validate_timezone(value: str) -> str:
+    """Raise ValueError with a user-facing message if `value` isn't a valid IANA tz name."""
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    try:
+        ZoneInfo(value)
+    except ZoneInfoNotFoundError as e:
+        raise ValueError(
+            f"Unknown timezone {value!r}. Use an IANA name, e.g. 'America/Sao_Paulo', 'UTC'.") from e
+    return value
+
+
+CONFIG_VALIDATORS = {"timezone": _validate_timezone}  # key -> fn(value) -> normalized value | raises ValueError
+
+
+def _read_config() -> dict:
+    """Persisted user preferences, or {} if absent/unreadable/corrupt — degrades to defaults,
+    same spirit as _read_cache."""
+    try:
+        with open(CONFIG, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_config(cfg: dict) -> None:
+    """Persist user preferences to ~/.cmon/config.json. Unlike _write_cache this does NOT
+    swallow errors — 'config set/clear' is the primary action, callers must surface failure."""
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    with open(CONFIG, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+
+
+def _resolve_tz():
+    """Effective ZoneInfo for display, in precedence order: CMON_TZ env (quick override,
+    doesn't persist) -> ~/.cmon/config.json {"timezone": ...} -> UTC. An invalid value at
+    either source is skipped with a stderr warning, falling through."""
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    for source, name in (("env CMON_TZ", os.environ.get("CMON_TZ")),
+                         ("config", _read_config().get("timezone"))):
+        if not name:
+            continue
+        try:
+            return ZoneInfo(name)
+        except ZoneInfoNotFoundError:
+            print(f"cmon: ignoring invalid timezone {name!r} from {source} "
+                 "(run 'cmon config set timezone <IANA name>').", file=sys.stderr)
+    return ZoneInfo("UTC")
+
+
+def config_set(args):
+    value = args.value
+    if validator := CONFIG_VALIDATORS.get(args.key):
+        try:
+            value = validator(value)
+        except ValueError as e:
+            sys.exit(str(e))
+    cfg = _read_config()
+    cfg[args.key] = value
+    try:
+        _write_config(cfg)
+    except Exception as e:
+        sys.exit(f"Failed to save config: {e}")
+    print(f"✓ {args.key} = {value}")
+
+
+def config_get(args):
+    val = _read_config().get(args.key)
+    print(val if val is not None else f"{args.key} not set (default applies).")
+
+
+def config_list(_args):
+    cfg = _read_config()
+    if not cfg:
+        print("No preferences set. Run 'cmon config set <key> <value>'.")
+        return
+    w = max(len(k) for k in cfg)
+    for k, v in cfg.items():
+        print(f"{k:<{w}} = {v}")
+
+
+def config_clear(args):
+    cfg = _read_config()
+    if args.all:
+        try:
+            _write_config({})
+        except Exception as e:
+            sys.exit(f"Failed to clear config: {e}")
+        print("✓ All preferences cleared." if cfg else "Nothing was set.")
+        return
+    if not args.key:
+        sys.exit("Specify a key to clear, or use --all.")
+    if args.key not in cfg:
+        print(f"{args.key} was not set.")
+        return
+    del cfg[args.key]
+    try:
+        _write_config(cfg)
+    except Exception as e:
+        sys.exit(f"Failed to save config: {e}")
+    print(f"✓ {args.key} cleared.")
+
+
 def _retry_after(r) -> float | None:
     """Seconds from a Retry-After header (429/503), clamped to [0, 60]; None if non-numeric.
     The clamp caps a malicious/garbage value so it can't hang the CLI (secperf F3)."""
@@ -1628,12 +1737,30 @@ def main():
     ta.add_parser("status", help="show token source, masked")
     ta.add_parser("clear", help="remove saved token from vault")
 
+    pcfg = sub.add_parser("config", help="manage persisted user preferences (~/.cmon/config.json)",
+                          description="Currently supports: timezone (used to display timestamps "
+                                      "locally instead of UTC).")
+    cfa = pcfg.add_subparsers(dest="action", required=True)
+    cfset = cfa.add_parser("set", help="set a preference")
+    cfset.add_argument("key", choices=sorted(CONFIG_KEYS))
+    cfset.add_argument("value", help="e.g. an IANA timezone name for 'timezone' (America/Sao_Paulo, UTC...)")
+    cfget = cfa.add_parser("get", help="show a persisted preference")
+    cfget.add_argument("key", choices=sorted(CONFIG_KEYS))
+    cfa.add_parser("list", help="show all persisted preferences")
+    cfclr = cfa.add_parser("clear", help="remove a preference (or --all)")
+    cfclr.add_argument("key", nargs="?", choices=sorted(CONFIG_KEYS))
+    cfclr.add_argument("--all", action="store_true", help="remove every persisted preference")
+
     args = p.parse_args()
     if args.db:
         global DB
         DB = args.db
     if args.cmd == "token":
         {"set": token_set, "status": token_status, "clear": token_clear}[args.action](args)
+        return
+    if args.cmd == "config":
+        {"set": config_set, "get": config_get, "list": config_list,
+         "clear": config_clear}[args.action](args)
         return
     try:
         {"now": now, "status": status, "trends": trends, "collect": collect,

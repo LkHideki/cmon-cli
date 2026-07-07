@@ -30,6 +30,7 @@ dependencies = [
     "python-dotenv>=1.0",
     "requests>=2.32",
     "rich>=13.0",
+    "tzdata>=2024.1",
 ]
 
 # Plots are optional: matplotlib+seaborn are heavy and only the `plot` command
