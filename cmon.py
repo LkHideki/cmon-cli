@@ -1410,7 +1410,8 @@ def burn(args):
         return
     per = {"model": "model", "surface": "surface", "day": "day",
            "project": "project", "session": "session"}[args.by]
-    window = f" since {since:%Y-%m-%d %H:%M} UTC" if since else ""
+    since_local = since.astimezone(_resolve_tz()) if since else None
+    window = f" since {since_local:%Y-%m-%d %H:%M %Z}" if since_local else ""
     print(f"Consumption by {per}{window} (API equivalent):")
     lines = [(_surface(row.grp) if args.by == "surface" else str(row.grp),
               row.tok / 1e6, row.custo) for row in g.itertuples()]
