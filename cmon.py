@@ -647,7 +647,8 @@ def _summary(con, since):
     if since is not None:
         df = df[df.ts >= since]
         if df.empty:
-            sys.exit(f"No data since {since:%Y-%m-%d %H:%M} UTC.")
+            since_local = since.astimezone(_resolve_tz())
+            sys.exit(f"No data since {since_local:%Y-%m-%d %H:%M %Z}.")
     return df.groupby("label").agg(
         snapshots=("percent", "size"),
         peak_pct=("percent", "max"),
@@ -1183,6 +1184,7 @@ def trends(args):
         print(g.reset_index().to_json(orient="records", force_ascii=False))
         return
     print(g.to_string())
+    tz = _resolve_tz()
     for key, lbl in (("weekly_all", "Weekly (All models)"), ("session", "5h window")):
         segs = _cycles(con, key)
         if not segs:
@@ -1190,10 +1192,10 @@ def trends(args):
         peaks = [float(s.percent.max()) for s in segs]
         print(f"\n{lbl} — {len(segs)} cycle(s):")
         for i in range(max(0, len(segs) - 5), len(segs)):
-            ini = segs[i].ts.iloc[0]
+            ini = segs[i].ts.iloc[0].tz_convert(tz)
             d = peaks[i] - peaks[i - 1] if i > 0 else None
             delta = f"  ({'+' if d >= 0 else ''}{d:.0f} vs previous)" if d is not None else ""
-            print(f"  {ini:%Y-%m-%d %H:%M}  peak {peaks[i]:.0f}%{delta}")
+            print(f"  {ini:%Y-%m-%d %H:%M %Z}  peak {peaks[i]:.0f}%{delta}")
         if len(peaks) >= 3:
             prev = peaks[:-1]
             avg = sum(prev) / len(prev)
