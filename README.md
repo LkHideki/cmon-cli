@@ -59,6 +59,25 @@ even with an expired token. Without it, `cmon token set` stores the token secure
 on any system. `.env` still works for step 1 (see `.env.example`). Run `cmon --help`
 or `cmon token --help` for the rest.
 
+## Config
+
+`cmon` resolves display **timezone** in this order, stopping at the first match:
+
+1. **`CMON_TZ`** — environment variable (quick override, doesn't persist).
+2. **`~/.cmon/config.json`** — set via `cmon config set timezone <IANA name>`.
+3. **UTC** — default if neither is set.
+
+```bash
+cmon config set timezone America/Sao_Paulo   # persist a preference
+cmon config get timezone                     # show it
+cmon config list                              # show all persisted preferences
+cmon config clear timezone                    # remove it (or: cmon config clear --all)
+```
+
+Applies to displayed timestamps (`watch`, `trends`, `burn`); stored data and internal
+calculations stay in UTC. `timezone` is the only preference today; the mechanism is
+built to grow (`CONFIG_KEYS` in `cmon.py`).
+
 ## Usage
 
 ```bash
@@ -289,7 +308,8 @@ environment variables: `CMON_DB` (database path), `CMON_RETRIES`, `CMON_DEDUP_SE
 `CMON_ALERT_LEAD` / `CMON_ALERT_LEAD_WEEKLY` (minutes before the 5h / weekly reset to alert),
 `CMON_HOOK` (command run on that alert),
 `CMON_OAUTH_CLIENT_ID` / `CMON_OAUTH_TOKEN_URL` (OAuth refresh overrides; URL allowlisted to
-`*.anthropic.com`), `CMON_ALLOW_PLAINTEXT_KEYRING` (permit saving to a cleartext keyring backend).
+`*.anthropic.com`), `CMON_ALLOW_PLAINTEXT_KEYRING` (permit saving to a cleartext keyring backend),
+`CMON_TZ` (display timezone override; see [Config](#config)).
 
 ## Warning
 

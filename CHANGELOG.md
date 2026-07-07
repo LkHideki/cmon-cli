@@ -9,6 +9,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`cmon config`**: persisted user preferences (`~/.cmon/config.json`), starting with
+  `timezone` — `set`/`get`/`list`/`clear` subcommands, plus `CMON_TZ` for a quick
+  non-persisted override. `watch`, `trends`, and `burn` now display timestamps in the
+  resolved timezone instead of hardcoded UTC (stored data and internal calculations
+  stay in UTC).
 - **Per-window time-based alerts**: `collect --alert` now fires a desktop notification when the
   **weekly** window nears its reset too, not just the 5h window. New `CMON_ALERT_LEAD_WEEKLY`
   (default 180min) sets the weekly lead; `CMON_ALERT_LEAD` still governs the 5h session (default
