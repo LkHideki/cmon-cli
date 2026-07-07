@@ -1456,6 +1456,8 @@ def watch(args):
     from rich.text import Text
 
     con = db()  # writable: records each read (deduped), plus _rate and burn from logs
+    tz = _resolve_tz()  # resolved once, before Live(screen=True) takes over — any invalid-tz
+                       # warning must print here, never inside render() (would corrupt the TUI)
     base = float(args.interval)
     cur = base  # adaptive poll interval: grows on 403/errors, eases back on sustained success
     learned = _meta_get(con, "watch_interval")
@@ -1503,7 +1505,8 @@ def watch(args):
         alerts = _alerts(rows, con)
         if alerts:
             body.append(Text("\n".join("⚠ " + m for m in alerts), style="bold red"))
-        body.append(Text(f"{now_utc:%H:%M:%S} UTC · every ~{cur:.0f}s"
+        now_local = now_utc.astimezone(tz)
+        body.append(Text(f"{now_local:%H:%M:%S %Z} · every ~{cur:.0f}s"
                          " · recording · Ctrl-C quits", style="dim"))
         return Panel(Group(*body), title="cmon watch", border_style="cyan"), True
 
