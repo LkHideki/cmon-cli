@@ -14,8 +14,11 @@ and displays consumption rate, projections, and charts.
 ```bash
 git clone https://github.com/LkHideki/cmon && cd cmon
 uv sync                  # lightweight install (without plotting libraries)
-uv sync --extra plot     # optional: enables the `plot` command (matplotlib/seaborn)
+uv sync --extra plot     # optional: pre-install the `plot` command's libs (matplotlib/seaborn/pandas)
 ```
+
+`cmon plot` self-provisions: if the plotting libraries aren't installed, the first run
+installs them automatically. `uv sync --extra plot` is only to pre-install them (e.g. offline).
 
 Requires Python ≥ 3.11 and [uv](https://docs.astral.sh/uv/). Without uv,
 `pip install -e .` also works.

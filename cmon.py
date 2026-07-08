@@ -755,14 +755,37 @@ def _burn_ax(ax, con, since) -> None:
     ax.legend(fontsize=8, title="")
 
 
-def plot(args):
+def _ensure_plot_deps():
+    """Import the plotting stack, installing the optional `plot` extra on first use if it's
+    missing. Tries pip in the running interpreter, then `uv pip` (uv-managed envs often ship
+    without pip), and only falls back to manual instructions if both fail."""
     try:
-        import matplotlib.pyplot as plt
-        import seaborn as sns
+        import matplotlib.pyplot  # noqa: F401
+        import seaborn  # noqa: F401
+        return
     except ImportError:
-        sys.exit("Plots need plot extras. Install with:\n"
-                 "  uv sync --extra plot         (in repo)\n"
-                 "  pip install 'cmon[plot]'     (via PyPI)")
+        pass
+    pkgs = ["matplotlib>=3.8", "seaborn>=0.13", "pandas>=2.0"]
+    print("plot needs matplotlib/seaborn/pandas — installing them now…", file=sys.stderr)
+    import importlib
+    for cmd in ([sys.executable, "-m", "pip", "install", *pkgs],
+                ["uv", "pip", "install", "--python", sys.executable, *pkgs]):
+        try:
+            subprocess.run(cmd, check=True)
+            importlib.invalidate_caches()  # make the freshly-installed packages importable now
+            return
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            continue
+    sys.exit("Auto-install failed. Install the plot extra manually:\n"
+             "  pip install 'cmon-cli[plot]'       (via PyPI)\n"
+             "  uv tool install 'cmon-cli[plot]'   (if installed with uv tool)\n"
+             "  uv sync --extra plot               (in the repo)")
+
+
+def plot(args):
+    _ensure_plot_deps()
+    import matplotlib.pyplot as plt
+    import seaborn as sns
     con = db()
     df = deltas(con)
     now_utc = datetime.now(UTC)

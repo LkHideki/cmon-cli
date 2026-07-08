@@ -22,6 +22,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 ### Changed
 
 - **`cmon watch` default poll interval** raised 30s → 45s (fewer requests, lighter background use).
+- **`cmon plot` now self-provisions its libraries.** If matplotlib/seaborn/pandas aren't
+  installed, the first `plot` run installs them automatically (pip, then `uv pip` as a
+  fallback for uv-managed envs), instead of exiting with instructions. `uv sync --extra plot`
+  still works to pre-install them.
 
 ### Removed
 
