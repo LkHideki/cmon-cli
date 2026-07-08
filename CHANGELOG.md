@@ -7,6 +7,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.4] — 2026-07-08
+
 ### Added
 
 - **`cmon config`**: persisted user preferences (`~/.cmon/config.json`), starting with
