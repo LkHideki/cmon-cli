@@ -23,6 +23,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 - **`cmon watch` default poll interval** raised 30s → 45s (fewer requests, lighter background use).
 
+### Removed
+
+- **`pandas` (and its `numpy` stack) dropped from the core dependencies.** It was only a
+  convenience layer over DuckDB, not doing real analytics, and pulled a ~55 MB compiled
+  stack into every install. All core code paths now use native DuckDB fetch + plain Python
+  (SQL aggregation for summaries/burn, `unnest`-based bulk insert for log scanning), so a
+  default `uv sync`/`pip install` is much lighter. `pytz` (pure-Python, tiny) is now an
+  explicit dependency because DuckDB needs it to convert `TIMESTAMPTZ` ↔ Python `datetime`
+  (it used to arrive transitively via pandas). Plotting still uses pandas, now declared in
+  the optional `plot` extra alongside matplotlib/seaborn.
+
 ## [0.1.2] — 2026-07-05
 
 Security hardening (secperf audit), Cloudflare-403 resilience, and a smarter projection.

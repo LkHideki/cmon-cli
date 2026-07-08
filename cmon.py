@@ -23,7 +23,13 @@ import json
 import os
 import subprocess
 import sys
+from collections import namedtuple
 from datetime import UTC, datetime, timedelta
+
+# One cycle of a window's snapshots (segmented at each reset). Native replacement
+# for the pandas DataFrame slices _cycles() used to return: .ts is a list of
+# tz-aware datetimes, .percent a list of floats.
+Cycle = namedtuple("Cycle", "ts percent")
 
 DB = os.environ.get("CMON_DB", "usage.duckdb")
 URL = "https://claude.ai/api/oauth/usage"
@@ -501,7 +507,9 @@ def _meta_set(con, key: str, value: str) -> None:
 
 
 def deltas(con):
-    """delta = percent - previous snapshot for same window; delta<0 = reset (not consumption)."""
+    """delta = percent - previous snapshot for same window; delta<0 = reset (not consumption).
+    Plot-only: returns a pandas DataFrame (via .df()), so it needs the `plot` extra. Core
+    code paths use SQL aggregation directly (see _summary) and never call this."""
     df = con.execute(
         "SELECT ts, key, label, percent, percent - lag(percent) "
         "OVER (PARTITION BY key ORDER BY ts) AS delta "
@@ -642,17 +650,24 @@ def _parse_since(s: str | None):
 
 def _summary(con, since):
     """Per-label aggregate over the optional --since window: snapshots, peak %, and total
-    consumed % (sum of positive deltas). The headline table shown by 'trends'."""
-    df = deltas(con)
-    if since is not None:
-        df = df[df.ts >= since]
-        if df.empty:
+    consumed % (sum of positive deltas). The headline table shown by 'trends'. Returns a
+    list of dict rows sorted by label. delta is computed over the full history (lag per key)
+    and only then filtered to the window, so a snapshot at the window edge still gets a delta."""
+    where = "WHERE ts >= ?" if since is not None else ""
+    params = [since] if since is not None else []
+    rows = con.execute(
+        "WITH d AS (SELECT label, percent, ts, "
+        "  percent - lag(percent) OVER (PARTITION BY key ORDER BY ts) AS delta FROM snapshots) "
+        f"SELECT label, count(*), round(max(percent)), "
+        f"  round(sum(CASE WHEN delta > 0 THEN delta ELSE 0 END)) "
+        f"FROM d {where} GROUP BY label ORDER BY label", params).fetchall()
+    if not rows:
+        if since is not None:
             since_local = since.astimezone(_resolve_tz())
             sys.exit(f"No data since {since_local:%Y-%m-%d %H:%M %Z}.")
-    return df.groupby("label").agg(
-        snapshots=("percent", "size"),
-        peak_pct=("percent", "max"),
-        consumed_pct=("delta", lambda s: s[s > 0].sum())).round().astype(int)
+        sys.exit("No data — run 'cmon collect' a few times first.")
+    return [{"label": lbl, "snapshots": int(n), "peak_pct": int(pk),
+             "consumed_pct": int(cons or 0)} for lbl, n, pk, cons in rows]
 
 
 def _open_file(path):
@@ -688,30 +703,27 @@ def _pace_ax(ax, con, key: str, title: str, now_utc) -> None:
     Faceted per window because session (5h) and weekly (7d) horizons share no time axis.
     Reading differs by goal: weekly → aim for the line (full use); session → stay below it
     (crossing 100% early blocks you)."""
-    import pandas as pd
     segs = _cycles(con, key)
-    if not segs or len(segs[-1]) < 1:
+    if not segs or len(segs[-1].ts) < 1:
         ax.text(0.5, 0.5, "no data yet", ha="center", va="center", transform=ax.transAxes)
         ax.set_title(title)
         return
     seg = segs[-1]  # current cycle (after last reset)
     ax.plot(seg.ts, seg.percent, marker="o", label="actual")
-    # .df() not .fetchone(): scalar TIMESTAMPTZ->python needs pytz; the DataFrame path doesn't.
-    rdf = con.execute("SELECT resets_at FROM snapshots WHERE key=? AND resets_at IS NOT NULL "
-                      "ORDER BY ts DESC LIMIT 1", [key]).df()
-    if not rdf.empty and rdf.resets_at.iloc[0] is not None:
-        reset = pd.Timestamp(rdf.resets_at.iloc[0])
-        x0, y0 = seg.ts.iloc[0], float(seg.percent.iloc[0])
+    rrow = con.execute("SELECT resets_at FROM snapshots WHERE key=? AND resets_at IS NOT NULL "
+                       "ORDER BY ts DESC LIMIT 1", [key]).fetchone()
+    if rrow and rrow[0] is not None:
+        reset = rrow[0]  # tz-aware datetime (DuckDB TIMESTAMPTZ, needs pytz)
+        x0, y0 = seg.ts[0], float(seg.percent[0])
         ax.plot([x0, reset], [y0, 100], ls="--", color="gray", label="even pace → 100% at reset")
         ax.axvline(reset, color="red", ls=":", lw=1)
-        now_ts = pd.Timestamp(now_utc)
-        if x0 <= now_ts <= reset:
-            ax.axvline(now_ts, color="green", ls=":", lw=1, label="now")
+        if x0 <= now_utc <= reset:
+            ax.axvline(now_utc, color="green", ls=":", lw=1, label="now")
     ax.set_ylim(0, 105)
     ax.set_title(title)
     ax.set_xlabel("")
     ax.legend(loc="upper left", fontsize=8)
-    ax.xaxis.set_major_formatter(_time_formatter(seg.ts.dt.tz))
+    ax.xaxis.set_major_formatter(_time_formatter(seg.ts[0].tzinfo))
     ax.tick_params(axis="x", rotation=30)
 
 
@@ -780,26 +792,32 @@ def _rate(con, key) -> float | None:
     None if there's no net rise to project. Self-adapts to 5h/7d/etc. by cutting at each reset."""
     if con is None:
         return None
-    df = con.execute("SELECT ts, percent FROM snapshots WHERE key=? ORDER BY ts", [key]).df()
-    if len(df) < 2:
+    # epoch_us keeps this off the TIMESTAMPTZ->datetime path (we only need time *deltas*).
+    rows = con.execute("SELECT epoch_us(ts), percent FROM snapshots WHERE key=? ORDER BY ts",
+                       [key]).fetchall()
+    if len(rows) < 2:
         return None
-    drop_pos = (df.percent.diff() < 0).to_numpy().nonzero()[0]  # vectorized reset detection
-    seg = df.iloc[drop_pos[-1]:] if len(drop_pos) else df  # only the segment after last reset
+    last_drop = 0  # index of the last reset (percent dropped vs. previous sample)
+    for i in range(1, len(rows)):
+        if rows[i][1] - rows[i - 1][1] < 0:
+            last_drop = i
+    seg = rows[last_drop:]  # only the segment after the last reset
     if len(seg) < 2:
         return None
-    import numpy as np
+    import math
     # t = hours relative to the newest sample (<=0); exp(t/half_life) decays weight into the past.
-    t = (seg.ts - seg.ts.iloc[-1]).dt.total_seconds().to_numpy() / 3600.0
-    y = seg.percent.to_numpy(dtype=float)
+    t_last = seg[-1][0]
+    t = [(us - t_last) / 1e6 / 3600.0 for us, _ in seg]
+    y = [float(p) for _, p in seg]
     half_life = 1.0 if key == "session" else 12.0
-    w = np.exp(t / half_life)
-    sw = w.sum()
-    tm = (w * t).sum() / sw
-    denom = (w * (t - tm) ** 2).sum()
+    w = [math.exp(ti / half_life) for ti in t]
+    sw = sum(w)
+    tm = sum(wi * ti for wi, ti in zip(w, t, strict=True)) / sw
+    denom = sum(wi * (ti - tm) ** 2 for wi, ti in zip(w, t, strict=True))
     if denom <= 0:  # all samples effectively at one instant
         return None
-    ym = (w * y).sum() / sw
-    slope = (w * (t - tm) * (y - ym)).sum() / denom  # %/h, exponentially weighted
+    ym = sum(wi * yi for wi, yi in zip(w, y, strict=True)) / sw
+    slope = sum(wi * (ti - tm) * (yi - ym) for wi, ti, yi in zip(w, t, y, strict=True)) / denom  # %/h, EWMA
     return float(slope) if slope > 0 else None
 
 
@@ -1049,14 +1067,15 @@ def _rows_from_db():
     con = db(create=False)
     if con is None:
         return None
-    df = con.execute("SELECT key,label,percent,resets_at,is_active,ts FROM snapshots "
-                     "WHERE ts=(SELECT max(ts) FROM snapshots)").df()
-    if df.empty:
+    res = con.execute("SELECT key,label,percent,resets_at,is_active,ts FROM snapshots "
+                      "WHERE ts=(SELECT max(ts) FROM snapshots)").fetchall()
+    if not res:
         return None
-    rows = [(r.key, r.label, float(r.percent),
-             r.resets_at.isoformat() if r.resets_at is not None else None,
-             bool(r.is_active)) for r in df.itertuples()]
-    return rows, (datetime.now(UTC) - df.ts.iloc[0]).total_seconds()
+    rows = [(key, label, float(percent),
+             resets_at.isoformat() if resets_at is not None else None,
+             bool(is_active))
+            for key, label, percent, resets_at, is_active, _ts in res]
+    return rows, (datetime.now(UTC) - res[0][5]).total_seconds()
 
 
 def _reset_expired(rows) -> bool:
@@ -1161,15 +1180,20 @@ def wait(args):
 
 def _cycles(con, key: str) -> list:
     """Segment snapshots for a window into cycles, cutting at each reset
-    (percent drop). Returns list of DataFrames (ts, percent)."""
+    (percent drop). Returns a list of Cycle(ts, percent) named tuples."""
     if con is None:
         return []
-    df = con.execute("SELECT ts, percent FROM snapshots WHERE key=? ORDER BY ts", [key]).df()
-    if df.empty:
+    rows = con.execute("SELECT ts, percent FROM snapshots WHERE key=? ORDER BY ts", [key]).fetchall()
+    if not rows:
         return []
-    cut_pos = (df.percent.diff() < 0).to_numpy().nonzero()[0]  # vectorized reset boundaries
-    bounds = [0, *cut_pos.tolist(), len(df)]
-    return [df.iloc[a:b] for a, b in zip(bounds, bounds[1:], strict=False) if a < b]
+    cuts = [i for i in range(1, len(rows)) if rows[i][1] - rows[i - 1][1] < 0]  # reset boundaries
+    bounds = [0, *cuts, len(rows)]
+    segs = []
+    for a, b in zip(bounds, bounds[1:], strict=False):
+        if a < b:
+            chunk = rows[a:b]
+            segs.append(Cycle([r[0] for r in chunk], [float(r[1]) for r in chunk]))
+    return segs
 
 
 def trends(args):
@@ -1181,18 +1205,23 @@ def trends(args):
         sys.exit("No history — run 'cmon collect' a few times first.")
     g = _summary(con, _parse_since(getattr(args, "since", None)))
     if getattr(args, "json", False):
-        print(g.reset_index().to_json(orient="records", force_ascii=False))
+        print(json.dumps(g, ensure_ascii=False))
         return
-    print(g.to_string())
+    cols = [("label", "label", "<"), ("snapshots", "snapshots", ">"),
+            ("peak_pct", "peak_pct", ">"), ("consumed_pct", "consumed_pct", ">")]
+    widths = {k: max(len(h), *(len(str(r[k])) for r in g)) for k, h, _ in cols}
+    print("  ".join(f"{h:{a}{widths[k]}}" for k, h, a in cols))
+    for r in g:
+        print("  ".join(f"{r[k]:{a}{widths[k]}}" for k, _, a in cols))
     tz = _resolve_tz()
     for key, lbl in (("weekly_all", "Weekly (All models)"), ("session", "5h window")):
         segs = _cycles(con, key)
         if not segs:
             continue
-        peaks = [float(s.percent.max()) for s in segs]
+        peaks = [max(s.percent) for s in segs]
         print(f"\n{lbl} — {len(segs)} cycle(s):")
         for i in range(max(0, len(segs) - 5), len(segs)):
-            ini = segs[i].ts.iloc[0].tz_convert(tz)
+            ini = segs[i].ts[0].astimezone(tz)
             d = peaks[i] - peaks[i - 1] if i > 0 else None
             delta = f"  ({'+' if d >= 0 else ''}{d:.0f} vs previous)" if d is not None else ""
             print(f"  {ini:%Y-%m-%d %H:%M %Z}  peak {peaks[i]:.0f}%{delta}")
@@ -1315,24 +1344,25 @@ def scan_logs(con, since=None, quiet: bool = False) -> None:
         return
     if not quiet:
         print(f"scanning {len(todo)} log file(s)…", file=sys.stderr)
-    import pandas as pd
     parsed = _parse_many([f for f, _ in todo])  # parallel (with serial fallback)
     rows = [r for chunk in parsed for r in chunk]
     if rows:
-        # Vectorized insert via DataFrame: ~680x faster than executemany+ON CONFLICT.
-        # drop_duplicates resolves duplicate uuids within batch (mirrored transcripts).
-        tdf = pd.DataFrame(rows, columns=["uuid", "ts", "model", "entrypoint", "project",
-                                          "session", "in_tok", "out_tok", "cache_read",
-                                          "cache_create"]).drop_duplicates("uuid")
-        con.register("_tl_new", tdf)
-        con.execute("INSERT INTO token_log SELECT * FROM _tl_new ORDER BY ts ON CONFLICT DO NOTHING")
-        con.unregister("_tl_new")
-    sdf = pd.DataFrame([[f, st.st_mtime, st.st_size] for f, st in todo],
-                       columns=["path", "mtime", "size"])
-    con.register("_sc_new", sdf)
-    con.execute("INSERT INTO scanned SELECT * FROM _sc_new ON CONFLICT (path) DO UPDATE "
-                "SET mtime=excluded.mtime, size=excluded.size")
-    con.unregister("_sc_new")
+        # Vectorized insert via parallel unnest of column-arrays — native DuckDB, no pandas,
+        # and still bulk (one INSERT ... SELECT, not per-row executemany+ON CONFLICT).
+        # QUALIFY row_number() dedups duplicate uuids within the batch (mirrored transcripts).
+        cols = list(zip(*rows, strict=True))  # transpose rows -> one list per column (LIST params)
+        con.execute(
+            "INSERT INTO token_log SELECT * FROM ("
+            "  SELECT unnest(?::TEXT[]) uuid, unnest(?::TIMESTAMPTZ[]) ts, unnest(?::TEXT[]) model, "
+            "         unnest(?::TEXT[]) entrypoint, unnest(?::TEXT[]) project, unnest(?::TEXT[]) \"session\", "
+            "         unnest(?::BIGINT[]) in_tok, unnest(?::BIGINT[]) out_tok, "
+            "         unnest(?::BIGINT[]) cache_read, unnest(?::BIGINT[]) cache_create) "
+            "QUALIFY row_number() OVER (PARTITION BY uuid ORDER BY ts) = 1 "
+            "ON CONFLICT DO NOTHING",
+            [list(c) for c in cols])
+    con.executemany("INSERT INTO scanned VALUES (?, ?, ?) ON CONFLICT (path) DO UPDATE "
+                    "SET mtime=excluded.mtime, size=excluded.size",
+                    [(f, st.st_mtime, st.st_size) for f, st in todo])
 
 
 def _parse_many(paths: list) -> list:
@@ -1364,25 +1394,24 @@ def _session_window_start(rows, now_utc):
 
 
 def _burn_rows(con, since):
-    """Tokens by (window, model) since `since`, already with estimated cost per row."""
+    """Tokens by model since `since` as (model, in, out, cache_read, cache_create) tuples."""
     where = "WHERE ts >= ?" if since else ""
-    df = con.execute(
-        f"SELECT model, sum(in_tok) i, sum(out_tok) o, sum(cache_read) r, sum(cache_create) c "
-        f"FROM token_log {where} GROUP BY model", [since] if since else []).df()
-    return df
+    return con.execute(
+        f"SELECT model, sum(in_tok), sum(out_tok), sum(cache_read), sum(cache_create) "
+        f"FROM token_log {where} GROUP BY model", [since] if since else []).fetchall()
 
 
-def _burn_summary(df):
+def _burn_summary(rows):
     """(tokens_total, cost_usd, 'Opus 80% · Sonnet 20%') from _burn_rows, or None."""
-    if df.empty:
+    if not rows:
         return None
     tok, cost, bym = 0, 0.0, {}
-    for _, r in df.iterrows():
-        p = _price(r.model)
-        cost += (r.i * p[0] + r.o * p[1] + r.r * p[2] + r.c * p[3]) / 1e6
-        t = int(r.i + r.o + r.r + r.c)
+    for model, i, o, r, c in rows:
+        p = _price(model)
+        cost += (i * p[0] + o * p[1] + r * p[2] + c * p[3]) / 1e6
+        t = int(i + o + r + c)
         tok += t
-        bym[_short_model(r.model)] = bym.get(_short_model(r.model), 0) + t
+        bym[_short_model(model)] = bym.get(_short_model(model), 0) + t
     mix = " · ".join(f"{k} {v / tok * 100:.0f}%" for k, v in sorted(bym.items(), key=lambda x: -x[1])) if tok else ""
     return tok, cost, mix
 
@@ -1395,46 +1424,51 @@ def burn(args):
     col = {"model": "model", "surface": "entrypoint", "day": "CAST(ts AS DATE)",
            "project": "project", "session": "session"}[args.by]
     where = "WHERE ts >= ?" if since else ""
-    df = con.execute(
-        f"SELECT {col} grp, model, sum(in_tok) i, sum(out_tok) o, sum(cache_read) r, sum(cache_create) c "
-        f"FROM token_log {where} GROUP BY grp, model", [since] if since else []).df()
-    if df.empty:
+    rows = con.execute(
+        f"SELECT {col} grp, model, sum(in_tok), sum(out_tok), sum(cache_read), sum(cache_create) "
+        f"FROM token_log {where} GROUP BY grp, model", [since] if since else []).fetchall()
+    if not rows:
         sys.exit("No Claude Code log data in period.")
-    df["custo"] = [
-        (row.i * _price(row.model)[0] + row.o * _price(row.model)[1]
-         + row.r * _price(row.model)[2] + row.c * _price(row.model)[3]) / 1e6
-        for row in df.itertuples()]
-    df["tok"] = df.i + df.o + df.r + df.c
-    g = df.groupby("grp").agg(tok=("tok", "sum"), custo=("custo", "sum")).reset_index()
-    g = g.sort_values("custo", ascending=False)
+    # Per-group tokens+cost, and per-component totals — cost needs the per-model price map,
+    # so it's computed here in Python rather than in SQL.
+    agg = {}  # grp -> [tok, custo]
+    ctok = {"input": 0, "output": 0, "cache read": 0, "cache write": 0}
+    ccost = {"input": 0.0, "output": 0.0, "cache read": 0.0, "cache write": 0.0}
+    for grp, model, i, o, r, c in rows:
+        p = _price(model)
+        cost = (i * p[0] + o * p[1] + r * p[2] + c * p[3]) / 1e6
+        a = agg.setdefault(grp, [0, 0.0])
+        a[0] += i + o + r + c
+        a[1] += cost
+        ctok["input"] += i
+        ctok["output"] += o
+        ctok["cache read"] += r
+        ctok["cache write"] += c
+        ccost["input"] += i * p[0] / 1e6
+        ccost["output"] += o * p[1] / 1e6
+        ccost["cache read"] += r * p[2] / 1e6
+        ccost["cache write"] += c * p[3] / 1e6
+    ordered = sorted(agg.items(), key=lambda kv: -kv[1][1])  # by cost desc
     if getattr(args, "json", False):
-        print(g.to_json(orient="records", force_ascii=False))
+        print(json.dumps([{"grp": g.isoformat() if hasattr(g, "isoformat") else g,
+                            "tok": int(v[0]), "custo": v[1]} for g, v in ordered],
+                         ensure_ascii=False))
         return
     per = {"model": "model", "surface": "surface", "day": "day",
            "project": "project", "session": "session"}[args.by]
     since_local = since.astimezone(_resolve_tz()) if since else None
     window = f" since {since_local:%Y-%m-%d %H:%M %Z}" if since_local else ""
     print(f"Consumption by {per}{window} (API equivalent):")
-    lines = [(_surface(row.grp) if args.by == "surface" else str(row.grp),
-              row.tok / 1e6, row.custo) for row in g.itertuples()]
+    lines = [(_surface(g) if args.by == "surface" else str(g), v[0] / 1e6, v[1])
+             for g, v in ordered]
     w = max([len(lbl) for lbl, _, _ in lines] + [len("TOTAL")])  # widest label incl. long model ids
     for lbl, tok_m, cost in lines:
         print(f"  {lbl:<{w}} {tok_m:9.1f}M tok   US$ {cost:9.2f}")
-    total_c = g.custo.sum()
-    print(f"  {'TOTAL':<{w}} {g.tok.sum() / 1e6:9.1f}M tok   US$ {total_c:9.2f}")
+    total_c = sum(v[1] for _, v in ordered)
+    total_tok = sum(v[0] for _, v in ordered)
+    print(f"  {'TOTAL':<{w}} {total_tok / 1e6:9.1f}M tok   US$ {total_c:9.2f}")
 
     # Breakdown by component: cache read usually dominates (context re-reading).
-    comp = {"input": (0, 0.0, 0), "output": (0, 0.0, 1),
-            "cache read": (0, 0.0, 2), "cache write": (0, 0.0, 3)}
-    tok_by = {"input": "i", "output": "o", "cache read": "r", "cache write": "c"}
-    ctok = {k: int(df[v].sum()) for k, v in tok_by.items()}
-    ccost = {k: 0.0 for k in comp}
-    for row in df.itertuples():
-        p = _price(row.model)
-        ccost["input"] += row.i * p[0] / 1e6
-        ccost["output"] += row.o * p[1] / 1e6
-        ccost["cache read"] += row.r * p[2] / 1e6
-        ccost["cache write"] += row.c * p[3] / 1e6
     print("\nBy component:")
     for k in ("input", "output", "cache read", "cache write"):
         pct = ccost[k] / total_c * 100 if total_c else 0

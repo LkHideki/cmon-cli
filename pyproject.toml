@@ -24,7 +24,10 @@ classifiers = [
 ]
 dependencies = [
     "duckdb>=1.1",
-    "pandas>=2.0",
+    # pytz is required by DuckDB to convert TIMESTAMPTZ <-> Python datetime
+    # (scalar fetch + parameter binding). Pure-Python and tiny — it used to come
+    # in transitively via pandas, which we dropped from the core to stay lean.
+    "pytz>=2024.1",
     "orjson>=3.10",
     "keyring>=25.0",
     "python-dotenv>=1.0",
@@ -33,10 +36,11 @@ dependencies = [
     "tzdata>=2024.1",
 ]
 
-# Plots are optional: matplotlib+seaborn are heavy and only the `plot` command
-# uses them. Default `uv sync` stays lean; for plots: `uv sync --extra plot`.
+# Plots are optional: matplotlib+seaborn (plus pandas, used only by the plotting
+# helpers) are heavy and only the `plot` command needs them. Default `uv sync`
+# stays lean; for plots: `uv sync --extra plot`.
 [project.optional-dependencies]
-plot = ["matplotlib>=3.8", "seaborn>=0.13"]
+plot = ["matplotlib>=3.8", "seaborn>=0.13", "pandas>=2.0"]
 
 [project.scripts]
 cmon = "cmon:main"
