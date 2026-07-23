@@ -250,7 +250,15 @@ the projection at reset:
 The rate cuts at the last reset (so it adapts to 5h, 7d, or 72h windows — Anthropic resets the
 "weekly" at a fixed time, not always exactly 7 days) and is **exponentially weighted**: recent
 snapshots count more (half-life ~1h for the 5h window, ~12h weekly), so the projection tracks your
-current pace rather than a flat cycle average. Finally, `--advice` sends the
+current pace rather than a flat cycle average.
+
+The projection itself is **profile-weighted**, not linear: from your snapshot history cmon learns
+when you actually use Claude (24 local-hour buckets × a weekday multiplier) and integrates that
+intensity over the hours left until reset, anchored to the current rate — so a projection taken at
+22h doesn't assume you'll keep burning through the night, and one taken mid-afternoon accounts for
+the busy evening ahead. Until there's ~2 days of history it falls back to the linear
+`rate × remaining hours`; `watch`, `now`, `--advice`, and the rate-based alerts all share it
+(marked *profile-weighted* when active). Finally, `--advice` sends the
 numbers to **Claude Sonnet** (`claude -p`, cheap) for 3 actionable tips; use `--no-ai` for local
 projections only, no quota cost.
 

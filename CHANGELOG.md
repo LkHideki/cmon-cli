@@ -7,6 +7,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Profile-weighted projection**: `watch`, `now`, `now --advice`, and rate-based alerts no
+  longer extrapolate linearly (`rate × remaining hours`). cmon now learns your usage profile
+  from snapshot history (24 smoothed local-hour buckets × weekday multiplier, from
+  `weekly_all` deltas) and integrates that intensity over the time left until reset, anchored
+  to the current EWMA rate — projections stop assuming you burn quota through the night at
+  your daytime pace. Falls back to linear until ~2 days of history; output is marked
+  *profile-weighted* when active.
+
 ## [0.1.4] — 2026-07-08
 
 ### Added
