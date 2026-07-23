@@ -561,13 +561,13 @@ def now(args):
     if rate is None:
         print("Rate: no measurable consumption in this window.")
         return
-    rem_h = (end - datetime.now(UTC)).total_seconds() / 3600
-    proj = min(pct + rate * rem_h, 100)
-    print(f"Rate: {rate:.1f}%/h → projection at reset: {proj:.0f}%.")
-    if pct < 100:
-        to100 = (100 - pct) / rate
-        if to100 < rem_h:
-            print(f"⚠ At current rate you'll hit 100% in ~{to100:.1f}h, before reset.")
+    now_utc = datetime.now(UTC)
+    rem_h = (end - now_utc).total_seconds() / 3600
+    proj, to100, weighted = _project(con, pct, rate, rem_h, now_utc, _resolve_tz())
+    note = " (weighted by your usage profile)" if weighted else ""
+    print(f"Rate: {rate:.1f}%/h → projection at reset: {min(proj, 100):.0f}%{note}.")
+    if to100 is not None:
+        print(f"⚠ At current pace you'll hit 100% in ~{to100:.1f}h, before reset.")
 
     for m in _alerts(rows, con):
         if not m.startswith("Current session"):  # 5h already covered above
@@ -844,10 +844,94 @@ def _rate(con, key) -> float | None:
     return float(slope) if slope > 0 else None
 
 
-def _alerts(rows, con) -> list[str]:
-    """Alert when, at current rate, a window hits 100% before reset.
-    Needs history (via _rate); without database/rate produces nothing."""
+_profile_cache: dict[str, tuple[float, tuple | None]] = {}  # tz_key -> (expires_epoch, profile)
+
+
+def _hour_profile(con, tz):
+    """Relative usage intensity by local hour (24 buckets, circularly smoothed) plus a
+    per-weekday multiplier, learned from weekly_all snapshot deltas. weekly_all is the one
+    key whose percent climbs through day *and* night between rare resets, so its deltas
+    cover the whole daily cycle — the 5h key loses every night to a reset drop. Only the
+    shape matters: projections anchor on the current EWMA rate and scale it by relative
+    intensity, so weekly deltas shape session projections too. None (→ linear fallback)
+    until ~2 days of coverage. Cached ~15 min: watch re-renders every poll."""
+    if con is None:
+        return None
+    now_s = datetime.now(UTC).timestamp()
+    cached = _profile_cache.get(str(tz))
+    if cached and cached[0] > now_s:
+        return cached[1]
+    rows = con.execute("SELECT epoch_us(ts), percent FROM snapshots WHERE key='weekly_all' "
+                       "ORDER BY ts").fetchall()
+    prof = None
+    hrs, pts = [0.0] * 24, [0.0] * 24     # observed hours / consumed % per local-hour bucket
+    whrs, wpts = [0.0] * 7, [0.0] * 7     # same per weekday
+    for (us0, p0), (us1, p1) in zip(rows, rows[1:], strict=False):
+        dt_h = (us1 - us0) / 3.6e9
+        d = p1 - p0
+        # d<0 = reset inside the gap (consumption unknowable); >48h gaps would smear one
+        # delta over days and poison the shape.
+        if dt_h <= 0 or dt_h > 48 or d < 0:
+            continue
+        rate = d / dt_h  # uniform within the pair; hour granularity comes from many pairs
+        t = datetime.fromtimestamp(us0 / 1e6, tz)
+        end = datetime.fromtimestamp(us1 / 1e6, tz)
+        while t < end:
+            nxt = min((t + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0), end)
+            seg = (nxt - t).total_seconds() / 3600.0
+            hrs[t.hour] += seg
+            pts[t.hour] += rate * seg
+            whrs[t.weekday()] += seg
+            wpts[t.weekday()] += rate * seg
+            t = nxt
+    total_h = sum(hrs)
+    mean = sum(pts) / total_h if total_h > 0 else 0.0
+    if total_h >= 48 and sum(1 for h in hrs if h > 0.5) >= 12 and mean > 0:
+        # buckets with <30min observed borrow the mean instead of trusting one noisy sample
+        raw = [pts[h] / hrs[h] if hrs[h] > 0.5 else mean for h in range(24)]
+        smooth = [0.25 * raw[(h - 1) % 24] + 0.5 * raw[h] + 0.25 * raw[(h + 1) % 24]
+                  for h in range(24)]
+        dow = [min(max((wpts[d] / whrs[d]) / mean, 0.25), 4.0) if whrs[d] >= 6 else 1.0
+               for d in range(7)]
+        prof = (smooth, dow, mean)
+    _profile_cache[str(tz)] = (now_s + 900, prof)
+    return prof
+
+
+def _project(con, pct, rate, rem_h, now_utc, tz) -> tuple[float, float | None, bool]:
+    """(projection at reset, hours to hit 100% or None if it doesn't before reset, weighted?).
+    With a profile, integrates expected intensity over the remaining window — anchored so
+    'now' matches the observed EWMA rate — instead of the flat rate×hours extrapolation,
+    which overshoots into idle periods (nights) and undershoots into busy ones. The anchor
+    denominator is floored at 25% of the mean so a burst during a historically dead hour
+    can't inflate every future busy hour by that ratio. Linear without a profile."""
+    prof = _hour_profile(con, tz)
+    if prof is None:
+        eta = (100 - pct) / rate if pct < 100 else None
+        return pct + rate * rem_h, (eta if eta is not None and eta < rem_h else None), False
+    hour_rate, dow_mult, mean = prof
+
+    def intensity(t_local):
+        return hour_rate[t_local.hour] * dow_mult[t_local.weekday()]
+
+    now_local = now_utc.astimezone(tz)
+    k = rate / max(intensity(now_local), 0.25 * mean)
+    acc, eta, t = 0.0, None, 0.0
+    while t < rem_h:
+        dt = min(0.25, rem_h - t)
+        acc += k * intensity(now_local + timedelta(hours=t + dt / 2)) * dt
+        t += dt
+        if eta is None and pct < 100 and pct + acc >= 100:
+            eta = t
+    return pct + acc, eta, True
+
+
+def _alerts(rows, con, tz=None) -> list[str]:
+    """Alert when, at the projected pace, a window hits 100% before reset.
+    Needs history (via _rate); without database/rate produces nothing. watch passes its
+    pre-resolved tz (a _resolve_tz here could print into the Live TUI)."""
     now_utc = datetime.now(UTC)
+    tz = tz or _resolve_tz()
     msgs = []
     for key, lbl, pct, reset, _a in rows:
         if not reset or pct >= 100:
@@ -858,8 +942,8 @@ def _alerts(rows, con) -> list[str]:
         rem_h = (datetime.fromisoformat(reset) - now_utc).total_seconds() / 3600
         if rem_h <= 0:
             continue
-        eta = (100 - pct) / rate
-        if eta < rem_h:
+        _proj, eta, _w = _project(con, pct, rate, rem_h, now_utc, tz)
+        if eta is not None:
             msgs.append(f"{lbl}: at rate {rate:.1f}%/h hits 100% in ~{eta:.1f}h "
                         f"(~{rem_h - eta:.1f}h before reset).")
     return msgs
@@ -983,8 +1067,9 @@ def _ai_tip(summary: str) -> str | None:
         return None
 
 
-def _window_tips(lbl: str, pct: float, reset: str | None, rate: float | None, now_utc):
-    """Deterministic pacing block for a window. Returns (printed_lines, summary_line)."""
+def _window_tips(lbl: str, pct: float, reset: str | None, rate: float | None, now_utc, con=None, tz=None):
+    """Deterministic pacing block for a window. Returns (printed_lines, summary_line).
+    With con+tz the projection/eta use the hourly usage profile (same as watch/now)."""
     if not reset:
         return [f"{lbl}: {pct:.0f}% used."], f"- {lbl}: {pct:.0f}% used"
     rem_h = (datetime.fromisoformat(reset) - now_utc).total_seconds() / 3600
@@ -996,16 +1081,16 @@ def _window_tips(lbl: str, pct: float, reset: str | None, rate: float | None, no
     if rate is None:
         out.append("  (no rate yet — run 'cmon collect' more times)")
         return out, summ
-    proj = pct + rate * rem_h
-    summ += f", rate {rate:.2f}%/h, projection {min(proj, 999):.0f}%"
-    out.append(f"  current rate {rate:.2f}%/h → projection at reset ~{min(proj, 999):.0f}%")
+    proj, eta, weighted = _project(con, pct, rate, rem_h, now_utc, tz or _resolve_tz())
+    note = " (profile-weighted)" if weighted else ""
+    summ += f", rate {rate:.2f}%/h, projection {min(proj, 999):.0f}%{note}"
+    out.append(f"  current rate {rate:.2f}%/h → projection at reset ~{min(proj, 999):.0f}%{note}")
     if proj < 97:
         gap = tgt - rate
         extra = f" (~+{gap:.2f}%/h)" if gap > 0 else ""
         out.append(f"  ↑ upside: ~{100 - proj:.0f}% left on table — can intensify{extra} "
                    "or use stronger model")
-    elif proj > 103:
-        eta = (100 - pct) / rate
+    elif proj > 103 and eta is not None:
         out.append(f"  ⚠ won't make it: hits 100% in ~{eta:.0f}h ({rem_h - eta:.0f}h before reset) — "
                    f"slow to ~{tgt:.2f}%/h or switch to cheaper model")
     else:
@@ -1018,13 +1103,14 @@ def _advice(rows, con, no_ai: bool = False):
     the real last-5h model mix (grounds the model-swap tip) and — unless no_ai — 3 one-line
     tips from Claude Sonnet. Skips the mix if the DB is busy."""
     now_utc = datetime.now(UTC)
+    tz = _resolve_tz()
     summaries = []
     for key, want in (("weekly_all", "Weekly (All models)"), ("session", "5h window")):
         row = next((r for r in rows if r[0] == key), None)
         if not row:
             continue
         _k, _lbl, pct, reset, _a = row
-        block, summ = _window_tips(want, pct, reset, _rate(con, key), now_utc)
+        block, summ = _window_tips(want, pct, reset, _rate(con, key), now_utc, con, tz)
         print("\n".join(block) + "\n")
         summaries.append(summ)
 
@@ -1545,16 +1631,24 @@ def watch(args):
         t.add_column("resets in", justify="right")
         t.add_column("rate", justify="right")
         t.add_column("projection", justify="right")
+        weighted = False
         for key, lbl, pct, reset, act in rows:
             rate = _rate(con, key)
             rem_h = ((datetime.fromisoformat(reset) - now_utc).total_seconds() / 3600
                      if reset else None)
-            proj = f"{min(pct + rate * rem_h, 999):.0f}%" if rate and rem_h and rem_h > 0 else "-"
+            proj = "-"
+            if rate and rem_h and rem_h > 0:
+                p, _eta, w = _project(con, pct, rate, rem_h, now_utc, tz)
+                weighted = weighted or w
+                proj = f"{min(p, 999):.0f}%"
             t.add_row(lbl + (" ●" if act else ""),
                       Text(bar(pct, 28), style=color(pct)),
                       f"{pct:.0f}", fmt_eta(reset),
                       f"{rate:.1f}%/h" if rate else "-", proj)
         body = [t]
+        if weighted:
+            body.append(Text("projection weighted by your hourly/weekday usage profile",
+                             style="dim"))
         win = _session_window_start(rows, now_utc)
         scan_logs(con, since=win, quiet=True)
         bs = _burn_summary(_burn_rows(con, win))
@@ -1562,7 +1656,7 @@ def watch(args):
             tok, cost, mix = bs
             body.append(Text(f"burn this 5h window (logs): {tok / 1e6:.2f}M tok · US$ {cost:.2f} · {mix}",
                              style="cyan"))
-        alerts = _alerts(rows, con)
+        alerts = _alerts(rows, con, tz)
         if alerts:
             body.append(Text("\n".join("⚠ " + m for m in alerts), style="bold red"))
         now_local = now_utc.astimezone(tz)
