@@ -46,6 +46,26 @@ ALERT_LEAD_WEEKLY_MIN = int(os.environ.get("CMON_ALERT_LEAD_WEEKLY", "180"))  # 
 LEAD_MIN_BY_KEY = {"session": ALERT_LEAD_MIN, "weekly_all": ALERT_LEAD_WEEKLY_MIN}
 LEAD_LABEL_BY_KEY = {"session": "5h window", "weekly_all": "Weekly limit"}
 MAX_JSONL_LINE = 4 << 20  # 4 MiB: skip parsing absurdly large transcript lines (secperf F4 DoS guard)
+# Hourly-profile learning (see _hour_profile). Only *dense* snapshot pairs shape the hour
+# histogram: a wide gap can't say when inside it the usage happened, and spreading it evenly
+# invents consumption at 4am. Recency decays instead of being truncated so the shape drifts
+# with your routine rather than jumping when a day leaves a fixed window.
+PROFILE_PAIR_MAX_H = float(os.environ.get("CMON_PROFILE_PAIR_MAX_H", "1.5"))  # gap above this = ignorance
+PROFILE_HALFLIFE_D = float(os.environ.get("CMON_PROFILE_HALFLIFE_D", "10"))   # weight half-life
+PROFILE_MAX_AGE_D = float(os.environ.get("CMON_PROFILE_MAX_AGE_D", "42"))     # hard cutoff (~2 half-lives+)
+PROFILE_MIN_HOURS = float(os.environ.get("CMON_PROFILE_MIN_HOURS", "24"))     # dense coverage needed
+PROFILE_MIN_DAYS = int(os.environ.get("CMON_PROFILE_MIN_DAYS", "3"))          # days of token_log needed
+PROFILE_MIN_BUCKETS = int(os.environ.get("CMON_PROFILE_MIN_BUCKETS", "8"))    # distinct hours needed
+PROFILE_MIN_BUCKET_H = 0.5   # below this an hour bucket is "unobserved" (one noisy sample)
+PROFILE_PSEUDO_H = 1.0       # shrinkage strength toward the local prior, in observed-hour units
+PROFILE_FLOOR = 0.02         # no hour is ever exactly 0 intensity (kills divide-by-zero anchors)
+QUIET_MULT = 0.05            # intensity multiplier inside declared quiet hours
+# How each projection source is described to the user, keyed by _project()'s third return value.
+PROJ_NOTE = {"learned": " (weighted by your usage profile)",
+             "quiet_hours": " (skipping your quiet hours)"}
+PROJ_NOTE_SHORT = {"learned": " (profile-weighted)", "quiet_hours": " (quiet hours skipped)"}
+PROJ_NOTE_WATCH = {"learned": "projection weighted by your hourly/weekday usage profile",
+                   "quiet_hours": "projection skips your configured quiet hours"}
 # Claude Code OAuth — public values from login flow; used only for token renewal.
 OAUTH_CLIENT_ID = os.environ.get("CMON_OAUTH_CLIENT_ID", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
 OAUTH_TOKEN_URL = os.environ.get("CMON_OAUTH_TOKEN_URL", "https://console.anthropic.com/v1/oauth/token")
@@ -315,7 +335,54 @@ def _validate_timezone(value: str) -> str:
     return value
 
 
-CONFIG_VALIDATORS = {"timezone": _validate_timezone}  # key -> fn(value) -> normalized value | raises ValueError
+def _validate_quiet_hours(value: str) -> str:
+    """Normalize a quiet-hours spec ('2-7', '0-6,13', '23-2' wrapping midnight) or raise."""
+    if not _parse_quiet_hours(value):
+        raise ValueError(f"Invalid quiet_hours {value!r}. Use local hours like '2-7' or '0-6,13' "
+                         "(ranges may wrap midnight, e.g. '23-2').")
+    return value.replace(" ", "")
+
+
+def _parse_quiet_hours(value: str | None) -> frozenset[int]:
+    """Local hours declared idle -> {hours}, or empty frozenset if unset/unparseable.
+    Accepts comma-separated single hours and inclusive ranges; a range whose start is
+    greater than its end wraps midnight ('23-2' = 23, 0, 1, 2)."""
+    if not value:
+        return frozenset()
+    hours: set[int] = set()
+    for part in str(value).replace(" ", "").split(","):
+        if not part:
+            continue
+        try:
+            if "-" in part[1:]:
+                a_s, b_s = part.split("-", 1)
+                a, b = int(a_s), int(b_s)
+                if not (0 <= a <= 23 and 0 <= b <= 23):
+                    return frozenset()
+                hours |= {h % 24 for h in range(a, b + 1)} if a <= b else \
+                         {h % 24 for h in range(a, b + 25)}
+            else:
+                h = int(part)
+                if not 0 <= h <= 23:
+                    return frozenset()
+                hours.add(h)
+        except ValueError:
+            return frozenset()
+    return frozenset(hours) if len(hours) < 24 else frozenset()  # all-quiet is meaningless
+
+
+def _quiet_hours() -> frozenset[int]:
+    """Effective quiet hours: CMON_QUIET_HOURS env -> config 'quiet_hours' -> none.
+    Deterministic backstop for the projection: it applies even before enough history exists
+    to learn a profile, so a projection never spends a night you don't work."""
+    for src in (os.environ.get("CMON_QUIET_HOURS"), _read_config().get("quiet_hours")):
+        if hours := _parse_quiet_hours(src):
+            return hours
+    return frozenset()
+
+
+# key -> fn(value) -> normalized value | raises ValueError
+CONFIG_VALIDATORS = {"timezone": _validate_timezone, "quiet_hours": _validate_quiet_hours}
 
 
 def _read_config() -> dict:
@@ -563,8 +630,8 @@ def now(args):
         return
     now_utc = datetime.now(UTC)
     rem_h = (end - now_utc).total_seconds() / 3600
-    proj, to100, weighted = _project(con, pct, rate, rem_h, now_utc, _resolve_tz())
-    note = " (weighted by your usage profile)" if weighted else ""
+    proj, to100, src = _project(con, pct, rate, rem_h, now_utc, _resolve_tz())
+    note = PROJ_NOTE.get(src, "")
     print(f"Rate: {rate:.1f}%/h → projection at reset: {min(proj, 100):.0f}%{note}.")
     if to100 is not None:
         print(f"⚠ At current pace you'll hit 100% in ~{to100:.1f}h, before reset.")
@@ -847,59 +914,176 @@ def _rate(con, key) -> float | None:
 _profile_cache: dict[str, tuple[float, tuple | None]] = {}  # tz_key -> (expires_epoch, profile)
 
 
-def _hour_profile(con, tz):
-    """Relative usage intensity by local hour (24 buckets, circularly smoothed) plus a
-    per-weekday multiplier, learned from weekly_all snapshot deltas. weekly_all is the one
-    key whose percent climbs through day *and* night between rare resets, so its deltas
-    cover the whole daily cycle — the 5h key loses every night to a reset drop. Only the
-    shape matters: projections anchor on the current EWMA rate and scale it by relative
-    intensity, so weekly deltas shape session projections too. None (→ linear fallback)
-    until ~2 days of coverage. Cached ~15 min: watch re-renders every poll."""
-    if con is None:
+def _day_weights(con, tz):
+    """{local date -> recency weight} for every day from the first logged request (capped at
+    PROFILE_MAX_AGE_D) through today, plus the exposed hours of today. A day's weight decays
+    with a PROFILE_HALFLIFE_D half-life, so the learned shape follows your current routine
+    and old habits fade instead of dropping off a cliff when a fixed window slides."""
+    cutoff = datetime.now(UTC) - timedelta(days=PROFILE_MAX_AGE_D)
+    first = con.execute("SELECT min(ts) FROM token_log WHERE ts > ?", [cutoff]).fetchone()[0]
+    if first is None:
+        return {}, 0
+    now_local = datetime.now(UTC).astimezone(tz)
+    day = max(first.astimezone(tz), cutoff.astimezone(tz)).date()
+    out = {}
+    while day <= now_local.date():
+        age_d = (now_local.date() - day).days
+        out[day] = 0.5 ** (age_d / PROFILE_HALFLIFE_D)
+        day += timedelta(days=1)
+    return out, now_local.hour + 1  # hours of today already exposed
+
+
+def _hour_buckets_tokens(con, tz):
+    """(hrs, pts, whrs, wpts) per local hour/weekday from token_log, or None when it can't
+    support a shape. This is the good source: every assistant request carries its own precise
+    timestamp, so an idle 4am is an *observed zero* rather than an unknown. Snapshot percents
+    can't do that — they only move in whole points and a gap between two of them says nothing
+    about when inside it the work happened.
+
+    Weight mixes fresh tokens with cache reads at 1/10 (a cached-heavy hour is real work but
+    costs proportionally less quota). 'Exposure' (hrs) is one weighted hour per day covered,
+    which is what makes an hour with no requests count as genuinely dead."""
+    days, today_hours = _day_weights(con, tz)
+    if len(days) < PROFILE_MIN_DAYS:
         return None
-    now_s = datetime.now(UTC).timestamp()
-    cached = _profile_cache.get(str(tz))
-    if cached and cached[0] > now_s:
-        return cached[1]
+    hrs, pts = [0.0] * 24, [0.0] * 24
+    whrs, wpts = [0.0] * 7, [0.0] * 7
+    for day, w in days.items():
+        exposed = range(today_hours) if day == max(days) else range(24)
+        for h in exposed:
+            hrs[h] += w
+        whrs[day.weekday()] += w * len(exposed)
+    # Aggregate in SQL (a few hundred rows out) instead of walking every request in Python:
+    # token_log holds 100k+ rows and this runs on every watch poll after the cache expires.
+    rows = con.execute(
+        "SELECT (timezone(?, ts))::DATE, hour(timezone(?, ts)), "
+        "sum(in_tok + out_tok + coalesce(cache_read, 0) / 10.0) FROM token_log "
+        "WHERE ts > ? AND in_tok IS NOT NULL GROUP BY 1, 2",
+        [str(tz), str(tz), datetime.now(UTC) - timedelta(days=PROFILE_MAX_AGE_D)]).fetchall()
+    for day, hour, tok in rows:
+        w = days.get(day)
+        if w is None or not tok:
+            continue
+        pts[hour] += w * float(tok)
+        wpts[day.weekday()] += w * float(tok)
+    return (hrs, pts, whrs, wpts) if sum(pts) > 0 else None
+
+
+def _hour_buckets(con, tz):
+    """Recency-weighted (observed_hours, consumed_pct) per local hour and per weekday, from
+    *dense* consecutive weekly_all snapshot pairs. Fallback for when token_log is empty (no
+    Claude Code transcripts scanned yet). Two rules make the histogram honest:
+
+    - only pairs closer than PROFILE_PAIR_MAX_H count. A wider gap cannot say *when* inside
+      it the usage happened; spreading its delta evenly (the old behaviour) credited idle
+      nights with consumption and then dominated the totals, flattening the whole profile.
+    - each pair's contribution decays with a PROFILE_HALFLIFE_D half-life, so the shape
+      follows your current routine and old habits fade instead of dropping off a cliff.
+
+    weekly_all is the one key whose percent climbs through day *and* night between rare
+    resets, so its deltas can cover the full daily cycle — the 5h key loses every night to
+    a reset drop. Returns (hrs, pts, whrs, wpts)."""
+    hrs, pts = [0.0] * 24, [0.0] * 24
+    whrs, wpts = [0.0] * 7, [0.0] * 7
     rows = con.execute("SELECT epoch_us(ts), percent FROM snapshots WHERE key='weekly_all' "
-                       "ORDER BY ts").fetchall()
-    prof = None
-    hrs, pts = [0.0] * 24, [0.0] * 24     # observed hours / consumed % per local-hour bucket
-    whrs, wpts = [0.0] * 7, [0.0] * 7     # same per weekday
+                       "AND ts > ? ORDER BY ts",
+                       [datetime.now(UTC) - timedelta(days=PROFILE_MAX_AGE_D)]).fetchall()
+    now_s = datetime.now(UTC).timestamp()
     for (us0, p0), (us1, p1) in zip(rows, rows[1:], strict=False):
         dt_h = (us1 - us0) / 3.6e9
         d = p1 - p0
-        # d<0 = reset inside the gap (consumption unknowable); >48h gaps would smear one
-        # delta over days and poison the shape.
-        if dt_h <= 0 or dt_h > 48 or d < 0:
+        if dt_h <= 0 or dt_h > PROFILE_PAIR_MAX_H or d < 0:  # d<0 = reset inside the gap
             continue
-        rate = d / dt_h  # uniform within the pair; hour granularity comes from many pairs
+        rate = d / dt_h
+        w = 0.5 ** (((now_s - us1 / 1e6) / 86400.0) / PROFILE_HALFLIFE_D)
         t = datetime.fromtimestamp(us0 / 1e6, tz)
         end = datetime.fromtimestamp(us1 / 1e6, tz)
-        while t < end:
+        while t < end:  # a dense pair spans 1-2 buckets, so this loop is short
             nxt = min((t + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0), end)
-            seg = (nxt - t).total_seconds() / 3600.0
+            seg = w * (nxt - t).total_seconds() / 3600.0
             hrs[t.hour] += seg
             pts[t.hour] += rate * seg
             whrs[t.weekday()] += seg
             wpts[t.weekday()] += rate * seg
             t = nxt
+    return hrs, pts, whrs, wpts
+
+
+def _local_prior(raw, mean):
+    """Fill unobserved hours (raw[h] is None) by circular interpolation between the nearest
+    observed hours on each side — a night with no data inherits its neighbours, not the daily
+    mean. The mean is a terrible prior for a dead hour: it is dominated by working hours and
+    was exactly what kept 3am looking busy. All-None (no data at all) -> mean everywhere."""
+    obs = [h for h in range(24) if raw[h] is not None]
+    if not obs:
+        return [mean] * 24
+    out = []
+    for h in range(24):
+        if raw[h] is not None:
+            out.append(raw[h])
+            continue
+        prev = max(obs, key=lambda o: -((h - o) % 24))   # nearest observed hour going back
+        nxt = min(obs, key=lambda o: (o - h) % 24)       # nearest observed hour going forward
+        back, fwd = (h - prev) % 24, (nxt - h) % 24
+        span = back + fwd
+        out.append(raw[prev] if span == 0 else (raw[prev] * fwd + raw[nxt] * back) / span)
+    return out
+
+
+def _hour_profile(con, tz):
+    """(hour_rate[24], dow_mult[7], mean, source) — relative usage intensity by local hour and
+    weekday, or None when neither history nor config can say anything.
+
+    Learned from token_log when available (observed zeros: an hour with no requests is dead,
+    not unknown) and from dense snapshot pairs otherwise, where an unobserved hour has to
+    borrow from its neighbours via _local_prior instead. Below the coverage gate the learned
+    shape is dropped; if quiet_hours is configured a synthetic profile (flat awake, QUIET_MULT
+    asleep) is used instead, enough to stop the projection from spending the night. Cached
+    ~15 min: watch re-renders every poll."""
+    quiet = _quiet_hours()
+    synthetic = ([QUIET_MULT if h in quiet else 1.0 for h in range(24)],
+                 [1.0] * 7, 1.0, "quiet_hours") if quiet else None
+    if con is None:
+        return synthetic
+    now_s = datetime.now(UTC).timestamp()
+    cached = _profile_cache.get(str(tz))
+    if cached and cached[0] > now_s:
+        return cached[1]
+    try:
+        buckets = _hour_buckets_tokens(con, tz)
+    except Exception:  # token_log absent (older database) -> snapshot fallback
+        buckets = None
+    observed_zeros = buckets is not None
+    if buckets is None:
+        buckets = _hour_buckets(con, tz)
+    hrs, pts, whrs, wpts = buckets
     total_h = sum(hrs)
     mean = sum(pts) / total_h if total_h > 0 else 0.0
-    if total_h >= 48 and sum(1 for h in hrs if h > 0.5) >= 12 and mean > 0:
-        # buckets with <30min observed borrow the mean instead of trusting one noisy sample
-        raw = [pts[h] / hrs[h] if hrs[h] > 0.5 else mean for h in range(24)]
-        smooth = [0.25 * raw[(h - 1) % 24] + 0.5 * raw[h] + 0.25 * raw[(h + 1) % 24]
-                  for h in range(24)]
-        dow = [min(max((wpts[d] / whrs[d]) / mean, 0.25), 4.0) if whrs[d] >= 6 else 1.0
-               for d in range(7)]
-        prof = (smooth, dow, mean)
+    covered = sum(1 for h in hrs if h >= PROFILE_MIN_BUCKET_H)
+    prof = synthetic
+    if total_h >= PROFILE_MIN_HOURS and covered >= PROFILE_MIN_BUCKETS and mean > 0:
+        raw = [pts[h] / hrs[h] if hrs[h] >= PROFILE_MIN_BUCKET_H else None for h in range(24)]
+        if observed_zeros:
+            est = [v if v is not None else 0.0 for v in raw]
+        else:  # interval-censored: an unobserved hour inherits its neighbours, not the mean
+            prior = _local_prior(raw, mean)
+            est = [(pts[h] + PROFILE_PSEUDO_H * prior[h]) / (hrs[h] + PROFILE_PSEUDO_H)
+                   if raw[h] is not None else prior[h] for h in range(24)]
+        smooth = [max(0.25 * est[(h - 1) % 24] + 0.5 * est[h] + 0.25 * est[(h + 1) % 24],
+                      PROFILE_FLOOR * mean) for h in range(24)]
+        if quiet:  # an explicit statement beats an inference from sparse data
+            smooth = [v * QUIET_MULT if h in quiet else v for h, v in enumerate(smooth)]
+        dow = [min(max(((wpts[d] + PROFILE_PSEUDO_H * mean) / (whrs[d] + PROFILE_PSEUDO_H)) / mean,
+                       0.25), 4.0) if whrs[d] >= 2 else 1.0 for d in range(7)]
+        prof = (smooth, dow, mean, "learned")
     _profile_cache[str(tz)] = (now_s + 900, prof)
     return prof
 
 
-def _project(con, pct, rate, rem_h, now_utc, tz) -> tuple[float, float | None, bool]:
-    """(projection at reset, hours to hit 100% or None if it doesn't before reset, weighted?).
+def _project(con, pct, rate, rem_h, now_utc, tz) -> tuple[float, float | None, str]:
+    """(projection at reset, hours to hit 100% or None if it doesn't before reset, source).
+    source is "" (linear), "learned" (hourly/weekday profile) or "quiet_hours" (declared
+    idle hours only) — callers use it for the note they print, and it is truthy iff weighted.
     With a profile, integrates expected intensity over the remaining window — anchored so
     'now' matches the observed EWMA rate — instead of the flat rate×hours extrapolation,
     which overshoots into idle periods (nights) and undershoots into busy ones. The anchor
@@ -908,8 +1092,8 @@ def _project(con, pct, rate, rem_h, now_utc, tz) -> tuple[float, float | None, b
     prof = _hour_profile(con, tz)
     if prof is None:
         eta = (100 - pct) / rate if pct < 100 else None
-        return pct + rate * rem_h, (eta if eta is not None and eta < rem_h else None), False
-    hour_rate, dow_mult, mean = prof
+        return pct + rate * rem_h, (eta if eta is not None and eta < rem_h else None), ""
+    hour_rate, dow_mult, mean, src = prof
 
     def intensity(t_local):
         return hour_rate[t_local.hour] * dow_mult[t_local.weekday()]
@@ -923,7 +1107,7 @@ def _project(con, pct, rate, rem_h, now_utc, tz) -> tuple[float, float | None, b
         t += dt
         if eta is None and pct < 100 and pct + acc >= 100:
             eta = t
-    return pct + acc, eta, True
+    return pct + acc, eta, src
 
 
 def _alerts(rows, con, tz=None) -> list[str]:
@@ -1081,8 +1265,8 @@ def _window_tips(lbl: str, pct: float, reset: str | None, rate: float | None, no
     if rate is None:
         out.append("  (no rate yet — run 'cmon collect' more times)")
         return out, summ
-    proj, eta, weighted = _project(con, pct, rate, rem_h, now_utc, tz or _resolve_tz())
-    note = " (profile-weighted)" if weighted else ""
+    proj, eta, src = _project(con, pct, rate, rem_h, now_utc, tz or _resolve_tz())
+    note = PROJ_NOTE_SHORT.get(src, "")
     summ += f", rate {rate:.2f}%/h, projection {min(proj, 999):.0f}%{note}"
     out.append(f"  current rate {rate:.2f}%/h → projection at reset ~{min(proj, 999):.0f}%{note}")
     if proj < 97:
@@ -1631,24 +1815,23 @@ def watch(args):
         t.add_column("resets in", justify="right")
         t.add_column("rate", justify="right")
         t.add_column("projection", justify="right")
-        weighted = False
+        proj_src = ""
         for key, lbl, pct, reset, act in rows:
             rate = _rate(con, key)
             rem_h = ((datetime.fromisoformat(reset) - now_utc).total_seconds() / 3600
                      if reset else None)
             proj = "-"
             if rate and rem_h and rem_h > 0:
-                p, _eta, w = _project(con, pct, rate, rem_h, now_utc, tz)
-                weighted = weighted or w
+                p, _eta, src = _project(con, pct, rate, rem_h, now_utc, tz)
+                proj_src = proj_src or src
                 proj = f"{min(p, 999):.0f}%"
             t.add_row(lbl + (" ●" if act else ""),
                       Text(bar(pct, 28), style=color(pct)),
                       f"{pct:.0f}", fmt_eta(reset),
                       f"{rate:.1f}%/h" if rate else "-", proj)
         body = [t]
-        if weighted:
-            body.append(Text("projection weighted by your hourly/weekday usage profile",
-                             style="dim"))
+        if note := PROJ_NOTE_WATCH.get(proj_src):
+            body.append(Text(note, style="dim"))
         win = _session_window_start(rows, now_utc)
         scan_logs(con, since=win, quiet=True)
         bs = _burn_summary(_burn_rows(con, win))
