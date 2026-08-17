@@ -60,6 +60,12 @@ PROFILE_MIN_BUCKET_H = 0.5   # below this an hour bucket is "unobserved" (one no
 PROFILE_PSEUDO_H = 1.0       # shrinkage strength toward the local prior, in observed-hour units
 PROFILE_FLOOR = 0.02         # no hour is ever exactly 0 intensity (kills divide-by-zero anchors)
 QUIET_MULT = 0.05            # intensity multiplier inside declared quiet hours
+# Forecast logging (see _log_forecasts / backtest): predictions are stored so they can be
+# scored against reality later. Kept cheap — one write per interval, pruned by age.
+FORECAST_EVERY_S = int(os.environ.get("CMON_FORECAST_EVERY_S", "900"))  # dedup between writes
+FORECAST_HORIZONS = (1.0, 3.0, 6.0)  # fixed horizons, plus each window's own time-to-reset
+FORECAST_MATCH_MIN = int(os.environ.get("CMON_FORECAST_MATCH_MIN", "20"))  # snapshot match window
+FORECAST_KEEP_D = int(os.environ.get("CMON_FORECAST_KEEP_D", "60"))  # retention
 # How each projection source is described to the user, keyed by _project()'s third return value.
 PROJ_NOTE = {"learned": " (weighted by your usage profile)",
              "quiet_hours": " (skipping your quiet hours)"}
@@ -321,7 +327,7 @@ def token_clear(_):
 
 # --- Config: persisted user preferences (~/.cmon/config.json) ---
 CONFIG = os.path.expanduser("~/.cmon/config.json")
-CONFIG_KEYS = {"timezone"}  # allowlist; extend here as new preferences are added
+CONFIG_KEYS = {"timezone", "quiet_hours"}  # allowlist; extend here as new preferences are added
 
 
 def _validate_timezone(value: str) -> str:
@@ -542,6 +548,14 @@ def db(create: bool = True):
                 "ts TIMESTAMPTZ, key TEXT, label TEXT, percent DOUBLE, "
                 "resets_at TIMESTAMPTZ, is_active BOOL)")
     con.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT, ts TEXT)")
+    # Forecast log: what we predicted, and (once target_ts passes) what actually happened.
+    # Closes the loop — 'cmon backtest' scores MAE/bias per horizon, and the tuner reads the
+    # same rows to pick parameters. Small by design: one row per (poll, key, horizon), deduped
+    # to FORECAST_EVERY_S and pruned past FORECAST_KEEP_D.
+    con.execute("CREATE TABLE IF NOT EXISTS forecasts("
+                "ts TIMESTAMPTZ, key TEXT, horizon_h DOUBLE, target_ts TIMESTAMPTZ, "
+                "pred_pct DOUBLE, pct0 DOUBLE, rate DOUBLE, model TEXT, "
+                "actual_pct DOUBLE, resolved_ts TIMESTAMPTZ)")
     return con
 
 
@@ -630,7 +644,7 @@ def now(args):
         return
     now_utc = datetime.now(UTC)
     rem_h = (end - now_utc).total_seconds() / 3600
-    proj, to100, src = _project(con, pct, rate, rem_h, now_utc, _resolve_tz())
+    proj, to100, src = _project(con, pct, rate, rem_h, now_utc, _resolve_tz(), "session")
     note = PROJ_NOTE.get(src, "")
     print(f"Rate: {rate:.1f}%/h → projection at reset: {min(proj, 100):.0f}%{note}.")
     if to100 is not None:
@@ -689,6 +703,8 @@ def collect(args):
     con.executemany("INSERT INTO snapshots VALUES (?,?,?,?,?,?)",
                     [[ts, k, lbl, pct, reset, act] for k, lbl, pct, reset, act in rows])
     _write_cache(rows, ts)
+    _log_forecasts(con, rows, _resolve_tz(), ts)  # record predictions; scored by 'cmon backtest'
+    _reconcile_forecasts(con)                     # and settle the ones whose horizon just passed
     print(f"{ts:%Y-%m-%d %H:%M} collected:")
     for _k, lbl, pct, reset, _a in rows:
         print(f"  {lbl:16} {pct:4.0f}%  reset {reset[:16] if reset else '-'}")
@@ -875,16 +891,28 @@ def plot(args):
     _open_file(out)
 
 
-def _rate(con, key) -> float | None:
+def _rate_half_life(key) -> float:
+    """EWMA half-life (hours) used to measure a window's current rate. Short for the 5h window
+    (its pace changes within a session), long for weekly (a day of noise shouldn't swing it).
+    _project needs the same number to know what span its input rate is an average *over*."""
+    return 1.0 if key == "session" else 12.0
+
+
+def _rate(con, key, as_of=None) -> float | None:
     """Weighted %/h in the current window (segment since the last reset). Exponentially
     weighted least-squares slope: recent snapshots dominate (half-life ~1h for the 5h window,
     ~12h weekly), so the projection tracks your current pace instead of a flat cycle average.
-    None if there's no net rise to project. Self-adapts to 5h/7d/etc. by cutting at each reset."""
+    None if there's no net rise to project. Self-adapts to 5h/7d/etc. by cutting at each reset.
+
+    as_of pretends it is that moment and ignores every later snapshot — the replay backtest
+    needs it, since scoring a past prediction against a rate computed from data that only
+    arrived afterwards would leak the future into the model being judged."""
     if con is None:
         return None
     # epoch_us keeps this off the TIMESTAMPTZ->datetime path (we only need time *deltas*).
-    rows = con.execute("SELECT epoch_us(ts), percent FROM snapshots WHERE key=? ORDER BY ts",
-                       [key]).fetchall()
+    rows = con.execute("SELECT epoch_us(ts), percent FROM snapshots WHERE key=? "
+                       "AND (? IS NULL OR ts <= ?) ORDER BY ts",
+                       [key, as_of, as_of]).fetchall()
     if len(rows) < 2:
         return None
     last_drop = 0  # index of the last reset (percent dropped vs. previous sample)
@@ -899,7 +927,7 @@ def _rate(con, key) -> float | None:
     t_last = seg[-1][0]
     t = [(us - t_last) / 1e6 / 3600.0 for us, _ in seg]
     y = [float(p) for _, p in seg]
-    half_life = 1.0 if key == "session" else 12.0
+    half_life = _rate_half_life(key)
     w = [math.exp(ti / half_life) for ti in t]
     sw = sum(w)
     tm = sum(wi * ti for wi, ti in zip(w, t, strict=True)) / sw
@@ -914,16 +942,16 @@ def _rate(con, key) -> float | None:
 _profile_cache: dict[str, tuple[float, tuple | None]] = {}  # tz_key -> (expires_epoch, profile)
 
 
-def _day_weights(con, tz):
+def _day_weights(con, tz, now_utc):
     """{local date -> recency weight} for every day from the first logged request (capped at
     PROFILE_MAX_AGE_D) through today, plus the exposed hours of today. A day's weight decays
     with a PROFILE_HALFLIFE_D half-life, so the learned shape follows your current routine
     and old habits fade instead of dropping off a cliff when a fixed window slides."""
-    cutoff = datetime.now(UTC) - timedelta(days=PROFILE_MAX_AGE_D)
+    cutoff = now_utc - timedelta(days=PROFILE_MAX_AGE_D)
     first = con.execute("SELECT min(ts) FROM token_log WHERE ts > ?", [cutoff]).fetchone()[0]
     if first is None:
         return {}, 0
-    now_local = datetime.now(UTC).astimezone(tz)
+    now_local = now_utc.astimezone(tz)
     day = max(first.astimezone(tz), cutoff.astimezone(tz)).date()
     out = {}
     while day <= now_local.date():
@@ -933,7 +961,7 @@ def _day_weights(con, tz):
     return out, now_local.hour + 1  # hours of today already exposed
 
 
-def _hour_buckets_tokens(con, tz):
+def _hour_buckets_tokens(con, tz, now_utc):
     """(hrs, pts, whrs, wpts) per local hour/weekday from token_log, or None when it can't
     support a shape. This is the good source: every assistant request carries its own precise
     timestamp, so an idle 4am is an *observed zero* rather than an unknown. Snapshot percents
@@ -943,7 +971,7 @@ def _hour_buckets_tokens(con, tz):
     Weight mixes fresh tokens with cache reads at 1/10 (a cached-heavy hour is real work but
     costs proportionally less quota). 'Exposure' (hrs) is one weighted hour per day covered,
     which is what makes an hour with no requests count as genuinely dead."""
-    days, today_hours = _day_weights(con, tz)
+    days, today_hours = _day_weights(con, tz, now_utc)
     if len(days) < PROFILE_MIN_DAYS:
         return None
     hrs, pts = [0.0] * 24, [0.0] * 24
@@ -958,8 +986,8 @@ def _hour_buckets_tokens(con, tz):
     rows = con.execute(
         "SELECT (timezone(?, ts))::DATE, hour(timezone(?, ts)), "
         "sum(in_tok + out_tok + coalesce(cache_read, 0) / 10.0) FROM token_log "
-        "WHERE ts > ? AND in_tok IS NOT NULL GROUP BY 1, 2",
-        [str(tz), str(tz), datetime.now(UTC) - timedelta(days=PROFILE_MAX_AGE_D)]).fetchall()
+        "WHERE ts > ? AND ts <= ? AND in_tok IS NOT NULL GROUP BY 1, 2",
+        [str(tz), str(tz), now_utc - timedelta(days=PROFILE_MAX_AGE_D), now_utc]).fetchall()
     for day, hour, tok in rows:
         w = days.get(day)
         if w is None or not tok:
@@ -969,7 +997,7 @@ def _hour_buckets_tokens(con, tz):
     return (hrs, pts, whrs, wpts) if sum(pts) > 0 else None
 
 
-def _hour_buckets(con, tz):
+def _hour_buckets(con, tz, now_utc):
     """Recency-weighted (observed_hours, consumed_pct) per local hour and per weekday, from
     *dense* consecutive weekly_all snapshot pairs. Fallback for when token_log is empty (no
     Claude Code transcripts scanned yet). Two rules make the histogram honest:
@@ -986,9 +1014,9 @@ def _hour_buckets(con, tz):
     hrs, pts = [0.0] * 24, [0.0] * 24
     whrs, wpts = [0.0] * 7, [0.0] * 7
     rows = con.execute("SELECT epoch_us(ts), percent FROM snapshots WHERE key='weekly_all' "
-                       "AND ts > ? ORDER BY ts",
-                       [datetime.now(UTC) - timedelta(days=PROFILE_MAX_AGE_D)]).fetchall()
-    now_s = datetime.now(UTC).timestamp()
+                       "AND ts > ? AND ts <= ? ORDER BY ts",
+                       [now_utc - timedelta(days=PROFILE_MAX_AGE_D), now_utc]).fetchall()
+    now_s = now_utc.timestamp()
     for (us0, p0), (us1, p1) in zip(rows, rows[1:], strict=False):
         dt_h = (us1 - us0) / 3.6e9
         d = p1 - p0
@@ -1030,9 +1058,10 @@ def _local_prior(raw, mean):
     return out
 
 
-def _hour_profile(con, tz):
+def _hour_profile(con, tz, as_of=None):
     """(hour_rate[24], dow_mult[7], mean, source) — relative usage intensity by local hour and
-    weekday, or None when neither history nor config can say anything.
+    weekday, or None when neither history nor config can say anything. as_of restricts learning
+    to data available at that moment (replay backtest; see _rate).
 
     Learned from token_log when available (observed zeros: an hour with no requests is dead,
     not unknown) and from dense snapshot pairs otherwise, where an unobserved hour has to
@@ -1045,17 +1074,21 @@ def _hour_profile(con, tz):
                  [1.0] * 7, 1.0, "quiet_hours") if quiet else None
     if con is None:
         return synthetic
+    now_utc = as_of or datetime.now(UTC)
     now_s = datetime.now(UTC).timestamp()
-    cached = _profile_cache.get(str(tz))
+    # A replay caches per (tz, as_of hour): it walks thousands of past moments, and relearning
+    # the shape for each one would dominate its runtime.
+    ck = f"{tz}|{as_of:%Y%m%d%H}" if as_of else str(tz)
+    cached = _profile_cache.get(ck)
     if cached and cached[0] > now_s:
         return cached[1]
     try:
-        buckets = _hour_buckets_tokens(con, tz)
+        buckets = _hour_buckets_tokens(con, tz, now_utc)
     except Exception:  # token_log absent (older database) -> snapshot fallback
         buckets = None
     observed_zeros = buckets is not None
     if buckets is None:
-        buckets = _hour_buckets(con, tz)
+        buckets = _hour_buckets(con, tz, now_utc)
     hrs, pts, whrs, wpts = buckets
     total_h = sum(hrs)
     mean = sum(pts) / total_h if total_h > 0 else 0.0
@@ -1076,20 +1109,30 @@ def _hour_profile(con, tz):
         dow = [min(max(((wpts[d] + PROFILE_PSEUDO_H * mean) / (whrs[d] + PROFILE_PSEUDO_H)) / mean,
                        0.25), 4.0) if whrs[d] >= 2 else 1.0 for d in range(7)]
         prof = (smooth, dow, mean, "learned")
-    _profile_cache[str(tz)] = (now_s + 900, prof)
+    _profile_cache[ck] = (now_s + 900, prof)
     return prof
 
 
-def _project(con, pct, rate, rem_h, now_utc, tz) -> tuple[float, float | None, str]:
+def _project(con, pct, rate, rem_h, now_utc, tz, key=None, replay=False) -> tuple[float, float | None, str]:
     """(projection at reset, hours to hit 100% or None if it doesn't before reset, source).
     source is "" (linear), "learned" (hourly/weekday profile) or "quiet_hours" (declared
     idle hours only) — callers use it for the note they print, and it is truthy iff weighted.
-    With a profile, integrates expected intensity over the remaining window — anchored so
-    'now' matches the observed EWMA rate — instead of the flat rate×hours extrapolation,
-    which overshoots into idle periods (nights) and undershoots into busy ones. The anchor
-    denominator is floored at 25% of the mean so a burst during a historically dead hour
-    can't inflate every future busy hour by that ratio. Linear without a profile."""
-    prof = _hour_profile(con, tz)
+    With a profile, integrates expected intensity over the remaining window instead of the flat
+    rate×hours extrapolation, which overshoots into idle periods (nights) and undershoots into
+    busy ones. Linear without a profile.
+
+    The anchor k converts the measured rate into profile units, and *what* it divides by matters:
+    the input rate is an EWMA over roughly the last _rate_half_life(key) hours, not the intensity
+    of this instant. Dividing by intensity(now) therefore mis-scaled every weekly projection —
+    with a 12h half-life the measured rate already averages evening peaks with the night, so
+    anchoring it to a peak-hour intensity made the model quietly pessimistic (replay: bias -9.1
+    at horizons past 6h, worse than plain linear). Dividing by the intensity averaged under the
+    same exponential kernel is the consistent choice. Floored at 25% of the mean so a burst
+    during a historically dead hour can't inflate every future busy hour by that ratio.
+
+    replay=True treats now_utc as the present, so a past prediction is rebuilt from the data
+    that existed back then."""
+    prof = _hour_profile(con, tz, as_of=now_utc if replay else None)
     if prof is None:
         eta = (100 - pct) / rate if pct < 100 else None
         return pct + rate * rem_h, (eta if eta is not None and eta < rem_h else None), ""
@@ -1099,7 +1142,12 @@ def _project(con, pct, rate, rem_h, now_utc, tz) -> tuple[float, float | None, s
         return hour_rate[t_local.hour] * dow_mult[t_local.weekday()]
 
     now_local = now_utc.astimezone(tz)
-    k = rate / max(intensity(now_local), 0.25 * mean)
+    hl = _rate_half_life(key)
+    span, dt = 3 * hl, 0.25   # 3 half-lives carry ~90% of the kernel's weight
+    kern = [(0.5 ** (a / hl), intensity(now_local - timedelta(hours=a)))
+            for a in [i * dt + dt / 2 for i in range(int(span / dt))]]
+    past = sum(w * v for w, v in kern) / sum(w for w, _ in kern)
+    k = rate / max(past, 0.25 * mean)
     acc, eta, t = 0.0, None, 0.0
     while t < rem_h:
         dt = min(0.25, rem_h - t)
@@ -1108,6 +1156,171 @@ def _project(con, pct, rate, rem_h, now_utc, tz) -> tuple[float, float | None, s
         if eta is None and pct < 100 and pct + acc >= 100:
             eta = t
     return pct + acc, eta, src
+
+
+def _log_forecasts(con, rows, tz, now_utc=None) -> None:
+    """Record what we predict right now so it can be scored later (see _reconcile_forecasts).
+    Both the active model *and* the plain linear baseline are stored for each horizon, which
+    is the only way to tell whether the profile actually helps rather than just looks smarter.
+    Best-effort and deduped to one write per FORECAST_EVERY_S: watch polls every ~75s and this
+    is bookkeeping, not the user's request."""
+    if con is None:
+        return
+    now_utc = now_utc or datetime.now(UTC)
+    try:
+        last = con.execute("SELECT max(ts) FROM forecasts").fetchone()[0]
+        if last and (now_utc - last).total_seconds() < FORECAST_EVERY_S:
+            return
+        out = []
+        for key, _lbl, pct, reset, _act in rows:
+            if not reset or pct >= 100:
+                continue
+            rate = _rate(con, key)
+            if not rate:
+                continue
+            rem_h = (datetime.fromisoformat(reset) - now_utc).total_seconds() / 3600
+            if rem_h <= 0:
+                continue
+            for h in [x for x in FORECAST_HORIZONS if x < rem_h] + [rem_h]:
+                pred, _eta, src = _project(con, pct, rate, h, now_utc, tz, key)
+                target = now_utc + timedelta(hours=h)
+                out.append([now_utc, key, h, target, pred, pct, rate, src or "linear"])
+                if src:  # baseline for comparison; skipped when the model *is* linear
+                    out.append([now_utc, key, h, target, pct + rate * h, pct, rate, "linear"])
+        if out:
+            con.executemany("INSERT INTO forecasts (ts, key, horizon_h, target_ts, pred_pct, "
+                            "pct0, rate, model) VALUES (?,?,?,?,?,?,?,?)", out)
+    except Exception:
+        pass  # never let bookkeeping break a collect/watch cycle
+
+
+def _reconcile_forecasts(con) -> int:
+    """Fill actual_pct for forecasts whose target time has passed, from the nearest snapshot of
+    the same window within FORECAST_MATCH_MIN minutes. Returns how many were resolved.
+
+    Pairs whose window reset between prediction and target are dropped, not scored: percent
+    falling below pct0 means the quota reset, so the 'error' would be the reset, not the model.
+    Unmatched predictions older than a day (no snapshot near their target — machine asleep)
+    and rows past FORECAST_KEEP_D are pruned so the table stays small."""
+    if con is None:
+        return 0
+    try:
+        con.execute(
+            "CREATE OR REPLACE TEMP TABLE _rec AS SELECT fts, fkey, fh, sts, percent FROM ("
+            "  SELECT f.ts AS fts, f.key AS fkey, f.horizon_h AS fh, s.ts AS sts, s.percent, "
+            "         row_number() OVER (PARTITION BY f.ts, f.key, f.horizon_h "
+            "           ORDER BY abs(date_diff('second', s.ts, f.target_ts))) AS rn "
+            "  FROM forecasts f JOIN snapshots s ON s.key = f.key "
+            "    AND s.ts BETWEEN f.target_ts - to_minutes(?) AND f.target_ts + to_minutes(?) "
+            "  WHERE f.actual_pct IS NULL AND f.target_ts <= now()) WHERE rn = 1",
+            [FORECAST_MATCH_MIN, FORECAST_MATCH_MIN])
+        con.execute("UPDATE forecasts SET actual_pct = _rec.percent, resolved_ts = _rec.sts "
+                    "FROM _rec WHERE forecasts.ts = _rec.fts AND forecasts.key = _rec.fkey "
+                    "AND forecasts.horizon_h = _rec.fh")
+        n = con.execute("SELECT count(*) FROM _rec").fetchone()[0]
+        con.execute("DELETE FROM forecasts WHERE actual_pct IS NOT NULL AND actual_pct < pct0 - 0.5")
+        con.execute("DELETE FROM forecasts WHERE actual_pct IS NULL AND target_ts < now() - to_hours(24)")
+        con.execute("DELETE FROM forecasts WHERE ts < now() - to_days(?)", [FORECAST_KEEP_D])
+        return int(n)
+    except Exception:
+        return 0
+
+
+def _backtest_rows(con, since):
+    """(model, band, n, mae, bias) per model and horizon band, from resolved forecasts.
+    pred_pct is clamped to 100 for scoring: reality saturates there, so an uncapped 130%
+    prediction would be charged for 30 points of error it could never have avoided."""
+    return con.execute(
+        "SELECT model, CASE WHEN horizon_h <= 1 THEN '<=1h' "
+        "                   WHEN horizon_h <= 6 THEN '1-6h' ELSE '>6h' END AS band, "
+        "       count(*), avg(abs(least(pred_pct, 100) - actual_pct)), "
+        "       avg(least(pred_pct, 100) - actual_pct) "
+        "FROM forecasts WHERE actual_pct IS NOT NULL AND ts > ? "
+        "GROUP BY 1, 2 ORDER BY 1, min(horizon_h)", [since]).fetchall()
+
+
+def _replay(con, tz, since, keys=("session", "weekly_all"), step=8, models=("active", "linear")):
+    """Rebuild past predictions from the snapshots we already have and score them, without
+    waiting weeks for live forecasts to mature. For each sampled snapshot it recomputes the
+    rate and the profile *as of that moment* (nothing later is visible), projects each horizon,
+    and compares against the actual percent at the target time — skipping pairs whose window
+    reset in between, since the drop isn't a forecasting error.
+
+    Returns (model, band, n, mae, bias) rows shaped like _backtest_rows. step subsamples the
+    snapshots (they arrive every ~20min; every 8th is ~2.7h apart, plenty for scoring)."""
+    out = {}
+    for key in keys:
+        rows = con.execute("SELECT ts, percent, resets_at FROM snapshots WHERE key=? AND ts > ? "
+                           "AND resets_at IS NOT NULL ORDER BY ts", [key, since]).fetchall()
+        if len(rows) < 4:
+            continue
+        by_ts = [(ts, pct) for ts, pct, _r in rows]
+        for i in range(0, len(rows), step):
+            ts, pct, reset = rows[i]
+            rem_h = (reset - ts).total_seconds() / 3600
+            rate = _rate(con, key, as_of=ts)
+            if not rate or rem_h <= 0 or pct >= 100:
+                continue
+            for h in [x for x in FORECAST_HORIZONS if x < rem_h] + [rem_h]:
+                target = ts + timedelta(hours=h)
+                # nearest later snapshot within the match window; None -> unscoreable
+                act = next(((t, p) for t, p in by_ts[i + 1:]
+                            if abs((t - target).total_seconds()) <= FORECAST_MATCH_MIN * 60), None)
+                if act is None or act[1] < pct - 0.5:  # reset between prediction and target
+                    continue
+                pred, _eta, src = _project(con, pct, rate, h, ts, tz, key, replay=True)
+                band = "<=1h" if h <= 1 else ("1-6h" if h <= 6 else ">6h")
+                for model, value in (("active", pred), ("linear", pct + rate * h)):
+                    if model not in models:
+                        continue
+                    err = min(value, 100.0) - act[1]
+                    agg = out.setdefault((model if model == "linear" else (src or "linear"), band),
+                                         [0, 0.0, 0.0])
+                    agg[0] += 1
+                    agg[1] += abs(err)
+                    agg[2] += err
+    order = {"<=1h": 0, "1-6h": 1, ">6h": 2}
+    return [(m, b, n, s_abs / n, s_err / n)
+            for (m, b), (n, s_abs, s_err) in sorted(out.items(), key=lambda kv: (kv[0][0], order[kv[0][1]]))
+            if n]
+
+
+def backtest(args):
+    """Score past projections against what actually happened. bias > 0 = overestimating."""
+    con = _read_db()
+    if con is None:
+        sys.exit("No database yet — run 'cmon collect' a few times first.")
+    if getattr(args, "replay", False):
+        since = _parse_since(getattr(args, "since", None)) or datetime(1970, 1, 1, tzinfo=UTC)
+        rows = _replay(con, _resolve_tz(), since)
+        _print_backtest(rows, getattr(args, "json", False), header="Replayed over existing history")
+        return
+    resolved = _reconcile_forecasts(con)
+    since = _parse_since(getattr(args, "since", None)) or datetime(1970, 1, 1, tzinfo=UTC)
+    rows = _backtest_rows(con, since)
+    if not rows and not getattr(args, "json", False):
+        pend = con.execute("SELECT count(*) FROM forecasts WHERE actual_pct IS NULL").fetchone()[0]
+        print(f"No scored forecasts yet ({pend} awaiting their target time). Keep "
+              "'cmon collect'/'watch' running, or use --replay to score the history you "
+              "already have.")
+        return
+    _print_backtest(rows, getattr(args, "json", False),
+                    header=f"Live forecasts (resolved {resolved} new)")
+
+
+def _print_backtest(rows, as_json: bool, header: str) -> None:
+    if as_json:
+        print(json.dumps([{"model": m, "horizon": b, "n": int(n), "mae": round(mae, 2),
+                           "bias": round(bias, 2)} for m, b, n, mae, bias in rows], indent=2))
+        return
+    if not rows:
+        print("Nothing scoreable in that range.")
+        return
+    print(f"{header}:\n")
+    print(f"  {'model':<12} {'horizon':<8} {'n':>6} {'MAE':>7} {'bias':>7}")
+    for m, band, n, mae, bias in rows:
+        print(f"  {m:<12} {band:<8} {n:>6} {mae:>7.2f} {bias:>+7.2f}")
+    print("\nMAE = mean absolute error in percentage points; bias > 0 = projecting too high.")
 
 
 def _alerts(rows, con, tz=None) -> list[str]:
@@ -1126,7 +1339,7 @@ def _alerts(rows, con, tz=None) -> list[str]:
         rem_h = (datetime.fromisoformat(reset) - now_utc).total_seconds() / 3600
         if rem_h <= 0:
             continue
-        _proj, eta, _w = _project(con, pct, rate, rem_h, now_utc, tz)
+        _proj, eta, _w = _project(con, pct, rate, rem_h, now_utc, tz, key)
         if eta is not None:
             msgs.append(f"{lbl}: at rate {rate:.1f}%/h hits 100% in ~{eta:.1f}h "
                         f"(~{rem_h - eta:.1f}h before reset).")
@@ -1251,7 +1464,8 @@ def _ai_tip(summary: str) -> str | None:
         return None
 
 
-def _window_tips(lbl: str, pct: float, reset: str | None, rate: float | None, now_utc, con=None, tz=None):
+def _window_tips(lbl: str, pct: float, reset: str | None, rate: float | None, now_utc, con=None,
+                 tz=None, key=None):
     """Deterministic pacing block for a window. Returns (printed_lines, summary_line).
     With con+tz the projection/eta use the hourly usage profile (same as watch/now)."""
     if not reset:
@@ -1265,7 +1479,7 @@ def _window_tips(lbl: str, pct: float, reset: str | None, rate: float | None, no
     if rate is None:
         out.append("  (no rate yet — run 'cmon collect' more times)")
         return out, summ
-    proj, eta, src = _project(con, pct, rate, rem_h, now_utc, tz or _resolve_tz())
+    proj, eta, src = _project(con, pct, rate, rem_h, now_utc, tz or _resolve_tz(), key)
     note = PROJ_NOTE_SHORT.get(src, "")
     summ += f", rate {rate:.2f}%/h, projection {min(proj, 999):.0f}%{note}"
     out.append(f"  current rate {rate:.2f}%/h → projection at reset ~{min(proj, 999):.0f}%{note}")
@@ -1294,7 +1508,7 @@ def _advice(rows, con, no_ai: bool = False):
         if not row:
             continue
         _k, _lbl, pct, reset, _a = row
-        block, summ = _window_tips(want, pct, reset, _rate(con, key), now_utc, con, tz)
+        block, summ = _window_tips(want, pct, reset, _rate(con, key), now_utc, con, tz, key)
         print("\n".join(block) + "\n")
         summaries.append(summ)
 
@@ -1822,7 +2036,7 @@ def watch(args):
                      if reset else None)
             proj = "-"
             if rate and rem_h and rem_h > 0:
-                p, _eta, src = _project(con, pct, rate, rem_h, now_utc, tz)
+                p, _eta, src = _project(con, pct, rate, rem_h, now_utc, tz, key)
                 proj_src = proj_src or src
                 proj = f"{min(p, 999):.0f}%"
             t.add_row(lbl + (" ●" if act else ""),
@@ -1834,6 +2048,8 @@ def watch(args):
             body.append(Text(note, style="dim"))
         win = _session_window_start(rows, now_utc)
         scan_logs(con, since=win, quiet=True)
+        _log_forecasts(con, rows, tz, now_utc)  # deduped internally to FORECAST_EVERY_S
+        _reconcile_forecasts(con)
         bs = _burn_summary(_burn_rows(con, win))
         if bs:
             tok, cost, mix = bs
@@ -2059,6 +2275,12 @@ def main():
     pwa.add_argument("--window", default="session", help="window to watch (default session = 5h; e.g., weekly_all)")
     pwa.add_argument("--at", type=float, help="instead of reset, wait for usage to reach N%%")
     pwa.add_argument("-n", "--interval", type=int, default=60, help="seconds between checks (default 60)")
+    pbt = sub.add_parser("backtest", help="score past projections against what actually happened")
+    pbt.add_argument("--since", help="only forecasts made after '24h', '7d' or an ISO date")
+    pbt.add_argument("--replay", action="store_true",
+                     help="score the existing history instead of live forecasts: rebuilds each "
+                          "past prediction from the data available back then (no waiting)")
+    pbt.add_argument("--json", action="store_true", help="JSON output")
     pin = sub.add_parser("install", help="schedule 'collect --alert' on OS scheduler (background collection)")
     pin.add_argument("-i", "--interval", type=int, default=20, help="minutes between collections (default 20)")
     pin.add_argument("--dry-run", action="store_true", help="show what it would do, don't install")
@@ -2105,7 +2327,7 @@ def main():
     try:
         {"now": now, "status": status, "trends": trends, "collect": collect,
          "burn": burn, "watch": watch, "wait": wait, "plot": plot,
-         "install": install, "uninstall": uninstall}[args.cmd](args)
+         "backtest": backtest, "install": install, "uninstall": uninstall}[args.cmd](args)
     except FetchError as e:
         sys.exit(f"cmon: {e}")
 
