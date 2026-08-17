@@ -7,15 +7,57 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`cmon backtest`**: scores past projections against what actually happened — MAE and bias per
+  horizon band, for the active model *and* the linear baseline. Predictions are logged to a new
+  `forecasts` table and settled against the nearest snapshot once their horizon passes (pairs
+  whose window reset in between are dropped, since the drop isn't a forecasting error). Deduped
+  to one write per 15min and pruned after 60 days.
+- **`cmon backtest --replay`**: scores the history you already have instead of waiting weeks for
+  live forecasts to mature. Each past prediction is rebuilt from the data available *at that
+  moment* — `_rate` and `_hour_profile` both take an `as_of`, so nothing later leaks in.
+- **`cmon tune`**: grid-searches the model parameters (recency half-life, Fourier harmonics for
+  the daily cycle, and how much to trust the profile versus the flat rate) against your own
+  history, fitting on the older part and validating on the newer one. Refuses to persist unless
+  the winner beats the current parameters on that unseen slice and at least 200 predictions are
+  scoreable. Stored as one small JSON row in `meta`; `--show` prints the active values, `--reset`
+  restores defaults.
+- **`quiet_hours` preference**: declares the local hours you don't work (`cmon config set
+  quiet_hours 2-7`, ranges may wrap midnight). A deterministic backstop that applies from the
+  first run, before any profile can be learned, and overrides the learned shape where they
+  disagree. `CMON_QUIET_HOURS` overrides without persisting.
+
 ### Changed
 
 - **Profile-weighted projection**: `watch`, `now`, `now --advice`, and rate-based alerts no
-  longer extrapolate linearly (`rate × remaining hours`). cmon now learns your usage profile
-  from snapshot history (24 smoothed local-hour buckets × weekday multiplier, from
-  `weekly_all` deltas) and integrates that intensity over the time left until reset, anchored
-  to the current EWMA rate — projections stop assuming you burn quota through the night at
-  your daytime pace. Falls back to linear until ~2 days of history; output is marked
-  *profile-weighted* when active.
+  longer extrapolate linearly (`rate × remaining hours`). cmon learns when you actually use
+  Claude (24 local-hour buckets × weekday multiplier) and integrates that intensity over the
+  time left until reset, anchored to the current EWMA rate — projections stop assuming you burn
+  quota through the night at your daytime pace. Falls back to linear without enough history;
+  output is marked *profile-weighted* when active.
+
+### Fixed
+
+- **The profile no longer invents overnight usage.** It was learned by spreading each
+  `weekly_all` snapshot delta evenly across every hour its gap covered, accepting gaps up to
+  48h — so a snapshot at midnight followed by one the next afternoon credited 02:00–07:00 with
+  work done at 14:00. Those wide gaps then dominated the totals (31.6h of the 33.7h in the
+  00:00 bucket) and flattened the shape until every hour looked equally busy. The profile is now
+  learned from **request timestamps** in `token_log`, where an hour with no requests is an
+  observed zero rather than an unknown. On real data the learned shape goes from flat
+  (0.75–1.47, with 05:00 as the apparent "peak") to 0.02 at 04:00 and 2.31 at 21:00, and a 23h
+  projection with 8h to reset drops from 90% to 69%. Snapshot pairs remain the fallback, now
+  restricted to pairs under 1.5h apart, with unobserved hours interpolated from their neighbours
+  instead of borrowing the daily mean — which is exactly what kept 3am looking busy.
+- **EWMA anchor mismatch**, caught by the new replay backtest. The anchor divided the measured
+  rate by `intensity(now)`, treating an EWMA average as this instant's intensity; for the weekly
+  window that average spans ~12h and already mixes evening peaks with the night, so anchoring it
+  to a peak-hour intensity made weekly projections quietly pessimistic. Dividing by the intensity
+  averaged under the same exponential kernel takes horizons past 6h from MAE 15.55 / bias −9.13
+  (worse than linear's 14.15) to MAE 11.31 — now clearly better than linear.
+- Recency now decays with a half-life instead of a hard cutoff, so the learned shape drifts with
+  your routine rather than jumping when a day falls out of a fixed window.
 
 ## [0.1.4] — 2026-07-08
 

@@ -14,10 +14,13 @@ CLAUDE_OAUTH_TOKEN returns 401, cmon refreshes and uses the new one anyway.
   cmon collect     # save 1 snapshot to database (run via cron every ~20min)
   cmon trends      # consumption history: per-label summary + per-cycle peaks/anomaly
   cmon plot        # charts -> PNG: trajectory, pace-vs-target, burn by model
+  cmon backtest    # how accurate past projections were (--replay scores existing history)
+  cmon tune        # fit the projection's parameters to your own history
   cmon token set   # save token to OS secure vault (cross-platform)
 """
 
 import argparse
+import bisect
 import getpass
 import json
 import os
@@ -66,6 +69,18 @@ FORECAST_EVERY_S = int(os.environ.get("CMON_FORECAST_EVERY_S", "900"))  # dedup 
 FORECAST_HORIZONS = (1.0, 3.0, 6.0)  # fixed horizons, plus each window's own time-to-reset
 FORECAST_MATCH_MIN = int(os.environ.get("CMON_FORECAST_MATCH_MIN", "20"))  # snapshot match window
 FORECAST_KEEP_D = int(os.environ.get("CMON_FORECAST_KEEP_D", "60"))  # retention
+# Tunable model parameters, with the values used until 'cmon tune' has evidence to change them.
+# Persisted as one small JSON row in `meta` (a few hundred bytes) rather than a new table or
+# file: they are three numbers, and they belong next to the history they were fitted on.
+#   halflife_d — recency half-life of the learned shape, in days
+#   harmonics  — 0 = 3-point circular smoothing; 2-3 = weighted Fourier fit of the daily cycle
+#   blend      — how much of the profile to trust vs the flat rate (1 = all profile, 0 = linear)
+PARAM_DEFAULTS = {"halflife_d": 10.0, "harmonics": 0.0, "blend": 1.0}
+PARAM_GRID = {"halflife_d": [5.0, 10.0, 21.0], "harmonics": [0.0, 2.0, 3.0],
+              "blend": [0.0, 0.5, 1.0]}
+TUNE_STEP = 24  # subsample the history when tuning: 27 candidates x a full replay is minutes
+TUNE_MIN_GAIN = 0.05  # MAE points a candidate must win by before it's worth persisting
+PARAM_MIN_SCORED = int(os.environ.get("CMON_TUNE_MIN_SCORED", "200"))  # per-band evidence needed
 # How each projection source is described to the user, keyed by _project()'s third return value.
 PROJ_NOTE = {"learned": " (weighted by your usage profile)",
              "quiet_hours": " (skipping your quiet hours)"}
@@ -898,6 +913,9 @@ def _rate_half_life(key) -> float:
     return 1.0 if key == "session" else 12.0
 
 
+_rate_cache: dict[tuple, float | None] = {}  # (key, as_of) -> rate; replay/tune only
+
+
 def _rate(con, key, as_of=None) -> float | None:
     """Weighted %/h in the current window (segment since the last reset). Exponentially
     weighted least-squares slope: recent snapshots dominate (half-life ~1h for the 5h window,
@@ -909,10 +927,16 @@ def _rate(con, key, as_of=None) -> float | None:
     arrived afterwards would leak the future into the model being judged."""
     if con is None:
         return None
+    # Past rates never change, and 'cmon tune' re-scores the same thousands of moments once per
+    # candidate — so memoize them. Only for as_of: the live rate must stay fresh.
+    if as_of is not None and (ck := (key, as_of)) in _rate_cache:
+        return _rate_cache[ck]
     # epoch_us keeps this off the TIMESTAMPTZ->datetime path (we only need time *deltas*).
     rows = con.execute("SELECT epoch_us(ts), percent FROM snapshots WHERE key=? "
                        "AND (? IS NULL OR ts <= ?) ORDER BY ts",
                        [key, as_of, as_of]).fetchall()
+    if as_of is not None:
+        _rate_cache[(key, as_of)] = None  # replaced below unless we bail out early
     if len(rows) < 2:
         return None
     last_drop = 0  # index of the last reset (percent dropped vs. previous sample)
@@ -936,13 +960,96 @@ def _rate(con, key, as_of=None) -> float | None:
         return None
     ym = sum(wi * yi for wi, yi in zip(w, y, strict=True)) / sw
     slope = sum(wi * (ti - tm) * (yi - ym) for wi, ti, yi in zip(w, t, y, strict=True)) / denom  # %/h, EWMA
-    return float(slope) if slope > 0 else None
+    out = float(slope) if slope > 0 else None
+    if as_of is not None:
+        _rate_cache[(key, as_of)] = out
+    return out
 
 
 _profile_cache: dict[str, tuple[float, tuple | None]] = {}  # tz_key -> (expires_epoch, profile)
+_params_cache: dict | None = None
 
 
-def _day_weights(con, tz, now_utc):
+def _params(con=None) -> dict:
+    """Active model parameters: PARAM_DEFAULTS overridden by whatever 'cmon tune' last wrote.
+    Cached per process — every watch poll reads these."""
+    global _params_cache
+    if _params_cache is None:
+        p = dict(PARAM_DEFAULTS)
+        if r := _meta_get(con, "model_params"):
+            try:
+                p.update({k: float(v) for k, v in json.loads(r[0]).items() if k in PARAM_DEFAULTS})
+            except (ValueError, TypeError):
+                pass
+        _params_cache = p
+    return _params_cache
+
+
+def _set_params(con, p: dict | None) -> None:
+    """Persist tuned parameters (or, with None, only reset the process cache — the tuner walks
+    a grid in-process and each candidate needs the learned shape recomputed)."""
+    global _params_cache
+    _params_cache = p if p is None else {**PARAM_DEFAULTS, **p}
+    _profile_cache.clear()
+    if p is not None and con is not None:
+        _meta_set(con, "model_params", json.dumps({k: round(v, 4) for k, v in p.items()}))
+
+
+def _solve(a) -> list[float] | None:
+    """Gaussian elimination with partial pivoting on an augmented n x (n+1) matrix. None if
+    singular. Small by construction (n <= 7), so no numpy — the core stays dependency-free."""
+    n = len(a)
+    for i in range(n):
+        piv = max(range(i, n), key=lambda r: abs(a[r][i]))
+        if abs(a[piv][i]) < 1e-12:
+            return None
+        a[i], a[piv] = a[piv], a[i]
+        for r in range(i + 1, n):
+            f = a[r][i] / a[i][i]
+            for c in range(i, n + 1):
+                a[r][c] -= f * a[i][c]
+    x = [0.0] * n
+    for i in range(n - 1, -1, -1):
+        x[i] = (a[i][n] - sum(a[i][c] * x[c] for c in range(i + 1, n))) / a[i][i]
+    return x
+
+
+def _fourier(weights, y, k: int) -> list[float] | None:
+    """Weighted least-squares fit of the 24 hourly values y to a mean plus k harmonics of the
+    daily cycle, evaluated back at each hour. Cyclic by construction — hour 23 flows into hour 0,
+    which a 3-point smoother can only approximate — and 2k+1 parameters for 24 buckets, so it
+    regresses the noise instead of interpolating it, with better-observed hours weighing more.
+
+    Interpolation (a polynomial through all 24 points) would be the wrong tool: it doesn't close
+    the cycle, oscillates (Runge) on noisy buckets, and can swing negative. Clamped at 0 anyway,
+    since a truncated series can undershoot."""
+    import math
+    n = 2 * k + 1
+
+    def basis(h):
+        b = [1.0]
+        for j in range(1, k + 1):
+            ang = 2 * math.pi * j * h / 24
+            b += [math.cos(ang), math.sin(ang)]
+        return b
+
+    rows = [basis(h) for h in range(24)]
+    a = [[0.0] * (n + 1) for _ in range(n)]
+    for h in range(24):
+        w = weights[h]
+        if w <= 0:
+            continue
+        for r in range(n):
+            for c in range(n):
+                a[r][c] += w * rows[h][r] * rows[h][c]
+            a[r][n] += w * rows[h][r] * y[h]
+    beta = _solve(a)
+    if beta is None:
+        return None
+    return [max(sum(b * v for b, v in zip(rows[h], beta, strict=True)), 0.0) for h in range(24)]
+
+
+def _day_weights(con, tz, now_utc, halflife_d):
     """{local date -> recency weight} for every day from the first logged request (capped at
     PROFILE_MAX_AGE_D) through today, plus the exposed hours of today. A day's weight decays
     with a PROFILE_HALFLIFE_D half-life, so the learned shape follows your current routine
@@ -956,12 +1063,12 @@ def _day_weights(con, tz, now_utc):
     out = {}
     while day <= now_local.date():
         age_d = (now_local.date() - day).days
-        out[day] = 0.5 ** (age_d / PROFILE_HALFLIFE_D)
+        out[day] = 0.5 ** (age_d / halflife_d)
         day += timedelta(days=1)
     return out, now_local.hour + 1  # hours of today already exposed
 
 
-def _hour_buckets_tokens(con, tz, now_utc):
+def _hour_buckets_tokens(con, tz, now_utc, halflife_d):
     """(hrs, pts, whrs, wpts) per local hour/weekday from token_log, or None when it can't
     support a shape. This is the good source: every assistant request carries its own precise
     timestamp, so an idle 4am is an *observed zero* rather than an unknown. Snapshot percents
@@ -971,7 +1078,7 @@ def _hour_buckets_tokens(con, tz, now_utc):
     Weight mixes fresh tokens with cache reads at 1/10 (a cached-heavy hour is real work but
     costs proportionally less quota). 'Exposure' (hrs) is one weighted hour per day covered,
     which is what makes an hour with no requests count as genuinely dead."""
-    days, today_hours = _day_weights(con, tz, now_utc)
+    days, today_hours = _day_weights(con, tz, now_utc, halflife_d)
     if len(days) < PROFILE_MIN_DAYS:
         return None
     hrs, pts = [0.0] * 24, [0.0] * 24
@@ -997,7 +1104,7 @@ def _hour_buckets_tokens(con, tz, now_utc):
     return (hrs, pts, whrs, wpts) if sum(pts) > 0 else None
 
 
-def _hour_buckets(con, tz, now_utc):
+def _hour_buckets(con, tz, now_utc, halflife_d):
     """Recency-weighted (observed_hours, consumed_pct) per local hour and per weekday, from
     *dense* consecutive weekly_all snapshot pairs. Fallback for when token_log is empty (no
     Claude Code transcripts scanned yet). Two rules make the histogram honest:
@@ -1023,7 +1130,7 @@ def _hour_buckets(con, tz, now_utc):
         if dt_h <= 0 or dt_h > PROFILE_PAIR_MAX_H or d < 0:  # d<0 = reset inside the gap
             continue
         rate = d / dt_h
-        w = 0.5 ** (((now_s - us1 / 1e6) / 86400.0) / PROFILE_HALFLIFE_D)
+        w = 0.5 ** (((now_s - us1 / 1e6) / 86400.0) / halflife_d)
         t = datetime.fromtimestamp(us0 / 1e6, tz)
         end = datetime.fromtimestamp(us1 / 1e6, tz)
         while t < end:  # a dense pair spans 1-2 buckets, so this loop is short
@@ -1076,6 +1183,8 @@ def _hour_profile(con, tz, as_of=None):
         return synthetic
     now_utc = as_of or datetime.now(UTC)
     now_s = datetime.now(UTC).timestamp()
+    par = _params(con)
+    halflife, harmonics = par["halflife_d"], int(par["harmonics"])
     # A replay caches per (tz, as_of hour): it walks thousands of past moments, and relearning
     # the shape for each one would dominate its runtime.
     ck = f"{tz}|{as_of:%Y%m%d%H}" if as_of else str(tz)
@@ -1083,12 +1192,12 @@ def _hour_profile(con, tz, as_of=None):
     if cached and cached[0] > now_s:
         return cached[1]
     try:
-        buckets = _hour_buckets_tokens(con, tz, now_utc)
+        buckets = _hour_buckets_tokens(con, tz, now_utc, halflife)
     except Exception:  # token_log absent (older database) -> snapshot fallback
         buckets = None
     observed_zeros = buckets is not None
     if buckets is None:
-        buckets = _hour_buckets(con, tz, now_utc)
+        buckets = _hour_buckets(con, tz, now_utc, halflife)
     hrs, pts, whrs, wpts = buckets
     total_h = sum(hrs)
     mean = sum(pts) / total_h if total_h > 0 else 0.0
@@ -1102,8 +1211,10 @@ def _hour_profile(con, tz, as_of=None):
             prior = _local_prior(raw, mean)
             est = [(pts[h] + PROFILE_PSEUDO_H * prior[h]) / (hrs[h] + PROFILE_PSEUDO_H)
                    if raw[h] is not None else prior[h] for h in range(24)]
-        smooth = [max(0.25 * est[(h - 1) % 24] + 0.5 * est[h] + 0.25 * est[(h + 1) % 24],
-                      PROFILE_FLOOR * mean) for h in range(24)]
+        fitted = _fourier(hrs, est, harmonics) if harmonics >= 1 else None
+        smooth = fitted or [0.25 * est[(h - 1) % 24] + 0.5 * est[h] + 0.25 * est[(h + 1) % 24]
+                            for h in range(24)]
+        smooth = [max(v, PROFILE_FLOOR * mean) for v in smooth]
         if quiet:  # an explicit statement beats an inference from sparse data
             smooth = [v * QUIET_MULT if h in quiet else v for h, v in enumerate(smooth)]
         dow = [min(max(((wpts[d] + PROFILE_PSEUDO_H * mean) / (whrs[d] + PROFILE_PSEUDO_H)) / mean,
@@ -1148,10 +1259,17 @@ def _project(con, pct, rate, rem_h, now_utc, tz, key=None, replay=False) -> tupl
             for a in [i * dt + dt / 2 for i in range(int(span / dt))]]
     past = sum(w * v for w, v in kern) / sum(w for w, _ in kern)
     k = rate / max(past, 0.25 * mean)
+    # blend < 1 keeps part of the flat rate. Short horizons have almost no shape to exploit, so
+    # the tuner can pull the profile's weight down where the backtest says it doesn't pay off.
+    lam = _params(con)["blend"]
+    if lam <= 0:
+        eta = (100 - pct) / rate if pct < 100 else None
+        return pct + rate * rem_h, (eta if eta is not None and eta < rem_h else None), ""
     acc, eta, t = 0.0, None, 0.0
     while t < rem_h:
         dt = min(0.25, rem_h - t)
-        acc += k * intensity(now_local + timedelta(hours=t + dt / 2)) * dt
+        shaped = k * intensity(now_local + timedelta(hours=t + dt / 2))
+        acc += (lam * shaped + (1 - lam) * rate) * dt
         t += dt
         if eta is None and pct < 100 and pct + acc >= 100:
             eta = t
@@ -1239,7 +1357,8 @@ def _backtest_rows(con, since):
         "GROUP BY 1, 2 ORDER BY 1, min(horizon_h)", [since]).fetchall()
 
 
-def _replay(con, tz, since, keys=("session", "weekly_all"), step=8, models=("active", "linear")):
+def _replay(con, tz, since, keys=("session", "weekly_all"), step=8, models=("active", "linear"),
+            until=None):
     """Rebuild past predictions from the snapshots we already have and score them, without
     waiting weeks for live forecasts to mature. For each sampled snapshot it recomputes the
     rate and the profile *as of that moment* (nothing later is visible), projects each horizon,
@@ -1254,8 +1373,12 @@ def _replay(con, tz, since, keys=("session", "weekly_all"), step=8, models=("act
                            "AND resets_at IS NOT NULL ORDER BY ts", [key, since]).fetchall()
         if len(rows) < 4:
             continue
-        by_ts = [(ts, pct) for ts, pct, _r in rows]
-        for i in range(0, len(rows), step):
+        stamps = [ts for ts, _p, _r in rows]
+        tol = timedelta(minutes=FORECAST_MATCH_MIN)
+        # `until` bounds the *predictions*, not the outcomes: a forecast made just before the
+        # cutoff is still scored against the snapshot that resolves it, as it would be live.
+        stop = bisect.bisect_right(stamps, until) if until else len(rows)
+        for i in range(0, stop, step):
             ts, pct, reset = rows[i]
             rem_h = (reset - ts).total_seconds() / 3600
             rate = _rate(con, key, as_of=ts)
@@ -1263,9 +1386,10 @@ def _replay(con, tz, since, keys=("session", "weekly_all"), step=8, models=("act
                 continue
             for h in [x for x in FORECAST_HORIZONS if x < rem_h] + [rem_h]:
                 target = ts + timedelta(hours=h)
-                # nearest later snapshot within the match window; None -> unscoreable
-                act = next(((t, p) for t, p in by_ts[i + 1:]
-                            if abs((t - target).total_seconds()) <= FORECAST_MATCH_MIN * 60), None)
+                # first snapshot within the match window of the target; None -> unscoreable.
+                # bisect, not a scan: the tuner replays this history once per candidate.
+                j = bisect.bisect_left(stamps, target - tol, i + 1)
+                act = (stamps[j], rows[j][1]) if j < len(rows) and stamps[j] <= target + tol else None
                 if act is None or act[1] < pct - 0.5:  # reset between prediction and target
                     continue
                 pred, _eta, src = _project(con, pct, rate, h, ts, tz, key, replay=True)
@@ -1306,6 +1430,88 @@ def backtest(args):
         return
     _print_backtest(rows, getattr(args, "json", False),
                     header=f"Live forecasts (resolved {resolved} new)")
+
+
+def _score(con, tz, since, until=None, step=12) -> tuple[int, float] | None:
+    """(n, MAE) of the active parameters over a replay slice, or None if nothing is scoreable."""
+    rows = [r for r in _replay(con, tz, since, step=step, models=("active",), until=until)]
+    n = sum(r[2] for r in rows)
+    return (n, sum(r[2] * r[3] for r in rows) / n) if n else None
+
+
+def tune(args):
+    """Grid-search the model parameters against the recorded history and persist the winner.
+
+    Fitted on the older part of the history and scored on the newer part — picking the
+    parameters that look best on the very data used to choose them is how you end up with a
+    model that only predicts the past. Refuses to write anything until PARAM_MIN_SCORED
+    predictions are scoreable, because a grid search over a few dozen points fits noise."""
+    con = _read_db()
+    if con is None:
+        sys.exit("No database yet — run 'cmon collect' a few times first.")
+    if getattr(args, "show", False):
+        cur, stored = _params(con), _meta_get(con, "model_params")
+        print("Active model parameters:")
+        for k in sorted(PARAM_DEFAULTS):
+            tag = "" if stored else "  (default)"
+            print(f"  {k:<11} {cur[k]:g}{tag}")
+        if stored:
+            print(f"\nTuned {stored[1] / 86400:.1f} days ago. 'cmon tune' re-fits, "
+                  "'cmon tune --reset' restores defaults.")
+        return
+    if getattr(args, "reset", False):
+        _set_params(con, dict(PARAM_DEFAULTS))
+        _meta_set(con, "model_params", json.dumps(PARAM_DEFAULTS))
+        print("✓ Model parameters restored to defaults.")
+        return
+    tz = _resolve_tz()
+    active = dict(_params(con))
+    span = con.execute("SELECT min(ts), max(ts) FROM snapshots WHERE key='session'").fetchone()
+    if not span or not span[0]:
+        sys.exit("No snapshots to tune on yet.")
+    first, last = span
+    split = first + (last - first) * 0.6  # 60% fit / 40% validate, in time order
+    baseline = _score(con, tz, split, step=TUNE_STEP)
+    if baseline is None or baseline[0] < PARAM_MIN_SCORED:
+        have = baseline[0] if baseline else 0
+        sys.exit(f"Not enough scoreable history to tune ({have} of {PARAM_MIN_SCORED} needed). "
+                 "Keep collecting — 'cmon backtest --replay' works meanwhile.")
+    combos = [{"halflife_d": hl, "harmonics": hm, "blend": bl}
+              for hl in PARAM_GRID["halflife_d"] for hm in PARAM_GRID["harmonics"]
+              for bl in PARAM_GRID["blend"]]
+    print(f"Fitting {len(combos)} candidates on {first:%Y-%m-%d} → {split:%Y-%m-%d}, "
+          f"validating on {split:%Y-%m-%d} → {last:%Y-%m-%d}…")
+    fitted = []
+    for i, c in enumerate(combos, 1):
+        _set_params(None, c)
+        s = _score(con, tz, first, until=split, step=TUNE_STEP)
+        if s:
+            fitted.append((s[1], c))
+        print(f"\r  {i}/{len(combos)}", end="", flush=True)
+    print()
+    if not fitted:
+        sys.exit("Nothing scoreable in the fitting window.")
+    fitted.sort(key=lambda x: x[0])
+    best_fit = fitted[0][1]
+    _set_params(None, best_fit)
+    val = _score(con, tz, split, step=TUNE_STEP)
+    _set_params(None, active)  # the incumbent is whatever is active now, not the defaults
+    cur = _score(con, tz, split, step=TUNE_STEP)
+    pstr = " ".join(f"{k}={v:g}" for k, v in best_fit.items())
+    print(f"\n  {'params':<34} {'fit MAE':>8} {'val MAE':>8}")
+    if cur:
+        print(f"  {'current':<34} {'':>8} {cur[1]:>8.2f}")
+    if val:
+        print(f"  {pstr:<34} {fitted[0][0]:>8.2f} {val[1]:>8.2f}")
+    # TUNE_MIN_GAIN keeps a coin-flip difference from being written as an improvement.
+    if not val or not cur or val[1] >= cur[1] - TUNE_MIN_GAIN:
+        _set_params(None, active)  # restore in-process only; nothing persisted, nothing lost
+        print("\nNo candidate beat the current parameters on unseen data — keeping them "
+              "unchanged. Expected until there's more history.")
+        return
+    _set_params(con, best_fit)
+    print(f"\n✓ Saved: {pstr}  (validation MAE {cur[1]:.2f} → {val[1]:.2f}). "
+          "'cmon tune --reset' undoes this.")
 
 
 def _print_backtest(rows, as_json: bool, header: str) -> None:
@@ -2281,6 +2487,9 @@ def main():
                      help="score the existing history instead of live forecasts: rebuilds each "
                           "past prediction from the data available back then (no waiting)")
     pbt.add_argument("--json", action="store_true", help="JSON output")
+    ptu = sub.add_parser("tune", help="fit the projection's parameters to your own history")
+    ptu.add_argument("--show", action="store_true", help="print the active parameters and exit")
+    ptu.add_argument("--reset", action="store_true", help="restore the built-in defaults")
     pin = sub.add_parser("install", help="schedule 'collect --alert' on OS scheduler (background collection)")
     pin.add_argument("-i", "--interval", type=int, default=20, help="minutes between collections (default 20)")
     pin.add_argument("--dry-run", action="store_true", help="show what it would do, don't install")
@@ -2327,7 +2536,8 @@ def main():
     try:
         {"now": now, "status": status, "trends": trends, "collect": collect,
          "burn": burn, "watch": watch, "wait": wait, "plot": plot,
-         "backtest": backtest, "install": install, "uninstall": uninstall}[args.cmd](args)
+         "backtest": backtest, "tune": tune, "install": install,
+         "uninstall": uninstall}[args.cmd](args)
     except FetchError as e:
         sys.exit(f"cmon: {e}")
 

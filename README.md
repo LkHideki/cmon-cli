@@ -78,8 +78,19 @@ cmon config clear timezone                    # remove it (or: cmon config clear
 ```
 
 Applies to displayed timestamps (`watch`, `trends`, `burn`); stored data and internal
-calculations stay in UTC. `timezone` is the only preference today; the mechanism is
-built to grow (`CONFIG_KEYS` in `cmon.py`).
+calculations stay in UTC.
+
+**`quiet_hours`** declares the local hours you don't work, so projections never spend them:
+
+```bash
+cmon config set quiet_hours 2-7      # ranges may wrap midnight ('23-2'), or list hours ('0-6,13')
+```
+
+It's a deterministic backstop — it applies from the first run, before there's enough history to
+learn a profile, and overrides the learned shape where the two disagree. Usually you don't need it:
+with Claude Code transcripts available, cmon learns your real quiet hours on its own (see
+[`cmon now`](#cmon-now--current-usage--pacing)). Both preferences are validated on `set`;
+`CMON_QUIET_HOURS` overrides without persisting.
 
 ## Usage
 
@@ -92,6 +103,8 @@ uv run cmon collect   # save 1 snapshot to database (with UTC timestamp)
 uv run cmon trends    # consumption history: per-label summary + per-cycle peaks/anomaly
 uv run cmon burn      # tokens & estimated US$ (from local Claude Code logs)
 uv run cmon plot      # charts -> usage.png
+uv run cmon backtest  # how accurate past projections were (--replay scores existing history)
+uv run cmon tune      # fit the projection's parameters to your own history
 uv run cmon install   # schedule background collection in OS scheduler
 ```
 
@@ -252,15 +265,70 @@ The rate cuts at the last reset (so it adapts to 5h, 7d, or 72h windows — Anth
 snapshots count more (half-life ~1h for the 5h window, ~12h weekly), so the projection tracks your
 current pace rather than a flat cycle average.
 
-The projection itself is **profile-weighted**, not linear: from your snapshot history cmon learns
-when you actually use Claude (24 local-hour buckets × a weekday multiplier) and integrates that
-intensity over the hours left until reset, anchored to the current rate — so a projection taken at
-22h doesn't assume you'll keep burning through the night, and one taken mid-afternoon accounts for
-the busy evening ahead. Until there's ~2 days of history it falls back to the linear
-`rate × remaining hours`; `watch`, `now`, `--advice`, and the rate-based alerts all share it
-(marked *profile-weighted* when active). Finally, `--advice` sends the
+The projection itself is **profile-weighted**, not linear: cmon learns when you actually use Claude
+(24 local-hour buckets × a weekday multiplier) and integrates that intensity over the hours left
+until reset, anchored to the current rate — so a projection taken at 22h doesn't assume you'll keep
+burning through the night, and one taken mid-afternoon accounts for the busy evening ahead. On real
+data, a 23h projection with 8h to reset drops from 90% (linear) to 69%.
+
+The shape is learned from **request timestamps** in your Claude Code transcripts (the same
+`token_log` that powers `burn`), because there an hour with no requests is an *observed zero*.
+Snapshot percents can't say that: they move in whole points, and the gap between two of them says
+nothing about *when* inside it the work happened — spreading a delta evenly across a 20h gap is
+what used to credit 3am with your afternoon's usage. Recency decays with a half-life, so the shape
+follows your current routine instead of jumping when a day leaves a fixed window. Without
+transcripts it falls back to dense snapshot pairs, then to `quiet_hours`, then to linear;
+`watch`, `now`, `--advice`, and the rate-based alerts all share it (marked *profile-weighted* when
+active). See [`cmon backtest`](#cmon-backtest--is-the-projection-any-good) for how well it does.
+Finally, `--advice` sends the
 numbers to **Claude Sonnet** (`claude -p`, cheap) for 3 actionable tips; use `--no-ai` for local
 projections only, no quota cost.
+
+### `cmon backtest` — is the projection any good?
+
+Every projection is logged with its horizon and settled against reality once that time passes, so
+the model can be checked instead of trusted. `cmon backtest` scores the result — MAE in percentage
+points, plus the bias (positive = projecting too high) — for the active model and for the plain
+linear baseline, which is the only way to tell whether the profile earns its complexity:
+
+```bash
+cmon backtest              # score the forecasts recorded so far
+cmon backtest --replay     # score your existing history right now, no waiting
+```
+
+`--replay` rebuilds each past prediction from the data that existed *at that moment* — the rate and
+the profile are both recomputed with everything later hidden — so it can't flatter itself with
+hindsight. On a 6-week history:
+
+```
+  model        horizon       n     MAE    bias
+  learned      <=1h       3540    4.38   +1.95
+  learned      1-6h       3785    9.73   +2.72
+  learned      >6h         807   11.31   -6.87
+  linear       <=1h       3540    4.31   +1.92
+  linear       1-6h       3785    9.69   +2.26
+  linear       >6h         807   14.15   -2.75
+```
+
+The profile pays off where it should — long horizons, the ones that cross a night — and is a tie
+one hour out, where there's no shape to exploit. This measurement is also what caught a real bug in
+the anchor (see the CHANGELOG).
+
+### `cmon tune` — fit the model to your own history
+
+```bash
+cmon tune --show     # active parameters
+cmon tune            # grid-search and persist the winner
+cmon tune --reset    # back to defaults
+```
+
+Three parameters (recency half-life, number of Fourier harmonics used to smooth the daily cycle,
+and how much of the profile to trust versus the flat rate) are fitted on the older part of your
+history and scored on the newer part — never on the data used to choose them. It **refuses to save
+anything** unless the winner beats the current parameters on that unseen slice, and unless there
+are at least 200 scoreable predictions; a grid search over a few dozen points fits noise, not your
+routine. The result is three numbers stored as a single small JSON row in the database, next to the
+history they were fitted on.
 
 ## Continuous collection
 
