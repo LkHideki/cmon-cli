@@ -5,7 +5,7 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.0] — 2026-08-17
 
 ### Added
 
@@ -58,6 +58,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   (worse than linear's 14.15) to MAE 11.31 — now clearly better than linear.
 - Recency now decays with a half-life instead of a hard cutoff, so the learned shape drifts with
   your routine rather than jumping when a day falls out of a fixed window.
+- The daily cycle can now be smoothed by a **weighted Fourier fit** (2–3 harmonics) instead of the
+  3-point circular smoother — cyclic by construction, so hour 23 flows into hour 0, and only 5–7
+  parameters for 24 buckets, which regresses noise instead of interpolating it. Off by default
+  until `cmon tune` finds evidence for it. (Polynomial interpolation was considered and rejected:
+  it doesn't close the cycle, oscillates on noisy buckets, and can go negative.)
+- Replay and tuning memoize past rates and locate matching snapshots by bisection, roughly halving
+  the cost per tuning candidate.
 
 ## [0.1.4] — 2026-07-08
 
