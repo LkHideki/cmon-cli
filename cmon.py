@@ -2237,6 +2237,7 @@ def watch(args):
     con = db()  # writable: records each read (deduped), plus _rate and burn from logs
     tz = _resolve_tz()  # resolved once, before Live(screen=True) takes over — any invalid-tz
                        # warning must print here, never inside render() (would corrupt the TUI)
+    show_bar = getattr(args, "usage", False)
     base = float(args.interval)
     cur = base  # adaptive poll interval: grows on 403/errors, eases back on sustained success
     learned = _meta_get(con, "watch_interval")
@@ -2258,8 +2259,9 @@ def watch(args):
                          title="cmon watch — error", border_style="red"), False
         now_utc = datetime.now(UTC)
         t = Table(expand=True, header_style="bold")
-        t.add_column("Window")
-        t.add_column("Usage", ratio=1)
+        t.add_column("Window", ratio=None if show_bar else 1)
+        if show_bar:
+            t.add_column("Usage", ratio=1)
         t.add_column("%", justify="right")
         t.add_column("resets in", justify="right")
         t.add_column("rate", justify="right")
@@ -2274,10 +2276,12 @@ def watch(args):
                 p, _eta, src = _project(con, pct, rate, rem_h, now_utc, tz, key)
                 proj_src = proj_src or src
                 proj = f"{min(p, 999):.0f}%"
-            t.add_row(lbl + (" ●" if act else ""),
-                      Text(bar(pct, 28), style=color(pct)),
-                      f"{pct:.0f}", fmt_eta(reset),
-                      f"{rate:.1f}%/h" if rate else "-", proj)
+            cells = [lbl + (" ●" if act else "")]
+            if show_bar:
+                cells += [Text(bar(pct, 28), style=color(pct)), f"{pct:.0f}"]
+            else:  # without the bar the % cell carries the color cue
+                cells.append(Text(f"{pct:.0f}", style=color(pct), justify="right"))
+            t.add_row(*cells, fmt_eta(reset), f"{rate:.1f}%/h" if rate else "-", proj)
         body = [t]
         if note := PROJ_NOTE_WATCH.get(proj_src):
             body.append(Text(note, style="dim"))
@@ -2506,6 +2510,7 @@ def main():
                          "(CMON_ALERT_LEAD / CMON_ALERT_LEAD_WEEKLY min)")
     pw = sub.add_parser("watch", help="live TUI with current usage, recording each read (Ctrl-C quits)")
     pw.add_argument("-n", "--interval", type=int, default=75, help="seconds between updates (default 75)")
+    pw.add_argument("-u", "--usage", action="store_true", help="show the Usage bar column")
     pwa = sub.add_parser("wait", help="block until window resets (or --at N%%), then notify")
     pwa.add_argument("--window", default="session", help="window to watch (default session = 5h; e.g., weekly_all)")
     pwa.add_argument("--at", type=float, help="instead of reset, wait for usage to reach N%%")

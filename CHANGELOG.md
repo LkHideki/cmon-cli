@@ -5,6 +5,14 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **`cmon watch` hides the Usage bar column by default** — the compact table keeps Window, %,
+  resets in, rate, and projection, with the green/yellow/red cue moved onto the % cell.
+  `-u/--usage` restores the bar chart.
+
 ## [0.3.0] — 2026-08-30
 
 ### Changed

@@ -196,14 +196,15 @@ ignore — real consumption is under `Opus`/`Sonnet`/`Haiku`/`Fable`.
 
 ### `cmon watch` — live TUI
 
-Self-updating dashboard: colored bars by window (green/yellow/red), rate `%/h`,
+Self-updating dashboard: percent colored by window (green/yellow/red), rate `%/h`,
 projection at reset, and alerts when you'll hit 100% before reset. Great to leave open
 in a corner of the terminal. Each read is recorded to the database (deduped), so leaving
-`watch` open also builds history.
+`watch` open also builds history. `-u/--usage` adds a bar-chart column.
 
 ```bash
 uv run cmon watch                 # ~30s, self-tuning
 uv run cmon watch -n 10           # start at ~10s
+uv run cmon watch -u              # with the Usage bar column
 ```
 
 If claude.ai's Cloudflare starts returning **403** (bot-detection on the fixed polling
