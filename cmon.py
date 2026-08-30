@@ -22,6 +22,7 @@ CLAUDE_OAUTH_TOKEN returns 401, cmon refreshes and uses the new one anyway.
 import argparse
 import bisect
 import getpass
+import itertools
 import json
 import os
 import subprocess
@@ -62,6 +63,7 @@ PROFILE_MIN_BUCKETS = int(os.environ.get("CMON_PROFILE_MIN_BUCKETS", "8"))    # 
 PROFILE_MIN_BUCKET_H = 0.5   # below this an hour bucket is "unobserved" (one noisy sample)
 PROFILE_PSEUDO_H = 1.0       # shrinkage strength toward the local prior, in observed-hour units
 PROFILE_FLOOR = 0.02         # no hour is ever exactly 0 intensity (kills divide-by-zero anchors)
+PROFILE_ACTIVE_FRAC = 0.05   # a day-hour is "active" above this fraction of the mean intensity
 QUIET_MULT = 0.05            # intensity multiplier inside declared quiet hours
 # Forecast logging (see _log_forecasts / backtest): predictions are stored so they can be
 # scored against reality later. Kept cheap — one write per interval, pruned by age.
@@ -75,9 +77,12 @@ FORECAST_KEEP_D = int(os.environ.get("CMON_FORECAST_KEEP_D", "60"))  # retention
 #   halflife_d — recency half-life of the learned shape, in days
 #   harmonics  — 0 = 3-point circular smoothing; 2-3 = weighted Fourier fit of the daily cycle
 #   blend      — how much of the profile to trust vs the flat rate (1 = all profile, 0 = linear)
-PARAM_DEFAULTS = {"halflife_d": 10.0, "harmonics": 0.0, "blend": 1.0}
+#   robust     — damp rarely-used hours: est × occupancy^robust, occupancy = recency-weighted
+#                share of days with real activity in that hour (0 = plain mean). A single 4am
+#                burst night stops crediting every future 4am with burst-level intensity.
+PARAM_DEFAULTS = {"halflife_d": 10.0, "harmonics": 0.0, "blend": 1.0, "robust": 0.5}
 PARAM_GRID = {"halflife_d": [5.0, 10.0, 21.0], "harmonics": [0.0, 2.0, 3.0],
-              "blend": [0.0, 0.5, 1.0]}
+              "blend": [0.0, 0.5, 1.0], "robust": [0.0, 0.5, 1.0]}
 TUNE_STEP = 24  # subsample the history when tuning: 27 candidates x a full replay is minutes
 TUNE_MIN_GAIN = 0.05  # MAE points a candidate must win by before it's worth persisting
 PARAM_MIN_SCORED = int(os.environ.get("CMON_TUNE_MIN_SCORED", "200"))  # per-band evidence needed
@@ -1069,7 +1074,7 @@ def _day_weights(con, tz, now_utc, halflife_d):
 
 
 def _hour_buckets_tokens(con, tz, now_utc, halflife_d):
-    """(hrs, pts, whrs, wpts) per local hour/weekday from token_log, or None when it can't
+    """(hrs, pts, whrs, wpts, act) per local hour/weekday from token_log, or None when it can't
     support a shape. This is the good source: every assistant request carries its own precise
     timestamp, so an idle 4am is an *observed zero* rather than an unknown. Snapshot percents
     can't do that — they only move in whole points and a gap between two of them says nothing
@@ -1077,12 +1082,16 @@ def _hour_buckets_tokens(con, tz, now_utc, halflife_d):
 
     Weight mixes fresh tokens with cache reads at 1/10 (a cached-heavy hour is real work but
     costs proportionally less quota). 'Exposure' (hrs) is one weighted hour per day covered,
-    which is what makes an hour with no requests count as genuinely dead."""
+    which is what makes an hour with no requests count as genuinely dead. act[h] is the weighted
+    exposure of days with *real* activity in that hour (above PROFILE_ACTIVE_FRAC of the mean,
+    so a stray heartbeat request doesn't count) — act[h]/hrs[h] is the occupancy the `robust`
+    parameter raises to damp rarely-used hours."""
     days, today_hours = _day_weights(con, tz, now_utc, halflife_d)
     if len(days) < PROFILE_MIN_DAYS:
         return None
     hrs, pts = [0.0] * 24, [0.0] * 24
     whrs, wpts = [0.0] * 7, [0.0] * 7
+    act = [0.0] * 24
     for day, w in days.items():
         exposed = range(today_hours) if day == max(days) else range(24)
         for h in exposed:
@@ -1101,7 +1110,13 @@ def _hour_buckets_tokens(con, tz, now_utc, halflife_d):
             continue
         pts[hour] += w * float(tok)
         wpts[day.weekday()] += w * float(tok)
-    return (hrs, pts, whrs, wpts) if sum(pts) > 0 else None
+    total_h = sum(hrs)
+    mean = sum(pts) / total_h if total_h > 0 else 0.0
+    for day, hour, tok in rows:
+        w = days.get(day)
+        if w is not None and tok and float(tok) >= PROFILE_ACTIVE_FRAC * mean:
+            act[hour] += w
+    return (hrs, pts, whrs, wpts, act) if sum(pts) > 0 else None
 
 
 def _hour_buckets(con, tz, now_utc, halflife_d):
@@ -1196,8 +1211,11 @@ def _hour_profile(con, tz, as_of=None):
     except Exception:  # token_log absent (older database) -> snapshot fallback
         buckets = None
     observed_zeros = buckets is not None
+    act = None
     if buckets is None:
         buckets = _hour_buckets(con, tz, now_utc, halflife)
+    else:
+        *buckets, act = buckets
     hrs, pts, whrs, wpts = buckets
     total_h = sum(hrs)
     mean = sum(pts) / total_h if total_h > 0 else 0.0
@@ -1207,6 +1225,13 @@ def _hour_profile(con, tz, as_of=None):
         raw = [pts[h] / hrs[h] if hrs[h] >= PROFILE_MIN_BUCKET_H else None for h in range(24)]
         if observed_zeros:
             est = [v if v is not None else 0.0 for v in raw]
+            # The mean over-credits rare bursts: one heavy 4am among idle nights leaves every
+            # future 4am carrying burst/n intensity. Raising occupancy (how *often* the hour is
+            # active, not how hard) damps rarely-used hours toward dead while leaving the shape
+            # of habitual hours to the mean. robust=0 turns this off.
+            if act is not None and par["robust"] > 0:
+                est = [e * (act[h] / hrs[h]) ** par["robust"] if hrs[h] > 0 else e
+                       for h, e in enumerate(est)]
         else:  # interval-censored: an unobserved hour inherits its neighbours, not the mean
             prior = _local_prior(raw, mean)
             est = [(pts[h] + PROFILE_PSEUDO_H * prior[h]) / (hrs[h] + PROFILE_PSEUDO_H)
@@ -1219,7 +1244,11 @@ def _hour_profile(con, tz, as_of=None):
             smooth = [v * QUIET_MULT if h in quiet else v for h, v in enumerate(smooth)]
         dow = [min(max(((wpts[d] + PROFILE_PSEUDO_H * mean) / (whrs[d] + PROFILE_PSEUDO_H)) / mean,
                        0.25), 4.0) if whrs[d] >= 2 else 1.0 for d in range(7)]
-        prof = (smooth, dow, mean, "learned")
+        # The returned mean must describe the *returned* shape: occupancy damping shrinks the
+        # profile as a whole, and _project floors its anchor at 0.25×mean — an undamped mean
+        # there would cap k and quietly deflate every projection.
+        mean_out = sum(smooth[h] * hrs[h] for h in range(24)) / total_h
+        prof = (smooth, dow, mean_out if mean_out > 0 else mean, "learned")
     _profile_cache[ck] = (now_s + 900, prof)
     return prof
 
@@ -1476,9 +1505,9 @@ def tune(args):
         have = baseline[0] if baseline else 0
         sys.exit(f"Not enough scoreable history to tune ({have} of {PARAM_MIN_SCORED} needed). "
                  "Keep collecting — 'cmon backtest --replay' works meanwhile.")
-    combos = [{"halflife_d": hl, "harmonics": hm, "blend": bl}
-              for hl in PARAM_GRID["halflife_d"] for hm in PARAM_GRID["harmonics"]
-              for bl in PARAM_GRID["blend"]]
+    keys = sorted(PARAM_GRID)
+    combos = [dict(zip(keys, vals, strict=True))
+              for vals in itertools.product(*(PARAM_GRID[k] for k in keys))]
     print(f"Fitting {len(combos)} candidates on {first:%Y-%m-%d} → {split:%Y-%m-%d}, "
           f"validating on {split:%Y-%m-%d} → {last:%Y-%m-%d}…")
     fitted = []
