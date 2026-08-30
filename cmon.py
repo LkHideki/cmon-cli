@@ -90,8 +90,8 @@ PARAM_MIN_SCORED = int(os.environ.get("CMON_TUNE_MIN_SCORED", "200"))  # per-ban
 PROJ_NOTE = {"learned": " (weighted by your usage profile)",
              "quiet_hours": " (skipping your quiet hours)"}
 PROJ_NOTE_SHORT = {"learned": " (profile-weighted)", "quiet_hours": " (quiet hours skipped)"}
-PROJ_NOTE_WATCH = {"learned": "projection weighted by your hourly/weekday usage profile",
-                   "quiet_hours": "projection skips your configured quiet hours"}
+PROJ_NOTE_WATCH = {"learned": "projection: profile-weighted",
+                   "quiet_hours": "projection: skips quiet hours"}
 # Claude Code OAuth — public values from login flow; used only for token renewal.
 OAUTH_CLIENT_ID = os.environ.get("CMON_OAUTH_CLIENT_ID", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
 OAUTH_TOKEN_URL = os.environ.get("CMON_OAUTH_TOKEN_URL", "https://console.anthropic.com/v1/oauth/token")
@@ -1576,8 +1576,7 @@ def _alerts(rows, con, tz=None) -> list[str]:
             continue
         _proj, eta, _w = _project(con, pct, rate, rem_h, now_utc, tz, key)
         if eta is not None:
-            msgs.append(f"{lbl}: at rate {rate:.1f}%/h hits 100% in ~{eta:.1f}h "
-                        f"(~{rem_h - eta:.1f}h before reset).")
+            msgs.append(f"{lbl}: 100% in ~{eta:.1f}h (~{rem_h - eta:.1f}h before reset)")
     return msgs
 
 
@@ -1996,7 +1995,7 @@ def _price(model: str):
 
 def _short_model(model: str) -> str:
     m = (model or "").lower()
-    for k in ("opus", "sonnet", "haiku"):
+    for k in ("opus", "sonnet", "haiku", "fable", "mythos"):
         if k in m:
             return k.capitalize()
     return model or "?"
@@ -2251,12 +2250,18 @@ def watch(args):
     def color(pct: float) -> str:
         return "red" if pct >= 90 else "yellow" if pct >= 70 else "green"
 
-    def render():
-        try:
-            rows, _ts = _snapshot(con)  # persists each read (deduped) via watch's own con
-        except FetchError as e:
-            return Panel(Text(f"{e}\nbacking off — next try in ~{cur:.0f}s", style="red"),
-                         title="cmon watch — error", border_style="red"), False
+    def render(cached=None):
+        """cached=(rows, age_s) renders the last known snapshot without touching the network —
+        the instant first frame; the fetch happens on the next loop pass. The endpoint can take
+        30s+ (timeout+retry), and before this the terminal stayed blank the whole time."""
+        if cached is None:
+            try:
+                rows, _ts = _snapshot(con)  # persists each read (deduped) via watch's own con
+            except FetchError as e:
+                return Panel(Text(f"{e}\nbacking off — next try in ~{cur:.0f}s", style="red"),
+                             title="cmon watch — error", border_style="red"), False
+        else:
+            rows = cached[0]
         now_utc = datetime.now(UTC)
         t = Table(expand=True, header_style="bold")
         t.add_column("Window", ratio=None if show_bar else 1)
@@ -2285,6 +2290,11 @@ def watch(args):
         body = [t]
         if note := PROJ_NOTE_WATCH.get(proj_src):
             body.append(Text(note, style="dim"))
+        now_local = now_utc.astimezone(tz)
+        if cached is not None:  # no scan/burn/alerts on the cached frame: keep it instant
+            body.append(Text(f"{now_local:%H:%M:%S} · cached {cached[1]:.0f}s ago · updating…",
+                             style="dim"))
+            return Panel(Group(*body), title="cmon watch", border_style="cyan"), True
         win = _session_window_start(rows, now_utc)
         scan_logs(con, since=win, quiet=True)
         _log_forecasts(con, rows, tz, now_utc)  # deduped internally to FORECAST_EVERY_S
@@ -2292,22 +2302,23 @@ def watch(args):
         bs = _burn_summary(_burn_rows(con, win))
         if bs:
             tok, cost, mix = bs
-            body.append(Text(f"burn this 5h window (logs): {tok / 1e6:.2f}M tok · US$ {cost:.2f} · {mix}",
+            body.append(Text(f"burn 5h (logs): {tok / 1e6:.2f}M tok · $ {cost:.2f} · {mix}",
                              style="cyan"))
         alerts = _alerts(rows, con, tz)
         if alerts:
             body.append(Text("\n".join("⚠ " + m for m in alerts), style="bold red"))
-        now_local = now_utc.astimezone(tz)
-        body.append(Text(f"{now_local:%H:%M:%S %Z} · every ~{cur:.0f}s"
-                         " · recording · Ctrl-C quits", style="dim"))
+        body.append(Text(f"{now_local:%H:%M:%S} · ~{cur:.0f}s · recording · ^C quits",
+                         style="dim"))
         return Panel(Group(*body), title="cmon watch", border_style="cyan"), True
 
-    panel, _ok = render()
+    got = _read_cache()
+    if got and got[1] < 600:  # fresh enough to be an honest first frame
+        panel, _ok = render(cached=got)
+    else:
+        panel = Panel(Text("connecting…", style="dim"), title="cmon watch", border_style="cyan")
     with Live(panel, console=Console(), screen=True, refresh_per_second=4) as live:
         try:
             while True:
-                # jitter breaks the exact robotic cadence Cloudflare bot-detection flags
-                time.sleep(cur * random.uniform(0.85, 1.15))
                 panel, ok = render()
                 live.update(panel)
                 if ok:
@@ -2320,6 +2331,8 @@ def watch(args):
                     cur = min(cur * 1.8, 300.0)
                     ok_streak = 0
                     _meta_set(con, "watch_interval", str(cur))
+                # jitter breaks the exact robotic cadence Cloudflare bot-detection flags
+                time.sleep(cur * random.uniform(0.85, 1.15))
         except KeyboardInterrupt:
             pass
 
