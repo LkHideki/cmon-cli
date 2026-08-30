@@ -276,7 +276,10 @@ The shape is learned from **request timestamps** in your Claude Code transcripts
 Snapshot percents can't say that: they move in whole points, and the gap between two of them says
 nothing about *when* inside it the work happened — spreading a delta evenly across a 20h gap is
 what used to credit 3am with your afternoon's usage. Recency decays with a half-life, so the shape
-follows your current routine instead of jumping when a day leaves a fixed window. Without
+follows your current routine instead of jumping when a day leaves a fixed window. Hours you rarely
+use are additionally **damped by occupancy** — how often the hour sees real activity, not how hard
+its rare bursts were — so one heavy 4am doesn't leave every future 4am projected at burst-level
+intensity (the mean alone would keep a third of that burst there forever). Without
 transcripts it falls back to dense snapshot pairs, then to `quiet_hours`, then to linear;
 `watch`, `now`, `--advice`, and the rate-based alerts all share it (marked *profile-weighted* when
 active). See [`cmon backtest`](#cmon-backtest--is-the-projection-any-good) for how well it does.
@@ -322,13 +325,13 @@ cmon tune            # grid-search and persist the winner
 cmon tune --reset    # back to defaults
 ```
 
-Three parameters (recency half-life, number of Fourier harmonics used to smooth the daily cycle,
-and how much of the profile to trust versus the flat rate) are fitted on the older part of your
-history and scored on the newer part — never on the data used to choose them. It **refuses to save
-anything** unless the winner beats the current parameters on that unseen slice, and unless there
-are at least 200 scoreable predictions; a grid search over a few dozen points fits noise, not your
-routine. The result is three numbers stored as a single small JSON row in the database, next to the
-history they were fitted on.
+Four parameters (recency half-life, number of Fourier harmonics used to smooth the daily cycle,
+how much of the profile to trust versus the flat rate, and how hard to damp rarely-used hours by
+occupancy) are fitted on the older part of your history and scored on the newer part — never on
+the data used to choose them. It **refuses to save anything** unless the winner beats the current
+parameters on that unseen slice, and unless there are at least 200 scoreable predictions; a grid
+search over a few dozen points fits noise, not your routine. The result is four numbers stored as
+a single small JSON row in the database, next to the history they were fitted on.
 
 ## Continuous collection
 

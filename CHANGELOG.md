@@ -5,6 +5,23 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **Rarely-used hours weigh less in the projection.** The hourly shape was a recency-weighted
+  mean, so one heavy 4am among weeks of idle nights left every future 4am carrying burst/n
+  intensity — the projection kept spending the madrugada at a rate that almost never happens.
+  Each hour's estimate is now multiplied by `occupancy^robust`, where occupancy is the
+  recency-weighted share of days with real activity in that hour (above 5% of the mean, so a
+  stray heartbeat request doesn't count) and `robust` is a fourth tunable parameter
+  (default 0.5, grid 0/0.5/1) fitted by `cmon tune` like the others. On real data 01h drops
+  0.24x→0.14x of the mean and 02–05h to ~0.03x, while habitual daytime hours rise ~9% through
+  the anchor renormalization; replay MAE is unchanged in aggregate (≤1h improves 3.25→3.12).
+  Applies to the `token_log` source only — the snapshot fallback can't observe occupancy — and
+  the profile's returned mean is recomputed from the damped shape so `_project`'s 0.25×mean
+  anchor floor keeps its meaning.
+
 ## [0.2.0] — 2026-08-17
 
 ### Added
