@@ -5,6 +5,24 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] — 2026-08-30
+
+### Fixed
+
+- **`cmon watch` no longer starts on a blank terminal.** The first render ran the whole
+  pipeline — network fetch (30s timeout + retry; measured 43.8s on a slow night), transcript
+  scan, forecasts — before the TUI ever painted. The first frame now comes instantly from the
+  local snapshot cache when it's under 10 minutes old (marked *cached Ns ago · updating…*),
+  or from a *connecting…* panel; the fetch happens inside the loop.
+
+### Changed
+
+- **Succinct `watch` footer lines** for narrow terminals: *projection: profile-weighted*,
+  *burn 5h (logs): … · $ …*, alerts without the rate (it's already in the table), status line
+  without timezone/"every"/"Ctrl-".
+- Model mix shortens Fable/Mythos ids (*Fable 100%* instead of *claude-fable-5 100%*), in
+  `watch` and `burn`.
+
 ## [0.4.0] — 2026-08-30
 
 ### Changed
