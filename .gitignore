@@ -18,6 +18,7 @@ wheels/
 .venv
 .ruff_cache
 .mypy_cache
+.codegraph/
 
 # Security/performance audit reports (local only)
 secperf-*.md
