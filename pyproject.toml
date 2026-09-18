@@ -51,7 +51,7 @@ Repository = "https://github.com/LkHideki/cmon"
 Issues = "https://github.com/LkHideki/cmon/issues"
 
 [dependency-groups]
-dev = ["ruff>=0.6"]
+dev = ["pytest>=8.3", "ruff>=0.6"]
 
 [tool.hatch.build.targets.wheel]
 only-include = ["cmon.py"]

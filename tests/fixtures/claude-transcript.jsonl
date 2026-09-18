@@ -1,0 +1,3 @@
+{"type":"progress","timestamp":"2030-01-01T10:00:00Z"}
+{"type":"assistant","uuid":"fixture-claude-turn-001","timestamp":"2030-01-01T10:00:01Z","cwd":"/fixture/alpha","sessionId":"fixture-claude-session-a","entrypoint":"cli","message":{"model":"claude-sonnet-fixture","usage":{"input_tokens":1000000,"output_tokens":100000,"cache_read_input_tokens":2000000,"cache_creation_input_tokens":50000}}}
+{"type":"assistant","uuid":"fixture-claude-turn-002","timestamp":"2030-01-01T10:30:01Z","cwd":"/fixture/beta","sessionId":"fixture-claude-session-b","entrypoint":"claude-vscode","message":{"model":"claude-opus-fixture","usage":{"input_tokens":500000,"output_tokens":50000,"cache_read_input_tokens":1000000,"cache_creation_input_tokens":20000}}}

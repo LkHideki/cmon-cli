@@ -1,0 +1,4 @@
+{"timestamp":"2030-01-01T11:00:00Z","type":"session_meta","payload":{"id":"fixture-codex-session-a","cwd":"/fixture/gamma"}}
+{"timestamp":"2030-01-01T11:00:01Z","type":"turn_context","payload":{"turn_id":"fixture-codex-turn-001","model":"codex-fixture","effort":"medium"}}
+{"timestamp":"2030-01-01T11:00:02Z","type":"token_usage_record","payload":{"turn_id":"fixture-codex-turn-001","response_id":"fixture-response-001","turn_token_usage":{"input_tokens":1000,"cached_input_tokens":600,"output_tokens":100,"reasoning_output_tokens":40}}}
+{"timestamp":"2030-01-01T11:00:03Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","plan_type":"fixture","primary":{"used_percent":12.0,"window_minutes":300,"resets_at":1893495600},"secondary":{"used_percent":34.0,"window_minutes":10080,"resets_at":1894060800}}}}
