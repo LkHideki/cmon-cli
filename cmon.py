@@ -22,13 +22,20 @@ CLAUDE_OAUTH_TOKEN returns 401, cmon refreshes and uses the new one anyway.
 import argparse
 import bisect
 import getpass
+import hashlib
 import itertools
 import json
+import math
 import os
 import subprocess
 import sys
+import tempfile
 from collections import namedtuple
+from collections.abc import Collection, Iterable, Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
+from typing import Protocol, runtime_checkable
 
 # One cycle of a window's snapshots (segmented at each reset). Native replacement
 # for the pandas DataFrame slices _cycles() used to return: .ts is a list of
@@ -95,6 +102,206 @@ PROJ_NOTE_WATCH = {"learned": "projection: profile-weighted",
 # Claude Code OAuth — public values from login flow; used only for token renewal.
 OAUTH_CLIENT_ID = os.environ.get("CMON_OAUTH_CLIENT_ID", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
 OAUTH_TOKEN_URL = os.environ.get("CMON_OAUTH_TOKEN_URL", "https://console.anthropic.com/v1/oauth/token")
+
+PROVIDER_ORDER = ("claude", "codex")
+SCHEMA_VERSION = 1
+_DATETIME_TYPE = datetime  # stable even when tests/applications inject a clock via cmon.datetime
+
+
+class ProviderCapability(StrEnum):
+    """A provider's independently discoverable data surfaces."""
+
+    QUOTA = "quota"
+    TOKENS = "tokens"
+    HISTORY = "history"
+
+
+class WindowRole(StrEnum):
+    """Public role of a quota window; provider-local keys remain separate."""
+
+    FIVE_HOUR = "5h"
+    WEEKLY = "weekly"
+
+
+class ProviderError(Exception):
+    """Base provider failure that can be reported without terminating the process."""
+
+    def __init__(self, provider: str, message: str):
+        self.provider = provider
+        self.message = message
+        super().__init__(f"{provider}: {message}")
+
+
+class ProviderUnavailable(ProviderError):
+    """The requested provider/capability is not available in the current environment."""
+
+
+class MigrationError(RuntimeError):
+    """The database schema could not be upgraded atomically."""
+
+
+def _aware_utc(value: datetime, name: str) -> datetime:
+    if not isinstance(value, _DATETIME_TYPE) or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{name} must be a timezone-aware datetime")
+    return value.astimezone(UTC)
+
+
+def _nonnegative_int(value: int, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
+
+
+def _identity_text(value: str, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    return value.strip()
+
+
+def _provider_name(value: str) -> str:
+    provider = _identity_text(value, "provider")
+    if provider not in PROVIDER_ORDER:
+        raise ValueError(f"provider must be one of {', '.join(PROVIDER_ORDER)}")
+    return provider
+
+
+@dataclass(frozen=True, slots=True)
+class UsageLimit:
+    """Provider-neutral quota observation.
+
+    ``key`` is local to ``provider``; callers must use the pair as its identity.  The source
+    timestamp drives history/staleness and the ingestion timestamp is audit metadata only.
+    """
+
+    provider: str
+    key: str
+    role: WindowRole
+    label: str
+    percent: float
+    window_minutes: int
+    observed_at: datetime
+    ingested_at: datetime
+    source_event_id: str
+    resets_at: datetime | None = None
+    is_active: bool | None = None
+    metadata: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        provider = _provider_name(self.provider)
+        key = _identity_text(self.key, "key")
+        if key.startswith(f"{provider}:"):
+            raise ValueError("key must be provider-local, without a provider prefix")
+        try:
+            role = self.role if isinstance(self.role, WindowRole) else WindowRole(self.role)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("role must be '5h' or 'weekly'") from exc
+        if isinstance(self.percent, bool) or not isinstance(self.percent, (int, float)):
+            raise ValueError("percent must be a finite number between 0 and 100")
+        percent = float(self.percent)
+        if not math.isfinite(percent) or not 0 <= percent <= 100:
+            raise ValueError("percent must be a finite number between 0 and 100")
+        window_minutes = _nonnegative_int(self.window_minutes, "window_minutes")
+        if window_minutes == 0:
+            raise ValueError("window_minutes must be positive")
+        if self.is_active is not None and not isinstance(self.is_active, bool):
+            raise ValueError("is_active must be bool or None")
+        if not isinstance(self.metadata, Mapping):
+            raise ValueError("metadata must be a mapping")
+        object.__setattr__(self, "provider", provider)
+        object.__setattr__(self, "key", key)
+        object.__setattr__(self, "role", role)
+        object.__setattr__(self, "label", _identity_text(self.label, "label"))
+        object.__setattr__(self, "percent", percent)
+        object.__setattr__(self, "window_minutes", window_minutes)
+        object.__setattr__(self, "observed_at", _aware_utc(self.observed_at, "observed_at"))
+        object.__setattr__(self, "ingested_at", _aware_utc(self.ingested_at, "ingested_at"))
+        object.__setattr__(self, "source_event_id", _identity_text(self.source_event_id, "source_event_id"))
+        if self.resets_at is not None:
+            object.__setattr__(self, "resets_at", _aware_utc(self.resets_at, "resets_at"))
+        object.__setattr__(self, "metadata", dict(self.metadata))
+
+
+@dataclass(frozen=True, slots=True)
+class TokenUsage:
+    """Provider-neutral logical turn usage with mutually exclusive token buckets.
+
+    ``input_tokens`` is uncached input.  Reasoning is informational and must be a subset of
+    ``output_tokens``; consequently neither reasoning nor cache is counted twice by totals.
+    """
+
+    provider: str
+    source_event_id: str
+    observed_at: datetime
+    ingested_at: datetime
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    reasoning_tokens: int = 0
+    thread_id: str = "?"
+    turn_id: str = "?"
+    model: str = "?"
+    surface: str = "?"
+    project: str = "?"
+    session_id: str = "?"
+    source_version: int = 0
+    metadata: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for name in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+                     "reasoning_tokens", "source_version"):
+            object.__setattr__(self, name, _nonnegative_int(getattr(self, name), name))
+        if self.reasoning_tokens > self.output_tokens:
+            raise ValueError("reasoning_tokens must be a subset of output_tokens")
+        if not isinstance(self.metadata, Mapping):
+            raise ValueError("metadata must be a mapping")
+        object.__setattr__(self, "provider", _provider_name(self.provider))
+        object.__setattr__(self, "source_event_id", _identity_text(self.source_event_id, "source_event_id"))
+        object.__setattr__(self, "observed_at", _aware_utc(self.observed_at, "observed_at"))
+        object.__setattr__(self, "ingested_at", _aware_utc(self.ingested_at, "ingested_at"))
+        for name in ("thread_id", "turn_id", "model", "surface", "project", "session_id"):
+            object.__setattr__(self, name, _identity_text(getattr(self, name), name))
+        object.__setattr__(self, "metadata", dict(self.metadata))
+
+    @property
+    def input_total(self) -> int:
+        return self.input_tokens + self.cache_read_tokens + self.cache_write_tokens
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_total + self.output_tokens
+
+
+@runtime_checkable
+class ProviderAdapter(Protocol):
+    """I/O boundary implemented by providers; adapters never own DB or process exit policy."""
+
+    provider: str
+    capabilities: Collection[ProviderCapability]
+
+    def usage_limits(self) -> Iterable[UsageLimit]: ...
+
+    def token_usage(self, since: datetime | None = None) -> Iterable[TokenUsage]: ...
+
+
+def resolve_providers(selection: str, capability: ProviderCapability | str,
+                      available: Mapping[str, Collection[ProviderCapability | str]]) -> tuple[str, ...]:
+    """Pure provider resolver with stable ordering and capability-aware availability."""
+    if selection not in ("all", *PROVIDER_ORDER):
+        raise ValueError(f"invalid provider {selection!r}; expected all, claude, or codex")
+    try:
+        needed = capability if isinstance(capability, ProviderCapability) else ProviderCapability(capability)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid provider capability {capability!r}") from exc
+    matching = tuple(provider for provider in PROVIDER_ORDER
+                     if needed.value in {getattr(item, "value", item) for item in available.get(provider, ())})
+    if selection == "all":
+        if not matching:
+            raise ProviderUnavailable("all", f"no provider offers {needed.value}")
+        return matching
+    if selection not in matching:
+        raise ProviderUnavailable(selection, f"{needed.value} is unavailable")
+    return (selection,)
 
 
 try:  # orjson speeds up log parsing ~2-3x; plain json is the fallback.
@@ -558,24 +765,315 @@ def limits(data: dict) -> list[tuple]:
     return out
 
 
+_SCHEMA_TABLES = ("snapshots", "token_log", "scanned", "forecasts", "codex_turns", "meta")
+_MIGRATION_TEST_HOOK = None
+
+
+def _migration_hook(phase: str) -> None:
+    """Private fault-injection seam used to prove migration rollback."""
+    if _MIGRATION_TEST_HOOK is not None:
+        _MIGRATION_TEST_HOOK(phase)
+
+
+def _table_exists(con, table: str) -> bool:
+    return bool(con.execute(
+        "SELECT count(*) FROM information_schema.tables WHERE table_schema=current_schema() AND table_name=?",
+        [table],
+    ).fetchone()[0])
+
+
+def _table_columns(con, table: str) -> set[str]:
+    if not _table_exists(con, table):
+        return set()
+    return {row[1] for row in con.execute(f"PRAGMA table_info('{table}')").fetchall()}
+
+
+def _create_schema_tables(con) -> None:
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS snapshots("
+        "provider TEXT NOT NULL, observed_at TIMESTAMPTZ NOT NULL, ingested_at TIMESTAMPTZ NOT NULL, "
+        "key TEXT NOT NULL, role TEXT NOT NULL, label TEXT NOT NULL, percent DOUBLE NOT NULL, "
+        "window_minutes INTEGER NOT NULL, resets_at TIMESTAMPTZ, is_active BOOL, "
+        "source_event_id TEXT NOT NULL, metadata_json TEXT, "
+        "CHECK(isfinite(percent) AND percent BETWEEN 0 AND 100), CHECK(window_minutes > 0), "
+        "UNIQUE(provider, source_event_id, key))"
+    )
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS token_log("
+        "provider TEXT NOT NULL, source_event_id TEXT NOT NULL, "
+        "observed_at TIMESTAMPTZ NOT NULL, ingested_at TIMESTAMPTZ NOT NULL, "
+        "thread_id TEXT NOT NULL, turn_id TEXT NOT NULL, model TEXT NOT NULL, surface TEXT NOT NULL, "
+        "project TEXT NOT NULL, session_id TEXT NOT NULL, input_tokens BIGINT NOT NULL, "
+        "output_tokens BIGINT NOT NULL, reasoning_tokens BIGINT NOT NULL, cache_read_tokens BIGINT NOT NULL, "
+        "cache_write_tokens BIGINT NOT NULL, source_version BIGINT NOT NULL, metadata_json TEXT, "
+        "CHECK(input_tokens >= 0), CHECK(output_tokens >= 0), CHECK(reasoning_tokens >= 0), "
+        "CHECK(cache_read_tokens >= 0), CHECK(cache_write_tokens >= 0), CHECK(source_version >= 0), "
+        "CHECK(reasoning_tokens <= output_tokens), "
+        "PRIMARY KEY(provider, thread_id, turn_id), UNIQUE(provider, source_event_id))"
+    )
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS scanned("
+        "provider TEXT NOT NULL, path TEXT NOT NULL, cursor BIGINT NOT NULL, file_identity TEXT NOT NULL, "
+        "fingerprint TEXT NOT NULL, size BIGINT NOT NULL, mtime DOUBLE NOT NULL, updated_at TIMESTAMPTZ NOT NULL, "
+        "PRIMARY KEY(provider, path))"
+    )
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS forecasts("
+        "provider TEXT NOT NULL, source_event_id TEXT NOT NULL, observed_at TIMESTAMPTZ NOT NULL, "
+        "ingested_at TIMESTAMPTZ NOT NULL, key TEXT NOT NULL, horizon_h DOUBLE NOT NULL, "
+        "target_ts TIMESTAMPTZ NOT NULL, pred_pct DOUBLE NOT NULL, pct0 DOUBLE NOT NULL, rate DOUBLE NOT NULL, "
+        "model TEXT NOT NULL, actual_pct DOUBLE, resolved_ts TIMESTAMPTZ, "
+        "UNIQUE(provider, source_event_id))"
+    )
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS codex_turns("
+        "thread_id TEXT NOT NULL, turn_id TEXT NOT NULL, session_id TEXT, model TEXT, reasoning_effort TEXT, "
+        "project TEXT, observed_at TIMESTAMPTZ, source_event_id TEXT, source_version BIGINT NOT NULL DEFAULT 0, "
+        "input_tokens BIGINT, output_tokens BIGINT, reasoning_tokens BIGINT, cache_read_tokens BIGINT, "
+        "cache_write_tokens BIGINT, PRIMARY KEY(thread_id, turn_id))"
+    )
+    con.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT, ts TEXT)")
+
+
+def _validate_current_schema(con) -> None:
+    required = {
+        "snapshots": {"provider", "observed_at", "ingested_at", "key", "role", "window_minutes",
+                      "source_event_id"},
+        "token_log": {"provider", "source_event_id", "observed_at", "thread_id", "turn_id",
+                      "input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens",
+                      "cache_write_tokens", "source_version"},
+        "scanned": {"provider", "path", "cursor", "file_identity", "fingerprint", "size", "mtime"},
+        "forecasts": {"provider", "source_event_id", "observed_at", "key", "horizon_h", "target_ts"},
+        "codex_turns": {"thread_id", "turn_id", "source_version"},
+        "meta": {"key", "value", "ts"},
+    }
+    for table, columns in required.items():
+        missing = columns - _table_columns(con, table)
+        if missing:
+            raise MigrationError(f"schema v{SCHEMA_VERSION} table {table} is missing {sorted(missing)}")
+
+
+def _legacy_event_id(kind: str, ordinal: int, row: tuple) -> str:
+    digest = hashlib.sha256(repr(row).encode("utf-8", "backslashreplace")).hexdigest()[:24]
+    return f"legacy-{kind}:{ordinal}:{digest}"
+
+
+def _migrate_snapshots(con, migrated_at: datetime) -> None:
+    table = "__legacy_snapshots"
+    if not _table_exists(con, table):
+        return
+    cols = _table_columns(con, table)
+    if not {"ts", "key", "label", "percent", "resets_at", "is_active"} <= cols:
+        raise MigrationError("legacy snapshots schema is not recognized")
+    rows = con.execute(
+        f"SELECT ts,key,label,percent,resets_at,is_active FROM {table} "
+        "ORDER BY ts,key,label,percent,resets_at NULLS LAST"
+    ).fetchall()
+    out = []
+    for ordinal, row in enumerate(rows):
+        ts, key, label, percent, resets_at, is_active = row
+        role = WindowRole.FIVE_HOUR.value if key == "session" else WindowRole.WEEKLY.value
+        minutes = 300 if role == WindowRole.FIVE_HOUR.value else 10080
+        out.append(("claude", ts, migrated_at, key, role, label, percent, minutes, resets_at, is_active,
+                    _legacy_event_id("snapshot", ordinal, row), None))
+    if out:
+        con.executemany(
+            "INSERT INTO snapshots(provider,observed_at,ingested_at,key,role,label,percent,window_minutes,"
+            "resets_at,is_active,source_event_id,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            out,
+        )
+
+
+def _migrate_token_log(con, migrated_at: datetime) -> None:
+    table = "__legacy_token_log"
+    if not _table_exists(con, table):
+        return
+    cols = _table_columns(con, table)
+    required = {"uuid", "ts", "model", "project", "session", "in_tok", "out_tok", "cache_read", "cache_create"}
+    if not required <= cols:
+        raise MigrationError("legacy token_log schema is not recognized")
+    entrypoint = "entrypoint" if "entrypoint" in cols else "'?' AS entrypoint"
+    rows = con.execute(
+        f'SELECT uuid,ts,model,{entrypoint},project,"session",in_tok,out_tok,cache_read,cache_create '
+        f"FROM {table} ORDER BY ts,uuid"
+    ).fetchall()
+    out = []
+    for row in rows:
+        uuid, ts, model, surface, project, session, in_tok, out_tok, cache_read, cache_write = row
+        session = session or "?"
+        out.append(("claude", str(uuid), ts, migrated_at, str(session), str(uuid), model or "?", surface or "?",
+                    project or "?", str(session), int(in_tok or 0), int(out_tok or 0), 0,
+                    int(cache_read or 0), int(cache_write or 0), 0, None))
+    if out:
+        con.executemany(
+            "INSERT INTO token_log(provider,source_event_id,observed_at,ingested_at,thread_id,turn_id,model,"
+            "surface,project,session_id,input_tokens,output_tokens,reasoning_tokens,cache_read_tokens,"
+            "cache_write_tokens,source_version,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            out,
+        )
+
+
+def _migrate_scanned(con, migrated_at: datetime) -> None:
+    table = "__legacy_scanned"
+    if not _table_exists(con, table):
+        return
+    cols = _table_columns(con, table)
+    if not {"path", "mtime", "size"} <= cols:
+        raise MigrationError("legacy scanned schema is not recognized")
+    rows = con.execute(f"SELECT path,mtime,size FROM {table} ORDER BY path").fetchall()
+    out = []
+    for path, mtime, size in rows:
+        fingerprint = hashlib.sha256(str(path).encode("utf-8", "backslashreplace")).hexdigest()
+        out.append(("claude", path, int(size or 0), f"legacy:{fingerprint}", fingerprint, int(size or 0),
+                    float(mtime or 0), migrated_at))
+    if out:
+        con.executemany(
+            "INSERT INTO scanned(provider,path,cursor,file_identity,fingerprint,size,mtime,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            out,
+        )
+
+
+def _migrate_forecasts(con, migrated_at: datetime) -> None:
+    table = "__legacy_forecasts"
+    if not _table_exists(con, table):
+        return
+    cols = _table_columns(con, table)
+    required = {"ts", "key", "horizon_h", "target_ts", "pred_pct", "pct0", "rate", "model",
+                "actual_pct", "resolved_ts"}
+    if not required <= cols:
+        raise MigrationError("legacy forecasts schema is not recognized")
+    rows = con.execute(
+        f"SELECT ts,key,horizon_h,target_ts,pred_pct,pct0,rate,model,actual_pct,resolved_ts FROM {table} "
+        "ORDER BY ts,key,horizon_h,target_ts,model"
+    ).fetchall()
+    out = []
+    for ordinal, row in enumerate(rows):
+        ts, key, horizon, target, pred, pct0, rate, model, actual, resolved = row
+        out.append(("claude", _legacy_event_id("forecast", ordinal, row), ts, migrated_at, key, horizon,
+                    target, pred, pct0, rate, model, actual, resolved))
+    if out:
+        con.executemany(
+            "INSERT INTO forecasts(provider,source_event_id,observed_at,ingested_at,key,horizon_h,target_ts,"
+            "pred_pct,pct0,rate,model,actual_pct,resolved_ts) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            out,
+        )
+
+
+def _migrate_meta(con) -> None:
+    table = "__legacy_meta"
+    if not _table_exists(con, table):
+        return
+    cols = _table_columns(con, table)
+    if not {"key", "value", "ts"} <= cols:
+        raise MigrationError("legacy meta schema is not recognized")
+    for key, value, ts in con.execute(f"SELECT key,value,ts FROM {table} ORDER BY key").fetchall():
+        if key == "schema_version":
+            continue
+        new_key = "claude:model_params" if key == "model_params" else key
+        con.execute(
+            "INSERT INTO meta(key,value,ts) VALUES (?,?,?) ON CONFLICT (key) DO UPDATE SET "
+            "value=excluded.value, ts=excluded.ts",
+            [new_key, value, ts],
+        )
+
+
+def _validate_migration_counts(con, legacy_tables: Collection[str]) -> None:
+    for table in ("snapshots", "token_log", "scanned", "forecasts"):
+        legacy = f"__legacy_{table}"
+        if legacy in legacy_tables:
+            old_count = con.execute(f"SELECT count(*) FROM {legacy}").fetchone()[0]
+            new_count = con.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+            if old_count != new_count:
+                raise MigrationError(f"{table} migration count mismatch: {old_count} != {new_count}")
+
+
+def _ensure_schema(con) -> None:
+    """Create or atomically migrate the persistent schema; version is written last."""
+    version = None
+    if _table_exists(con, "meta") and "key" in _table_columns(con, "meta"):
+        row = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+        version = row[0] if row else None
+    if version is not None:
+        try:
+            numeric_version = int(version)
+        except (TypeError, ValueError) as exc:
+            raise MigrationError(f"invalid schema version {version!r}") from exc
+        if numeric_version > SCHEMA_VERSION:
+            raise MigrationError(f"database schema v{numeric_version} is newer than supported v{SCHEMA_VERSION}")
+        if numeric_version == SCHEMA_VERSION:
+            try:
+                con.execute("BEGIN TRANSACTION")
+                _create_schema_tables(con)
+                _validate_current_schema(con)
+                con.execute("COMMIT")
+                return
+            except Exception as exc:
+                try:
+                    con.execute("ROLLBACK")
+                except Exception:
+                    pass
+                if isinstance(exc, MigrationError):
+                    raise
+                raise MigrationError(f"failed to validate schema v{SCHEMA_VERSION}: {exc}") from exc
+
+    existing = {table for table in _SCHEMA_TABLES if _table_exists(con, table)}
+    # A current-looking schema that lost only its version marker can be adopted safely.
+    current_unversioned = (
+        "snapshots" in existing
+        and {"provider", "observed_at", "source_event_id"} <= _table_columns(con, "snapshots")
+    )
+    try:
+        con.execute("BEGIN TRANSACTION")
+        if current_unversioned:
+            _create_schema_tables(con)
+            _validate_current_schema(con)
+        else:
+            for table in sorted(existing):
+                con.execute(f"ALTER TABLE {table} RENAME TO __legacy_{table}")
+            _migration_hook("staged")
+            _create_schema_tables(con)
+            migrated_at = datetime.now(UTC)
+            _migrate_snapshots(con, migrated_at)
+            _migrate_token_log(con, migrated_at)
+            _migrate_scanned(con, migrated_at)
+            _migrate_forecasts(con, migrated_at)
+            _migrate_meta(con)
+            _migration_hook("copied")
+            _validate_migration_counts(con, existing)
+            _migration_hook("validated")
+            for table in sorted(existing):
+                con.execute(f"DROP TABLE __legacy_{table}")
+            _migration_hook("swapped")
+        _validate_current_schema(con)
+        con.execute(
+            "INSERT INTO meta(key,value,ts) VALUES (?,?,?) ON CONFLICT (key) DO UPDATE SET "
+            "value=excluded.value, ts=excluded.ts",
+            ["schema_version", str(SCHEMA_VERSION), datetime.now(UTC).isoformat()],
+        )
+        _migration_hook("versioned")
+        con.execute("COMMIT")
+    except Exception as exc:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        if isinstance(exc, MigrationError):
+            raise
+        raise MigrationError(f"database migration to schema v{SCHEMA_VERSION} failed: {exc}") from exc
+
+
 def db(create: bool = True):
     """DuckDB connection. create=False returns None if database doesn't yet exist (doesn't create file)."""
     if not create and not os.path.exists(DB):
         return None
     import duckdb
     con = duckdb.connect(DB)
-    con.execute("CREATE TABLE IF NOT EXISTS snapshots("
-                "ts TIMESTAMPTZ, key TEXT, label TEXT, percent DOUBLE, "
-                "resets_at TIMESTAMPTZ, is_active BOOL)")
-    con.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT, ts TEXT)")
-    # Forecast log: what we predicted, and (once target_ts passes) what actually happened.
-    # Closes the loop — 'cmon backtest' scores MAE/bias per horizon, and the tuner reads the
-    # same rows to pick parameters. Small by design: one row per (poll, key, horizon), deduped
-    # to FORECAST_EVERY_S and pruned past FORECAST_KEEP_D.
-    con.execute("CREATE TABLE IF NOT EXISTS forecasts("
-                "ts TIMESTAMPTZ, key TEXT, horizon_h DOUBLE, target_ts TIMESTAMPTZ, "
-                "pred_pct DOUBLE, pct0 DOUBLE, rate DOUBLE, model TEXT, "
-                "actual_pct DOUBLE, resolved_ts TIMESTAMPTZ)")
+    try:
+        _ensure_schema(con)
+    except Exception:
+        con.close()
+        raise
     return con
 
 
@@ -600,7 +1098,7 @@ def _meta_set(con, key: str, value: str) -> None:
     if con is None:
         return
     try:
-        con.execute("INSERT INTO meta VALUES (?,?,?) ON CONFLICT (key) DO UPDATE SET "
+        con.execute("INSERT INTO meta(key,value,ts) VALUES (?,?,?) ON CONFLICT (key) DO UPDATE SET "
                     "value=excluded.value, ts=excluded.ts",
                     [key, value, datetime.now(UTC).isoformat()])
     except Exception:
@@ -612,9 +1110,9 @@ def deltas(con):
     Plot-only: returns a pandas DataFrame (via .df()), so it needs the `plot` extra. Core
     code paths use SQL aggregation directly (see _summary) and never call this."""
     df = con.execute(
-        "SELECT ts, key, label, percent, percent - lag(percent) "
-        "OVER (PARTITION BY key ORDER BY ts) AS delta "
-        "FROM snapshots ORDER BY ts").df()
+        "SELECT observed_at AS ts, key, label, percent, percent - lag(percent) "
+        "OVER (PARTITION BY provider,key ORDER BY observed_at) AS delta "
+        "FROM snapshots WHERE provider='claude' ORDER BY observed_at").df()
     if df.empty:
         sys.exit("No data — run 'cmon collect' a few times first.")
     return df
@@ -677,8 +1175,19 @@ def now(args):
 
 def _recent(con, ts) -> bool:
     """True if a snapshot was saved within DEDUP_SECS of ts (dedup guard, shared by collectors)."""
-    return bool(con.execute("SELECT count(*) FROM snapshots WHERE ts > ?",
+    return bool(con.execute("SELECT count(*) FROM snapshots WHERE provider='claude' AND observed_at > ?",
                             [ts - timedelta(seconds=DEDUP_SECS)]).fetchone()[0])
+
+
+def _claude_snapshot_records(rows, observed_at: datetime) -> list[tuple]:
+    source_event_id = f"claude-api:{observed_at.isoformat()}"
+    out = []
+    for key, label, percent, resets_at, is_active in rows:
+        role = WindowRole.FIVE_HOUR.value if key == "session" else WindowRole.WEEKLY.value
+        window_minutes = 300 if role == WindowRole.FIVE_HOUR.value else 10080
+        out.append(("claude", observed_at, observed_at, key, role, label, percent, window_minutes,
+                    resets_at, is_active, source_event_id, None))
+    return out
 
 
 def _read_db():
@@ -703,10 +1212,15 @@ def _snapshot(con=None):
     try:
         c = db() if own else con
         if not _recent(c, ts):
-            c.executemany("INSERT INTO snapshots VALUES (?,?,?,?,?,?)",
-                          [[ts, k, lbl, pct, reset, act] for k, lbl, pct, reset, act in rows])
+            c.executemany(
+                "INSERT INTO snapshots(provider,observed_at,ingested_at,key,role,label,percent,window_minutes,"
+                "resets_at,is_active,source_event_id,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                _claude_snapshot_records(rows, ts),
+            )
         if own:
             c.close()
+    except MigrationError:
+        raise
     except Exception:
         pass  # DB busy/unavailable → best-effort; cache still refreshes below
     _write_cache(rows, ts)
@@ -720,8 +1234,11 @@ def collect(args):
         print(f"Snapshot <{DEDUP_SECS}s ago — skipped (use --force to save anyway).")
         return
     rows = limits(fetch())
-    con.executemany("INSERT INTO snapshots VALUES (?,?,?,?,?,?)",
-                    [[ts, k, lbl, pct, reset, act] for k, lbl, pct, reset, act in rows])
+    con.executemany(
+        "INSERT INTO snapshots(provider,observed_at,ingested_at,key,role,label,percent,window_minutes,"
+        "resets_at,is_active,source_event_id,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        _claude_snapshot_records(rows, ts),
+    )
     _write_cache(rows, ts)
     _log_forecasts(con, rows, _resolve_tz(), ts)  # record predictions; scored by 'cmon backtest'
     _reconcile_forecasts(con)                     # and settle the ones whose horizon just passed
@@ -756,11 +1273,12 @@ def _summary(con, since):
     consumed % (sum of positive deltas). The headline table shown by 'trends'. Returns a
     list of dict rows sorted by label. delta is computed over the full history (lag per key)
     and only then filtered to the window, so a snapshot at the window edge still gets a delta."""
-    where = "WHERE ts >= ?" if since is not None else ""
+    where = "WHERE observed_at >= ?" if since is not None else ""
     params = [since] if since is not None else []
     rows = con.execute(
-        "WITH d AS (SELECT label, percent, ts, "
-        "  percent - lag(percent) OVER (PARTITION BY key ORDER BY ts) AS delta FROM snapshots) "
+        "WITH d AS (SELECT label, percent, observed_at, "
+        "  percent - lag(percent) OVER (PARTITION BY provider,key ORDER BY observed_at) AS delta "
+        "  FROM snapshots WHERE provider='claude') "
         f"SELECT label, count(*), round(max(percent)), "
         f"  round(sum(CASE WHEN delta > 0 THEN delta ELSE 0 END)) "
         f"FROM d {where} GROUP BY label ORDER BY label", params).fetchall()
@@ -813,8 +1331,8 @@ def _pace_ax(ax, con, key: str, title: str, now_utc) -> None:
         return
     seg = segs[-1]  # current cycle (after last reset)
     ax.plot(seg.ts, seg.percent, marker="o", label="actual")
-    rrow = con.execute("SELECT resets_at FROM snapshots WHERE key=? AND resets_at IS NOT NULL "
-                       "ORDER BY ts DESC LIMIT 1", [key]).fetchone()
+    rrow = con.execute("SELECT resets_at FROM snapshots WHERE provider='claude' AND key=? "
+                       "AND resets_at IS NOT NULL ORDER BY observed_at DESC LIMIT 1", [key]).fetchone()
     if rrow and rrow[0] is not None:
         reset = rrow[0]  # tz-aware datetime (DuckDB TIMESTAMPTZ, needs pytz)
         x0, y0 = seg.ts[0], float(seg.percent[0])
@@ -834,10 +1352,10 @@ def _burn_ax(ax, con, since) -> None:
     """Stacked API-equivalent cost/day by model from token_log — the richest table (where the
     tokens actually go). You pay a subscription, not this; it's for relative comparison."""
     scan_logs(con, since=since, quiet=True)
-    where = "WHERE ts >= ?" if since else ""
+    where = "WHERE provider='claude'" + (" AND observed_at >= ?" if since else "")
     df = con.execute(
-        f"SELECT CAST(ts AS DATE) d, model, sum(in_tok) i, sum(out_tok) o, "
-        f"sum(cache_read) r, sum(cache_create) c FROM token_log {where} GROUP BY d, model",
+        f"SELECT CAST(observed_at AS DATE) d, model, sum(input_tokens) i, sum(output_tokens) o, "
+        f"sum(cache_read_tokens) r, sum(cache_write_tokens) c FROM token_log {where} GROUP BY d, model",
         [since] if since else []).df()
     if df.empty:
         ax.text(0.5, 0.5, "no Claude Code log data", ha="center", va="center", transform=ax.transAxes)
@@ -937,8 +1455,9 @@ def _rate(con, key, as_of=None) -> float | None:
     if as_of is not None and (ck := (key, as_of)) in _rate_cache:
         return _rate_cache[ck]
     # epoch_us keeps this off the TIMESTAMPTZ->datetime path (we only need time *deltas*).
-    rows = con.execute("SELECT epoch_us(ts), percent FROM snapshots WHERE key=? "
-                       "AND (? IS NULL OR ts <= ?) ORDER BY ts",
+    rows = con.execute("SELECT epoch_us(observed_at), percent FROM snapshots "
+                       "WHERE provider='claude' AND key=? AND (? IS NULL OR observed_at <= ?) "
+                       "ORDER BY observed_at",
                        [key, as_of, as_of]).fetchall()
     if as_of is not None:
         _rate_cache[(key, as_of)] = None  # replaced below unless we bail out early
@@ -981,7 +1500,7 @@ def _params(con=None) -> dict:
     global _params_cache
     if _params_cache is None:
         p = dict(PARAM_DEFAULTS)
-        if r := _meta_get(con, "model_params"):
+        if r := _meta_get(con, "claude:model_params"):
             try:
                 p.update({k: float(v) for k, v in json.loads(r[0]).items() if k in PARAM_DEFAULTS})
             except (ValueError, TypeError):
@@ -997,7 +1516,7 @@ def _set_params(con, p: dict | None) -> None:
     _params_cache = p if p is None else {**PARAM_DEFAULTS, **p}
     _profile_cache.clear()
     if p is not None and con is not None:
-        _meta_set(con, "model_params", json.dumps({k: round(v, 4) for k, v in p.items()}))
+        _meta_set(con, "claude:model_params", json.dumps({k: round(v, 4) for k, v in p.items()}))
 
 
 def _solve(a) -> list[float] | None:
@@ -1060,7 +1579,8 @@ def _day_weights(con, tz, now_utc, halflife_d):
     with a PROFILE_HALFLIFE_D half-life, so the learned shape follows your current routine
     and old habits fade instead of dropping off a cliff when a fixed window slides."""
     cutoff = now_utc - timedelta(days=PROFILE_MAX_AGE_D)
-    first = con.execute("SELECT min(ts) FROM token_log WHERE ts > ?", [cutoff]).fetchone()[0]
+    first = con.execute("SELECT min(observed_at) FROM token_log "
+                        "WHERE provider='claude' AND observed_at > ?", [cutoff]).fetchone()[0]
     if first is None:
         return {}, 0
     now_local = now_utc.astimezone(tz)
@@ -1100,9 +1620,10 @@ def _hour_buckets_tokens(con, tz, now_utc, halflife_d):
     # Aggregate in SQL (a few hundred rows out) instead of walking every request in Python:
     # token_log holds 100k+ rows and this runs on every watch poll after the cache expires.
     rows = con.execute(
-        "SELECT (timezone(?, ts))::DATE, hour(timezone(?, ts)), "
-        "sum(in_tok + out_tok + coalesce(cache_read, 0) / 10.0) FROM token_log "
-        "WHERE ts > ? AND ts <= ? AND in_tok IS NOT NULL GROUP BY 1, 2",
+        "SELECT (timezone(?, observed_at))::DATE, hour(timezone(?, observed_at)), "
+        "sum(input_tokens + output_tokens + coalesce(cache_read_tokens, 0) / 10.0) FROM token_log "
+        "WHERE provider='claude' AND observed_at > ? AND observed_at <= ? "
+        "AND input_tokens IS NOT NULL GROUP BY 1, 2",
         [str(tz), str(tz), now_utc - timedelta(days=PROFILE_MAX_AGE_D), now_utc]).fetchall()
     for day, hour, tok in rows:
         w = days.get(day)
@@ -1135,8 +1656,9 @@ def _hour_buckets(con, tz, now_utc, halflife_d):
     a reset drop. Returns (hrs, pts, whrs, wpts)."""
     hrs, pts = [0.0] * 24, [0.0] * 24
     whrs, wpts = [0.0] * 7, [0.0] * 7
-    rows = con.execute("SELECT epoch_us(ts), percent FROM snapshots WHERE key='weekly_all' "
-                       "AND ts > ? AND ts <= ? ORDER BY ts",
+    rows = con.execute("SELECT epoch_us(observed_at), percent FROM snapshots "
+                       "WHERE provider='claude' AND key='weekly_all' "
+                       "AND observed_at > ? AND observed_at <= ? ORDER BY observed_at",
                        [now_utc - timedelta(days=PROFILE_MAX_AGE_D), now_utc]).fetchall()
     now_s = now_utc.timestamp()
     for (us0, p0), (us1, p1) in zip(rows, rows[1:], strict=False):
@@ -1315,7 +1837,7 @@ def _log_forecasts(con, rows, tz, now_utc=None) -> None:
         return
     now_utc = now_utc or datetime.now(UTC)
     try:
-        last = con.execute("SELECT max(ts) FROM forecasts").fetchone()[0]
+        last = con.execute("SELECT max(observed_at) FROM forecasts WHERE provider='claude'").fetchone()[0]
         if last and (now_utc - last).total_seconds() < FORECAST_EVERY_S:
             return
         out = []
@@ -1331,12 +1853,22 @@ def _log_forecasts(con, rows, tz, now_utc=None) -> None:
             for h in [x for x in FORECAST_HORIZONS if x < rem_h] + [rem_h]:
                 pred, _eta, src = _project(con, pct, rate, h, now_utc, tz, key)
                 target = now_utc + timedelta(hours=h)
-                out.append([now_utc, key, h, target, pred, pct, rate, src or "linear"])
+                model = src or "linear"
+                identity = f"claude|{now_utc.isoformat()}|{key}|{h}|{target.isoformat()}|{model}"
+                event = hashlib.sha256(identity.encode()).hexdigest()
+                out.append(["claude", event, now_utc, now_utc, key, h, target, pred, pct, rate, model])
                 if src:  # baseline for comparison; skipped when the model *is* linear
-                    out.append([now_utc, key, h, target, pct + rate * h, pct, rate, "linear"])
+                    event = hashlib.sha256(
+                        f"claude|{now_utc.isoformat()}|{key}|{h}|{target.isoformat()}|linear".encode()
+                    ).hexdigest()
+                    out.append(["claude", event, now_utc, now_utc, key, h, target,
+                                pct + rate * h, pct, rate, "linear"])
         if out:
-            con.executemany("INSERT INTO forecasts (ts, key, horizon_h, target_ts, pred_pct, "
-                            "pct0, rate, model) VALUES (?,?,?,?,?,?,?,?)", out)
+            con.executemany(
+                "INSERT INTO forecasts(provider,source_event_id,observed_at,ingested_at,key,horizon_h,"
+                "target_ts,pred_pct,pct0,rate,model) VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING",
+                out,
+            )
     except Exception:
         pass  # never let bookkeeping break a collect/watch cycle
 
@@ -1353,21 +1885,24 @@ def _reconcile_forecasts(con) -> int:
         return 0
     try:
         con.execute(
-            "CREATE OR REPLACE TEMP TABLE _rec AS SELECT fts, fkey, fh, sts, percent FROM ("
-            "  SELECT f.ts AS fts, f.key AS fkey, f.horizon_h AS fh, s.ts AS sts, s.percent, "
-            "         row_number() OVER (PARTITION BY f.ts, f.key, f.horizon_h "
-            "           ORDER BY abs(date_diff('second', s.ts, f.target_ts))) AS rn "
-            "  FROM forecasts f JOIN snapshots s ON s.key = f.key "
-            "    AND s.ts BETWEEN f.target_ts - to_minutes(?) AND f.target_ts + to_minutes(?) "
-            "  WHERE f.actual_pct IS NULL AND f.target_ts <= now()) WHERE rn = 1",
+            "CREATE OR REPLACE TEMP TABLE _rec AS SELECT fprovider,fsource,sts,percent FROM ("
+            "  SELECT f.provider AS fprovider, f.source_event_id AS fsource, s.observed_at AS sts, s.percent, "
+            "         row_number() OVER (PARTITION BY f.provider,f.source_event_id "
+            "           ORDER BY abs(date_diff('second', s.observed_at, f.target_ts))) AS rn "
+            "  FROM forecasts f JOIN snapshots s ON s.provider=f.provider AND s.key=f.key "
+            "    AND s.observed_at BETWEEN f.target_ts - to_minutes(?) AND f.target_ts + to_minutes(?) "
+            "  WHERE f.provider='claude' AND f.actual_pct IS NULL AND f.target_ts <= now()) WHERE rn=1",
             [FORECAST_MATCH_MIN, FORECAST_MATCH_MIN])
         con.execute("UPDATE forecasts SET actual_pct = _rec.percent, resolved_ts = _rec.sts "
-                    "FROM _rec WHERE forecasts.ts = _rec.fts AND forecasts.key = _rec.fkey "
-                    "AND forecasts.horizon_h = _rec.fh")
+                    "FROM _rec WHERE forecasts.provider=_rec.fprovider "
+                    "AND forecasts.source_event_id=_rec.fsource")
         n = con.execute("SELECT count(*) FROM _rec").fetchone()[0]
-        con.execute("DELETE FROM forecasts WHERE actual_pct IS NOT NULL AND actual_pct < pct0 - 0.5")
-        con.execute("DELETE FROM forecasts WHERE actual_pct IS NULL AND target_ts < now() - to_hours(24)")
-        con.execute("DELETE FROM forecasts WHERE ts < now() - to_days(?)", [FORECAST_KEEP_D])
+        con.execute("DELETE FROM forecasts WHERE provider='claude' AND actual_pct IS NOT NULL "
+                    "AND actual_pct < pct0 - 0.5")
+        con.execute("DELETE FROM forecasts WHERE provider='claude' AND actual_pct IS NULL "
+                    "AND target_ts < now() - to_hours(24)")
+        con.execute("DELETE FROM forecasts WHERE provider='claude' "
+                    "AND observed_at < now() - to_days(?)", [FORECAST_KEEP_D])
         return int(n)
     except Exception:
         return 0
@@ -1382,7 +1917,7 @@ def _backtest_rows(con, since):
         "                   WHEN horizon_h <= 6 THEN '1-6h' ELSE '>6h' END AS band, "
         "       count(*), avg(abs(least(pred_pct, 100) - actual_pct)), "
         "       avg(least(pred_pct, 100) - actual_pct) "
-        "FROM forecasts WHERE actual_pct IS NOT NULL AND ts > ? "
+        "FROM forecasts WHERE provider='claude' AND actual_pct IS NOT NULL AND observed_at > ? "
         "GROUP BY 1, 2 ORDER BY 1, min(horizon_h)", [since]).fetchall()
 
 
@@ -1398,8 +1933,9 @@ def _replay(con, tz, since, keys=("session", "weekly_all"), step=8, models=("act
     snapshots (they arrive every ~20min; every 8th is ~2.7h apart, plenty for scoring)."""
     out = {}
     for key in keys:
-        rows = con.execute("SELECT ts, percent, resets_at FROM snapshots WHERE key=? AND ts > ? "
-                           "AND resets_at IS NOT NULL ORDER BY ts", [key, since]).fetchall()
+        rows = con.execute("SELECT observed_at,percent,resets_at FROM snapshots "
+                           "WHERE provider='claude' AND key=? AND observed_at > ? "
+                           "AND resets_at IS NOT NULL ORDER BY observed_at", [key, since]).fetchall()
         if len(rows) < 4:
             continue
         stamps = [ts for ts, _p, _r in rows]
@@ -1479,7 +2015,7 @@ def tune(args):
     if con is None:
         sys.exit("No database yet — run 'cmon collect' a few times first.")
     if getattr(args, "show", False):
-        cur, stored = _params(con), _meta_get(con, "model_params")
+        cur, stored = _params(con), _meta_get(con, "claude:model_params")
         print("Active model parameters:")
         for k in sorted(PARAM_DEFAULTS):
             tag = "" if stored else "  (default)"
@@ -1490,12 +2026,13 @@ def tune(args):
         return
     if getattr(args, "reset", False):
         _set_params(con, dict(PARAM_DEFAULTS))
-        _meta_set(con, "model_params", json.dumps(PARAM_DEFAULTS))
+        _meta_set(con, "claude:model_params", json.dumps(PARAM_DEFAULTS))
         print("✓ Model parameters restored to defaults.")
         return
     tz = _resolve_tz()
     active = dict(_params(con))
-    span = con.execute("SELECT min(ts), max(ts) FROM snapshots WHERE key='session'").fetchone()
+    span = con.execute("SELECT min(observed_at),max(observed_at) FROM snapshots "
+                       "WHERE provider='claude' AND key='session'").fetchone()
     if not span or not span[0]:
         sys.exit("No snapshots to tune on yet.")
     first, last = span
@@ -1778,28 +2315,95 @@ def _eta_short(iso: str | None) -> str:
 
 
 CACHE = os.path.expanduser("~/.cmon/status.json")  # fixed: statusline runs from any cwd
+CACHE_VERSION = 2
 
 
-def _write_cache(rows, ts) -> None:
-    """Save latest snapshot to lightweight cache for 'status' to read without network/DuckDB."""
+def _cache_payload() -> dict:
+    """Read cache v2, upgrading v1 in memory as Claude; malformed content is rejected."""
+    if not os.path.exists(CACHE):
+        return {"version": CACHE_VERSION, "providers": {}}
+    with open(CACHE, encoding="utf-8") as f:
+        data = json.load(f)
+    if data.get("version") == CACHE_VERSION and isinstance(data.get("providers"), dict):
+        return data
+    if "ts" in data and isinstance(data.get("rows"), list):
+        windows = {}
+        for row in data["rows"]:
+            if not isinstance(row, list) or len(row) < 5 or not isinstance(row[0], str):
+                raise ValueError("invalid cache v1 row")
+            windows[row[0]] = {"observed_at": data["ts"], "row": row}
+        return {"version": CACHE_VERSION, "providers": {
+            "claude": {"updated_at": data["ts"], "windows": windows},
+        }}
+    raise ValueError("unsupported cache format")
+
+
+def _write_cache(rows, ts, provider: str = "claude") -> None:
+    """Atomically merge provider/window observations into the lightweight status cache."""
+    temp_path = None
     try:
-        os.makedirs(os.path.dirname(CACHE), exist_ok=True)
-        with open(CACHE, "w", encoding="utf-8") as f:
-            json.dump({"ts": ts.isoformat(), "rows": [list(r) for r in rows]}, f)
+        provider = _provider_name(provider)
+        ts = _aware_utc(ts, "ts")
+        try:
+            payload = _cache_payload()
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            payload = {"version": CACHE_VERSION, "providers": {}}
+        providers = payload.setdefault("providers", {})
+        current = providers.get(provider)
+        windows = dict(current.get("windows", {})) if isinstance(current, dict) else {}
+        for raw in rows:
+            row = list(raw)
+            if len(row) < 5 or not isinstance(row[0], str):
+                raise ValueError("invalid cache row")
+            windows[row[0]] = {"observed_at": ts.isoformat(), "row": row}
+        providers[provider] = {"updated_at": ts.isoformat(), "windows": windows}
+        payload["version"] = CACHE_VERSION
+        directory = os.path.dirname(CACHE)
+        os.makedirs(directory, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=directory, prefix=".status.",
+                                         suffix=".tmp", delete=False) as f:
+            temp_path = f.name
+            try:
+                os.fchmod(f.fileno(), 0o600)
+            except OSError:
+                pass
+            json.dump(payload, f, separators=(",", ":"), sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, CACHE)
+        temp_path = None
+        try:
+            dir_fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
     except Exception:
         pass
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
 
 
-def _read_cache():
-    """(rows, age_s) from JSON cache, or None if absent/unreadable."""
-    if not os.path.exists(CACHE):
-        return None
+def _read_cache(provider: str = "claude"):
+    """(rows, age_s) for one provider from cache v1/v2, or None if absent/unreadable."""
     try:
-        with open(CACHE, encoding="utf-8") as f:
-            d = json.load(f)
-        ts = datetime.fromisoformat(d["ts"])
-        return [tuple(r) for r in d["rows"]], (datetime.now(UTC) - ts).total_seconds()
-    except Exception:
+        state = _cache_payload()["providers"].get(provider)
+        if not isinstance(state, dict) or not isinstance(state.get("windows"), dict):
+            return None
+        ts = datetime.fromisoformat(state["updated_at"])
+        rows = []
+        for window in state["windows"].values():
+            if not isinstance(window, dict) or not isinstance(window.get("row"), list):
+                return None
+            rows.append(tuple(window["row"]))
+        return rows, (datetime.now(UTC) - ts).total_seconds()
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
         return None
 
 
@@ -1808,8 +2412,9 @@ def _rows_from_db():
     con = db(create=False)
     if con is None:
         return None
-    res = con.execute("SELECT key,label,percent,resets_at,is_active,ts FROM snapshots "
-                      "WHERE ts=(SELECT max(ts) FROM snapshots)").fetchall()
+    res = con.execute("SELECT key,label,percent,resets_at,is_active,observed_at FROM snapshots "
+                      "WHERE provider='claude' AND observed_at=(SELECT max(observed_at) FROM snapshots "
+                      "WHERE provider='claude')").fetchall()
     if not res:
         return None
     rows = [(key, label, float(percent),
@@ -1924,7 +2529,8 @@ def _cycles(con, key: str) -> list:
     (percent drop). Returns a list of Cycle(ts, percent) named tuples."""
     if con is None:
         return []
-    rows = con.execute("SELECT ts, percent FROM snapshots WHERE key=? ORDER BY ts", [key]).fetchall()
+    rows = con.execute("SELECT observed_at,percent FROM snapshots "
+                       "WHERE provider='claude' AND key=? ORDER BY observed_at", [key]).fetchall()
     if not rows:
         return []
     cuts = [i for i in range(1, len(rows)) if rows[i][1] - rows[i - 1][1] < 0]  # reset boundaries
@@ -2055,20 +2661,9 @@ def scan_logs(con, since=None, quiet: bool = False) -> None:
     deduplicates by uuid; with `since` skips files older than the window. Parse
     of new files runs in parallel (multicore)."""
     import glob
-    # Migration: if token_log has old schema (no entrypoint), rebuild — it's cache.
-    try:
-        cols = [r[1] for r in con.execute("PRAGMA table_info('token_log')").fetchall()]
-    except Exception:
-        cols = []  # table doesn't exist yet (new database)
-    if cols and "entrypoint" not in cols:
-        con.execute("DROP TABLE token_log")
-        con.execute("DROP TABLE IF EXISTS scanned")
-    con.execute("CREATE TABLE IF NOT EXISTS token_log("
-                "uuid TEXT PRIMARY KEY, ts TIMESTAMPTZ, model TEXT, entrypoint TEXT, "
-                "project TEXT, session TEXT, "
-                "in_tok BIGINT, out_tok BIGINT, cache_read BIGINT, cache_create BIGINT)")
-    con.execute("CREATE TABLE IF NOT EXISTS scanned(path TEXT PRIMARY KEY, mtime DOUBLE, size BIGINT)")
-    seen = {p: (m, s) for p, m, s in con.execute("SELECT path, mtime, size FROM scanned").fetchall()}
+    seen = {p: (m, s) for p, m, s in con.execute(
+        "SELECT path,mtime,size FROM scanned WHERE provider='claude'"
+    ).fetchall()}
     since_epoch = since.timestamp() if since else None
     todo = []
     for f in glob.glob(os.path.join(LOGS_ROOT, "**", "*.jsonl"), recursive=True):
@@ -2088,22 +2683,33 @@ def scan_logs(con, since=None, quiet: bool = False) -> None:
     parsed = _parse_many([f for f, _ in todo])  # parallel (with serial fallback)
     rows = [r for chunk in parsed for r in chunk]
     if rows:
-        # Vectorized insert via parallel unnest of column-arrays — native DuckDB, no pandas,
-        # and still bulk (one INSERT ... SELECT, not per-row executemany+ON CONFLICT).
-        # QUALIFY row_number() dedups duplicate uuids within the batch (mirrored transcripts).
-        cols = list(zip(*rows, strict=True))  # transpose rows -> one list per column (LIST params)
-        con.execute(
-            "INSERT INTO token_log SELECT * FROM ("
-            "  SELECT unnest(?::TEXT[]) uuid, unnest(?::TIMESTAMPTZ[]) ts, unnest(?::TEXT[]) model, "
-            "         unnest(?::TEXT[]) entrypoint, unnest(?::TEXT[]) project, unnest(?::TEXT[]) \"session\", "
-            "         unnest(?::BIGINT[]) in_tok, unnest(?::BIGINT[]) out_tok, "
-            "         unnest(?::BIGINT[]) cache_read, unnest(?::BIGINT[]) cache_create) "
-            "QUALIFY row_number() OVER (PARTITION BY uuid ORDER BY ts) = 1 "
+        ingested_at = datetime.now(UTC)
+        normalized = []
+        for uuid, observed_at, model, surface, project, session, inputs, outputs, cache_read, cache_write in rows:
+            session = session or "?"
+            normalized.append(("claude", uuid, observed_at, ingested_at, session, uuid, model, surface,
+                               project, session, inputs, outputs, 0, cache_read, cache_write, 0, None))
+        con.executemany(
+            "INSERT INTO token_log(provider,source_event_id,observed_at,ingested_at,thread_id,turn_id,model,"
+            "surface,project,session_id,input_tokens,output_tokens,reasoning_tokens,cache_read_tokens,"
+            "cache_write_tokens,source_version,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT DO NOTHING",
-            [list(c) for c in cols])
-    con.executemany("INSERT INTO scanned VALUES (?, ?, ?) ON CONFLICT (path) DO UPDATE "
-                    "SET mtime=excluded.mtime, size=excluded.size",
-                    [(f, st.st_mtime, st.st_size) for f, st in todo])
+            normalized,
+        )
+    scanned_rows = []
+    updated_at = datetime.now(UTC)
+    for path, st in todo:
+        identity = f"{getattr(st, 'st_dev', 0)}:{getattr(st, 'st_ino', 0)}"
+        fingerprint = hashlib.sha256(f"{path}|{st.st_size}|{st.st_mtime_ns}".encode()).hexdigest()
+        scanned_rows.append(("claude", path, st.st_size, identity, fingerprint, st.st_size, st.st_mtime,
+                             updated_at))
+    con.executemany(
+        "INSERT INTO scanned(provider,path,cursor,file_identity,fingerprint,size,mtime,updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT (provider,path) DO UPDATE SET cursor=excluded.cursor, "
+        "file_identity=excluded.file_identity,fingerprint=excluded.fingerprint,size=excluded.size,"
+        "mtime=excluded.mtime,updated_at=excluded.updated_at",
+        scanned_rows,
+    )
 
 
 def _parse_many(paths: list) -> list:
@@ -2136,9 +2742,9 @@ def _session_window_start(rows, now_utc):
 
 def _burn_rows(con, since):
     """Tokens by model since `since` as (model, in, out, cache_read, cache_create) tuples."""
-    where = "WHERE ts >= ?" if since else ""
+    where = "WHERE provider='claude'" + (" AND observed_at >= ?" if since else "")
     return con.execute(
-        f"SELECT model, sum(in_tok), sum(out_tok), sum(cache_read), sum(cache_create) "
+        f"SELECT model,sum(input_tokens),sum(output_tokens),sum(cache_read_tokens),sum(cache_write_tokens) "
         f"FROM token_log {where} GROUP BY model", [since] if since else []).fetchall()
 
 
@@ -2162,11 +2768,12 @@ def burn(args):
     con = db()
     since = _parse_since(getattr(args, "since", None))
     scan_logs(con, since)
-    col = {"model": "model", "surface": "entrypoint", "day": "CAST(ts AS DATE)",
-           "project": "project", "session": "session"}[args.by]
-    where = "WHERE ts >= ?" if since else ""
+    col = {"model": "model", "surface": "surface", "day": "CAST(observed_at AS DATE)",
+           "project": "project", "session": "session_id"}[args.by]
+    where = "WHERE provider='claude'" + (" AND observed_at >= ?" if since else "")
     rows = con.execute(
-        f"SELECT {col} grp, model, sum(in_tok), sum(out_tok), sum(cache_read), sum(cache_create) "
+        f"SELECT {col} grp,model,sum(input_tokens),sum(output_tokens),sum(cache_read_tokens),"
+        f"sum(cache_write_tokens) "
         f"FROM token_log {where} GROUP BY grp, model", [since] if since else []).fetchall()
     if not rows:
         sys.exit("No Claude Code log data in period.")

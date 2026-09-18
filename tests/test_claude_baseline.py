@@ -12,7 +12,7 @@ import cmon
 def _seed_history() -> None:
     con = cmon.db()
     start = datetime(2030, 1, 1, tzinfo=UTC)
-    rows = [
+    legacy_rows = [
         (start, "session", "Current session", 20.0, start + timedelta(hours=5), True),
         (start, "weekly_all", "All models", 10.0, start + timedelta(days=7), True),
         (start + timedelta(hours=1), "session", "Current session", 30.0, start + timedelta(hours=5), True),
@@ -20,19 +20,38 @@ def _seed_history() -> None:
         (start + timedelta(hours=2), "session", "Current session", 5.0, start + timedelta(hours=7), True),
         (start + timedelta(hours=2), "weekly_all", "All models", 20.0, start + timedelta(days=7), True),
     ]
-    con.executemany("INSERT INTO snapshots VALUES (?, ?, ?, ?, ?, ?)", rows)
+    rows = []
+    for ordinal, (observed_at, key, label, percent, resets_at, is_active) in enumerate(legacy_rows):
+        role, window_minutes = ("5h", 300) if key == "session" else ("weekly", 10080)
+        rows.append(("claude", observed_at, observed_at, key, role, label, percent, window_minutes,
+                     resets_at, is_active, f"baseline-snapshot-{ordinal}", None))
+    con.executemany(
+        "INSERT INTO snapshots(provider,observed_at,ingested_at,key,role,label,percent,window_minutes,"
+        "resets_at,is_active,source_event_id,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        rows,
+    )
     con.close()
 
 
 def _seed_forecasts() -> None:
     con = cmon.db()
     start = datetime(2030, 1, 1, tzinfo=UTC)
-    rows = [
+    legacy_rows = [
         (start, "session", 1.0, start + timedelta(hours=1), 40.0, 30.0, 10.0, "learned", 42.0, start),
         (start, "session", 3.0, start + timedelta(hours=3), 50.0, 30.0, 8.0, "linear", 47.0, start),
         (start, "session", 5.0, start + timedelta(hours=5), 55.0, 30.0, 5.0, "linear", 60.0, start),
     ]
-    con.executemany("INSERT INTO forecasts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+    rows = [
+        ("claude", f"baseline-forecast-{ordinal}", observed_at, observed_at, key, horizon_h, target_ts,
+         pred_pct, pct0, rate, model, actual_pct, resolved_ts)
+        for ordinal, (observed_at, key, horizon_h, target_ts, pred_pct, pct0, rate, model, actual_pct,
+                      resolved_ts) in enumerate(legacy_rows)
+    ]
+    con.executemany(
+        "INSERT INTO forecasts(provider,source_event_id,observed_at,ingested_at,key,horizon_h,target_ts,"
+        "pred_pct,pct0,rate,model,actual_pct,resolved_ts) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        rows,
+    )
     con.close()
 
 
@@ -163,4 +182,3 @@ def test_fixture_directory_contains_only_synthetic_paths() -> None:
     assert "/home/" not in contents
     assert "sk-" not in contents
     assert "Bearer " not in contents
-
