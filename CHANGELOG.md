@@ -20,6 +20,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   into resumed sessions; rows are now keyed per API message (`message.id` + `requestId`).
   Existing history migrates once: rows from transcripts still on disk are re-read exactly,
   rows from deleted transcripts are deduplicated heuristically (~4% residual).
+- **`watch` no longer locks out the scheduled `collect`.** It held DuckDB's single-writer
+  connection for its whole session, so `collect --alert`, `burn`, `trends` and `plot` failed
+  while it ran. Each tick now fetches first, then opens, writes and closes; `collect` waits
+  up to 30 s for the lock, and `now --advice` releases it before the slow AI tip.
 - **Log scans no longer stall on large batches.** Rows are bulk-loaded through a private
   temp CSV instead of list parameters (~100 µs/element in DuckDB); a full rescan of 1.5k
   transcripts went from ~100 s to ~4 s.

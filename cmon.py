@@ -693,6 +693,23 @@ def _recent(con, ts) -> bool:
                             [ts - timedelta(seconds=DEDUP_SECS)]).fetchone()[0])
 
 
+def _db_retry(wait_s: float):
+    """Short-lived writable connection, retrying while another process holds DuckDB's
+    single-writer lock (a scheduled 'collect' takes ~1 s). None if still locked after
+    wait_s; any other error propagates."""
+    import time
+    deadline = time.monotonic() + wait_s
+    while True:
+        try:
+            return db()
+        except Exception as e:
+            if "lock" not in str(e).lower():
+                raise
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.25)
+
+
 def _read_db():
     """Open the DB for reading, or None if it's absent or busy — never raises. DuckDB is
     single-writer, so a running 'watch'/'collect' holds the lock; read paths degrade instead
@@ -726,7 +743,9 @@ def _snapshot(con=None):
 
 
 def collect(args):
-    con = db()  # dedicated collector: hold the write lock and surface errors (cron logs them)
+    con = _db_retry(30)  # dedicated collector: waits out a watch/burn tick holding the lock
+    if con is None:
+        sys.exit("cmon: database locked by another cmon process for 30s — skipped this collection")
     ts = datetime.now(UTC)
     if not getattr(args, "force", False) and _recent(con, ts):
         print(f"Snapshot <{DEDUP_SECS}s ago — skipped (use --force to save anyway).")
@@ -1824,6 +1843,8 @@ def _advice(rows, con, no_ai: bool = False):
 
     if no_ai:
         return
+    if con is not None:
+        con.close()  # claude -p can take ~2 min: don't hold DuckDB's single-writer lock meanwhile
     tip = _ai_tip("\n".join(summaries))
     if tip:
         print("Tips (Claude Sonnet):\n" + tip)
@@ -2432,13 +2453,24 @@ def watch(args):
     from rich.table import Table
     from rich.text import Text
 
-    con = db()  # writable: records each read (deduped), plus _rate and burn from logs
+    # No connection held across ticks: DuckDB allows one writer process, and a watch left open
+    # for hours used to lock out the scheduled collect (and burn/trends/plot). Each tick opens,
+    # writes and closes; meta writes do the same.
+    def remember_interval(value: float) -> None:
+        c = _db_retry(2)
+        if c is not None:
+            _meta_set(c, "watch_interval", str(value))
+            c.close()
+
     tz = _resolve_tz()  # resolved once, before Live(screen=True) takes over — any invalid-tz
                        # warning must print here, never inside render() (would corrupt the TUI)
     show_bar = getattr(args, "usage", False)
     base = float(args.interval)
     cur = base  # adaptive poll interval: grows on 403/errors, eases back on sustained success
-    learned = _meta_get(con, "watch_interval")
+    c0 = _db_retry(2)
+    learned = _meta_get(c0, "watch_interval")
+    if c0 is not None:
+        c0.close()
     if learned and learned[1] < 7200:  # reuse an interval learned safe within the last 2h
         try:
             cur = max(base, min(float(learned[0]), 300.0))
@@ -2455,12 +2487,20 @@ def watch(args):
         30s+ (timeout+retry), and before this the terminal stayed blank the whole time."""
         if cached is None:
             try:
-                rows, _ts = _snapshot(con)  # persists each read (deduped) via watch's own con
+                rows, _ts = _snapshot()  # network first, lock-free; persists via its own short write
             except FetchError as e:
                 return Panel(Text(f"{e}\nbacking off — next try in ~{cur:.0f}s", style="red"),
                              title="cmon watch — error", border_style="red"), False
         else:
             rows = cached[0]
+        con = _db_retry(5)  # None when collect holds the lock longer: show % without history
+        try:
+            return frame(con, rows, cached)
+        finally:
+            if con is not None:
+                con.close()
+
+    def frame(con, rows, cached):
         now_utc = datetime.now(UTC)
         t = Table(expand=True, header_style="bold")
         t.add_column("Window", ratio=None if show_bar else 1)
@@ -2472,7 +2512,7 @@ def watch(args):
         t.add_column("projection", justify="right")
         proj_src = ""
         for key, lbl, pct, reset, act in rows:
-            rate = _rate(con, key)
+            rate = _rate(con, key) if con is not None else None
             rem_h = ((datetime.fromisoformat(reset) - now_utc).total_seconds() / 3600
                      if reset else None)
             proj = "-"
@@ -2492,6 +2532,10 @@ def watch(args):
         now_local = now_utc.astimezone(tz)
         if cached is not None:  # no scan/burn/alerts on the cached frame: keep it instant
             body.append(Text(f"{now_local:%H:%M:%S} · cached {cached[1]:.0f}s ago · updating…",
+                             style="dim"))
+            return Panel(Group(*body), title="cmon watch", border_style="cyan"), True
+        if con is None:
+            body.append(Text(f"{now_local:%H:%M:%S} · history busy (another cmon is writing) · ^C quits",
                              style="dim"))
             return Panel(Group(*body), title="cmon watch", border_style="cyan"), True
         win = _session_window_start(rows, now_utc)
@@ -2524,12 +2568,12 @@ def watch(args):
                     ok_streak += 1
                     if ok_streak >= 5 and cur > base:  # stable again → ease back toward base
                         cur = max(base, cur / 1.5)
-                        _meta_set(con, "watch_interval", str(cur))
+                        remember_interval(cur)
                         ok_streak = 0
                 else:  # 403/blocked/error → back off (cap 5 min), remember for next session
                     cur = min(cur * 1.8, 300.0)
                     ok_streak = 0
-                    _meta_set(con, "watch_interval", str(cur))
+                    remember_interval(cur)
                 # jitter breaks the exact robotic cadence Cloudflare bot-detection flags
                 time.sleep(cur * random.uniform(0.85, 1.15))
         except KeyboardInterrupt:
