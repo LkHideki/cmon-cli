@@ -23,6 +23,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Rate alerts fire once per window cycle.** `collect --alert` re-notified on every run
+  (every 20 min by default) while the projection stayed above 100%; it now keeps the same
+  per-cycle marker as the lead alert.
+- **`wait` survives network blips.** Transient failures (network, 429/5xx, a Claude Code
+  token awaiting renewal) back off exponentially up to 5 min and keep waiting, with one
+  notice instead of exiting; only unrecoverable ones (no credential, 403) stop it.
 - **A 401 retry no longer costs an attempt.** After a 401 cmon re-reads Claude Code's
   credential once without spending a retry, so `status` (one attempt) picks up a renewed
   token instead of reporting offline.

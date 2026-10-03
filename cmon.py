@@ -104,7 +104,13 @@ except ImportError:
 
 
 class FetchError(Exception):
-    """Failure to query the usage endpoint, with user-readable message."""
+    """Failure to query the usage endpoint, with user-readable message. transient=True when
+    waiting can fix it (network, 429/5xx, a Claude Code token that renews when it runs);
+    False when it can't (no credential at all, 403 block)."""
+
+    def __init__(self, msg: str, transient: bool = True):
+        super().__init__(msg)
+        self.transient = transient
 
 
 def _keyring():
@@ -213,7 +219,7 @@ def get_token() -> tuple[str, str]:
     src, tok, exp = _resolve_token()
     if not tok:
         raise FetchError("no token — log in to Claude Code, run 'cmon token set', "
-                         "or set CLAUDE_OAUTH_TOKEN.")
+                         "or set CLAUDE_OAUTH_TOKEN.", transient=False)
     if exp is not None and exp / 1000 <= time.time():
         raise FetchError("Claude Code's access token has expired; it renews the next time Claude "
                          "Code runs (any prompt). cmon never refreshes it itself — that would log "
@@ -497,7 +503,7 @@ def fetch(retries: int = RETRIES, timeout: float = 30) -> dict:
                                  "its own login), run 'cmon token set', or fix CLAUDE_OAUTH_TOKEN.")
             if r.status_code == 403:
                 raise FetchError("403 — blocked (Cloudflare/User-Agent) or no access. "
-                                 "The private endpoint may have changed.")
+                                 "The private endpoint may have changed.", transient=False)
             if r.status_code == 429 or r.status_code >= 500:
                 last, wait = f"HTTP {r.status_code}", _retry_after(r) or 2 ** attempt
             else:
@@ -724,9 +730,7 @@ def collect(args):
     for _k, lbl, pct, reset, _a in rows:
         print(f"  {lbl:16} {pct:4.0f}%  reset {reset[:16] if reset else '-'}")
     if getattr(args, "alert", False):
-        for m in _alerts(rows, con):  # rate-based: at current pace hits 100% before reset
-            print(f"⚠ {m}", file=sys.stderr)
-            _notify("cmon — Claude limit", m)
+        _fire_rate_alerts(rows, con)  # rate-based: at current pace hits 100% before reset
         _fire_lead_alert(rows)  # time-based: 5h window resets in <= CMON_ALERT_LEAD min (+ hook)
 
 
@@ -1602,7 +1606,12 @@ def _print_backtest(rows, as_json: bool, header: str) -> None:
 
 
 def _alerts(rows, con, tz=None) -> list[str]:
-    """Alert when, at the projected pace, a window hits 100% before reset.
+    """Messages for windows that, at the projected pace, hit 100% before reset."""
+    return [msg for _key, _reset, msg in _rate_alerts(rows, con, tz)]
+
+
+def _rate_alerts(rows, con, tz=None) -> list[tuple[str, str, str]]:
+    """(key, resets_at, message) per window that hits 100% before reset at the projected pace.
     Needs history (via _rate); without database/rate produces nothing. watch passes its
     pre-resolved tz (a _resolve_tz here could print into the Live TUI)."""
     now_utc = datetime.now(UTC)
@@ -1619,7 +1628,7 @@ def _alerts(rows, con, tz=None) -> list[str]:
             continue
         _proj, eta, _w = _project(con, pct, rate, rem_h, now_utc, tz, key)
         if eta is not None:
-            msgs.append(f"{lbl}: 100% in ~{eta:.1f}h (~{rem_h - eta:.1f}h before reset)")
+            msgs.append((key, reset, f"{lbl}: 100% in ~{eta:.1f}h (~{rem_h - eta:.1f}h before reset)"))
     return msgs
 
 
@@ -1709,6 +1718,19 @@ def _fire_lead_alert(rows) -> None:
         _notify(f"cmon — {LEAD_LABEL_BY_KEY.get(key, key)}", msg)
         _run_hook(msg)
         _mark_alert(f"lead_{key}", marker)
+
+
+def _fire_rate_alerts(rows, con) -> None:
+    """Notify once per window cycle that the pace will exhaust it before reset. Without the
+    dedup, every scheduled collect (default 20 min) re-notified for as long as the projection
+    stayed above 100%. Same per-cycle marker as the lead alert (reset to the nearest minute)."""
+    for key, reset, msg in _rate_alerts(rows, con):
+        marker = round(datetime.fromisoformat(reset).timestamp() / 60)
+        print(f"⚠ {msg}", file=sys.stderr)
+        if _alert_fired(f"rate_{key}", marker):
+            continue
+        _notify("cmon — Claude limit", msg)
+        _mark_alert(f"rate_{key}", marker)
 
 
 def _ai_tip(summary: str) -> str | None:
@@ -1975,10 +1997,28 @@ def wait(args):
     Ctrl-C cancels. Poll every --interval s; in reset mode sleep until resets_at."""
     import time
     key = args.window
+    warned = [None]
 
     def get():
-        rows, _ts = _snapshot()  # con-less: best-effort short-lived persist, no long-held lock
-        return next((r for r in rows if r[0] == key), None)
+        """The window's row, riding out transient failures: a wait can span hours, and one
+        network blip (or Claude Code's token expiring until it next runs) used to end it."""
+        delay = args.interval
+        while True:
+            try:
+                rows, _ts = _snapshot()  # con-less: short-lived persist, no long-held lock
+            except FetchError as e:
+                if not e.transient:
+                    raise
+                if warned[0] != str(e):
+                    print(f"cmon: {e} — retrying in {delay:.0f}s (Ctrl-C quits)", file=sys.stderr)
+                    warned[0] = str(e)
+                time.sleep(delay)
+                delay = min(delay * 2, 300)
+                continue
+            if warned[0]:
+                print("cmon: connection restored", file=sys.stderr)
+                warned[0] = None
+            return next((r for r in rows if r[0] == key), None)
 
     try:
         row = get()
