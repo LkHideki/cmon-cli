@@ -579,6 +579,15 @@ def db(create: bool = True):
                 "ts TIMESTAMPTZ, key TEXT, horizon_h DOUBLE, target_ts TIMESTAMPTZ, "
                 "pred_pct DOUBLE, pct0 DOUBLE, rate DOUBLE, model TEXT, "
                 "actual_pct DOUBLE, resolved_ts TIMESTAMPTZ)")
+    _ensure_token_tables(con)  # read paths (burn line, hourly profile) query token_terminal
+    # What counts against the quota cmon reads: the terminal's account (~/.claude.json). The
+    # Claude Desktop app can be signed into another account yet writes its Claude Code
+    # sessions to the same ~/.claude/projects (entrypoint 'claude-desktop'); those count only
+    # when Desktop's own session index ties them to the terminal account. Unattributable
+    # Desktop sessions are left out — over-reporting someone else's usage is the worse error.
+    con.execute("CREATE VIEW IF NOT EXISTS token_terminal AS SELECT * FROM token_log "
+                "WHERE entrypoint <> 'claude-desktop' OR session IN (SELECT session FROM session_account "
+                "WHERE account = (SELECT value FROM meta WHERE key = 'terminal_account'))")
     return con
 
 
@@ -888,7 +897,7 @@ def _burn_ax(ax, con, since) -> None:
     where = "WHERE ts >= ?" if since else ""
     df = con.execute(
         f"SELECT CAST(ts AS DATE) d, model, sum(in_tok) i, sum(out_tok) o, "
-        f"sum(cache_read) r, sum(cache_create) c FROM token_log {where} GROUP BY d, model",
+        f"sum(cache_read) r, sum(cache_create) c FROM token_terminal {where} GROUP BY d, model",
         [since] if since else []).df()
     if df.empty:
         ax.text(0.5, 0.5, "no Claude Code log data", ha="center", va="center", transform=ax.transAxes)
@@ -1111,7 +1120,7 @@ def _day_weights(con, tz, now_utc, halflife_d):
     with a PROFILE_HALFLIFE_D half-life, so the learned shape follows your current routine
     and old habits fade instead of dropping off a cliff when a fixed window slides."""
     cutoff = now_utc - timedelta(days=PROFILE_MAX_AGE_D)
-    first = con.execute("SELECT min(ts) FROM token_log WHERE ts > ?", [cutoff]).fetchone()[0]
+    first = con.execute("SELECT min(ts) FROM token_terminal WHERE ts > ?", [cutoff]).fetchone()[0]
     if first is None:
         return {}, 0
     now_local = now_utc.astimezone(tz)
@@ -1152,7 +1161,7 @@ def _hour_buckets_tokens(con, tz, now_utc, halflife_d):
     # token_log holds 100k+ rows and this runs on every watch poll after the cache expires.
     rows = con.execute(
         "SELECT (timezone(?, ts))::DATE, hour(timezone(?, ts)), "
-        "sum(in_tok + out_tok + coalesce(cache_read, 0) / 10.0) FROM token_log "
+        "sum(in_tok + out_tok + coalesce(cache_read, 0) / 10.0) FROM token_terminal "
         "WHERE ts > ? AND ts <= ? AND in_tok IS NOT NULL GROUP BY 1, 2",
         [str(tz), str(tz), now_utc - timedelta(days=PROFILE_MAX_AGE_D), now_utc]).fetchall()
     for day, hour, tok in rows:
@@ -2136,6 +2145,41 @@ def _ensure_token_tables(con, name: str = "token_log") -> None:
                 "project TEXT, session TEXT, "
                 "in_tok BIGINT, out_tok BIGINT, cache_read BIGINT, cache_create BIGINT)")
     con.execute("CREATE TABLE IF NOT EXISTS scanned(path TEXT PRIMARY KEY, mtime DOUBLE, size BIGINT)")
+    con.execute("CREATE TABLE IF NOT EXISTS session_account(session TEXT PRIMARY KEY, account TEXT)")
+
+
+DESKTOP_SESSIONS = os.path.expanduser("~/Library/Application Support/Claude/claude-code-sessions")
+
+
+def _terminal_account() -> str | None:
+    """accountUuid the terminal's Claude Code is signed into, or None."""
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~")
+    try:
+        with open(os.path.join(base, ".claude.json"), encoding="utf-8") as f:
+            return (json.load(f).get("oauthAccount") or {}).get("accountUuid") or None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _sync_accounts(con) -> None:
+    """Record the terminal account and map Desktop sessions to accounts. Desktop keeps one
+    JSON per session under claude-code-sessions/<account>/<org>/, carrying the transcript's
+    session id as cliSessionId. Mappings are kept after Desktop prunes its index."""
+    import glob
+    _meta_set(con, "terminal_account", _terminal_account() or "")
+    pairs = {}
+    for path in glob.glob(os.path.join(DESKTOP_SESSIONS, "*", "*", "*.json")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                sid = json.load(f).get("cliSessionId")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(sid, str) and sid:
+            pairs[sid] = os.path.relpath(path, DESKTOP_SESSIONS).split(os.sep)[0]
+    known = {r[0] for r in con.execute("SELECT session FROM session_account").fetchall()}
+    new = [(k, v) for k, v in pairs.items() if k not in known]
+    if new:
+        con.executemany("INSERT INTO session_account VALUES (?, ?)", new)
 
 
 def scan_logs(con, since=None, quiet: bool = False) -> None:
@@ -2171,6 +2215,7 @@ def scan_logs(con, since=None, quiet: bool = False) -> None:
         todo.append((f, st))
     if not todo and not migrate:
         return
+    _sync_accounts(con)
     if not quiet and todo:
         print(f"scanning {len(todo)} log file(s)…", file=sys.stderr)
     parsed = _parse_many([f for f, _ in todo])  # parallel (with serial fallback)
@@ -2286,7 +2331,7 @@ def _burn_rows(con, since):
     where = "WHERE ts >= ?" if since else ""
     return con.execute(
         f"SELECT model, sum(in_tok), sum(out_tok), sum(cache_read), sum(cache_create) "
-        f"FROM token_log {where} GROUP BY model", [since] if since else []).fetchall()
+        f"FROM token_terminal {where} GROUP BY model", [since] if since else []).fetchall()
 
 
 def _burn_summary(rows):
@@ -2312,9 +2357,13 @@ def burn(args):
     col = {"model": "model", "surface": "entrypoint", "day": "CAST(ts AS DATE)",
            "project": "project", "session": "session"}[args.by]
     where = "WHERE ts >= ?" if since else ""
+    src = "token_log" if getattr(args, "all_accounts", False) else "token_terminal"
     rows = con.execute(
         f"SELECT {col} grp, model, sum(in_tok), sum(out_tok), sum(cache_read), sum(cache_create) "
-        f"FROM token_log {where} GROUP BY grp, model", [since] if since else []).fetchall()
+        f"FROM {src} {where} GROUP BY grp, model", [since] if since else []).fetchall()
+    excluded = 0 if src == "token_log" else con.execute(
+        f"SELECT coalesce(sum(in_tok + out_tok + cache_read + cache_create), 0) FROM token_log {where}",
+        [since] if since else []).fetchone()[0] - sum(i + o + r + c for _g, _m, i, o, r, c in rows)
     if not rows:
         sys.exit("No Claude Code log data in period.")
     # Per-group tokens+cost, and per-component totals — cost needs the per-model price map,
@@ -2365,7 +2414,10 @@ def burn(args):
     cache = ccost["cache read"] + ccost["cache write"]
     print(f"\n→ Real work (input+output): US$ {real:.0f} · Cache (context re-reading): US$ {cache:.0f}")
     print("\nAPI EQUIVALENT cost (pay-per-token) — you pay subscription, not this.")
-    print("Estimate; Claude Code CLI usage only (doesn't include claude.ai web/desktop).")
+    print("Estimate; Claude Code sessions of the terminal's account only (not claude.ai chat).")
+    if excluded:
+        print(f"Excluded {excluded / 1e6:.1f}M tok from Claude Desktop sessions of another or unknown "
+              f"account (--all-accounts to include).")
 
 
 def watch(args):
@@ -2663,6 +2715,8 @@ def main():
     pb.add_argument("--since", default="30d",
                     help="window: '24h', '7d', '30d' (default), ISO date, or 'all' for everything")
     pb.add_argument("--json", action="store_true", help="JSON output")
+    pb.add_argument("--all-accounts", action="store_true",
+                    help="include Claude Desktop sessions not tied to the terminal's account")
     pc = sub.add_parser("collect", help="save 1 snapshot to database")
     pc.add_argument("--force", action="store_true", help="save even with recent snapshot (bypass dedup)")
     pc.add_argument("--alert", action="store_true",

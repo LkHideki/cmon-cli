@@ -188,7 +188,17 @@ uv run cmon burn --by project       # attribution by project (where your plan we
 uv run cmon burn --since 7d         # smaller window (24h, 7d, ISO date…)
 uv run cmon burn --since all        # full history (but Claude Code only keeps ~30d)
 uv run cmon burn --json
+uv run cmon burn --all-accounts     # include Desktop sessions of other accounts (see below)
 ```
+
+**Which account counts.** Only the account the terminal's Claude Code is signed into
+(`~/.claude.json`) — the one whose quota cmon reads. The Claude Desktop app may be signed
+into another account yet writes its Claude Code sessions to the same transcripts folder;
+those count only when Desktop's session index
+(`~/Library/Application Support/Claude/claude-code-sessions/<account>/…`) ties them to the
+terminal account. Sessions it can't attribute are left out of burn, the `watch` burn line,
+the hourly profile and `plot`, and `burn` reports how much was excluded. VS Code and
+terminal sessions share the terminal's login, so they always count.
 
 The default window is **30 days** — Claude Code deletes transcripts older than
 that, so beyond 30d there's usually no data. Use `--since all` for everything

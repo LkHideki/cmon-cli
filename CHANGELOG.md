@@ -26,6 +26,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Per-account token accounting.** Claude Code sessions run from Claude Desktop under a
+  different account no longer inflate burn, the hourly profile or `plot`; `burn` reports
+  what it excluded and `--all-accounts` brings it back.
 - **`cmon status --json`** — versioned, provider-grouped payload read from the local cache.
 - **cmon Bar** (`menubar/`) — native macOS menu bar item with a configurable compact title
   and a per-window breakdown; installed with `menubar/install.sh`.
