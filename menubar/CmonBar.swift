@@ -64,8 +64,10 @@ struct Settings: Codable {
             let enc = JSONEncoder()
             enc.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
             try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
-                                                     withIntermediateDirectories: true)
+                                                     withIntermediateDirectories: true,
+                                                     attributes: [.posixPermissions: 0o700])
             try? enc.encode(Settings()).write(to: url)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
         }
         return Settings()
     }

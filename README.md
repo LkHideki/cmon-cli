@@ -53,7 +53,9 @@ in case it was renewed meanwhile. The refresh chain older versions kept in the v
 (`claude-oauth-auto`) is deleted on first run.
 
 In short, with Claude Code logged in you need nothing. Without it, `cmon token set` stores the token securely
-on any system. `.env` still works for step 1 (see `.env.example`). Run `cmon --help`
+on any system. Settings and step 1 can also live in `~/.cmon/.env` (see `.env.example`);
+cmon never reads a `.env` from the directory you run it in, so a project's `.env` can't
+set its alert hook or swap in another account's token. Run `cmon --help`
 or `cmon token --help` for the rest.
 
 ## Config

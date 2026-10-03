@@ -15,6 +15,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+- **`.env` is no longer read from the current directory.** A project's `.env` could set
+  `CMON_HOOK` (run with a shell on alerts), `CMON_DB`, or another account's token. Only
+  `~/.cmon/.env` and the cmon checkout's own `.env` are read, before settings load (so
+  tuning variables there now take effect); files writable by others are refused.
+- **`claude -p` runs sandboxed** from an empty private directory, so an untrusted repo's
+  `.claude/settings.json` hooks and `CLAUDE.md` don't apply to the AI tip; it and the alert
+  hook no longer inherit `CLAUDE_OAUTH_TOKEN`.
+- **`~/.cmon` is private (0700)** and a new database is created 0600 — it holds project
+  names and session ids.
 - **cmon no longer logs Claude Code out.** It used to redeem Claude Code's `refresh_token`
   and keep the rotated chain in its own vault entry; since refresh tokens rotate on use,
   this invalidated Claude Code's login. Claude Code's credential is now strictly read-only,

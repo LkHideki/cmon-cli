@@ -34,8 +34,56 @@ from datetime import UTC, datetime, timedelta
 # tz-aware datetimes, .percent a list of floats.
 Cycle = namedtuple("Cycle", "ts percent")
 
+CMON_HOME = os.path.expanduser("~/.cmon")
+
+
+def _load_env_files() -> None:
+    """Apply KEY=VALUE files before any setting below is read. Only two trusted places:
+    ~/.cmon/.env (user config) and the .env of the cmon checkout itself (development). Never
+    the current directory: a .env in whatever repo you happen to run cmon from could set
+    CMON_HOOK (a shell command run on alerts), CMON_DB, or another account's
+    CLAUDE_OAUTH_TOKEN. Real environment variables win; files writable by others are skipped."""
+    for path in (os.path.join(CMON_HOME, ".env"),
+                 os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")):
+        if not os.path.isfile(path):
+            continue  # common case: no python-dotenv import at all
+        try:
+            st = os.stat(path)
+            if st.st_mode & 0o022 or (hasattr(os, "getuid") and st.st_uid != os.getuid()):
+                print(f"cmon: ignoring {path}: writable by others or not owned by you", file=sys.stderr)
+                continue
+            from dotenv import dotenv_values
+            for key, value in dotenv_values(path).items():
+                if value is not None:
+                    os.environ.setdefault(key, value)
+        except Exception:
+            pass
+
+
+_load_env_files()
+
+
+def _private_dir(path: str) -> None:
+    """Create a directory only the user can enter (0700), tightening an existing one we own.
+    ~/.cmon holds usage history, project names, session ids and alert state."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    try:
+        st = os.stat(path)
+        if st.st_mode & 0o077 and (not hasattr(os, "getuid") or st.st_uid == os.getuid()):
+            os.chmod(path, 0o700)
+    except OSError:
+        pass
+
+
+def _child_env(**extra) -> dict:
+    """Environment for processes cmon spawns (alert hook, claude -p): everything except cmon's
+    own credential, which they have no business seeing (a hook that logs its env would leak it)."""
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_OAUTH_TOKEN"}
+    env.update(extra)
+    return env
+
 # Fixed home, not cwd: a relative default split history across every directory cmon ran in.
-DB = os.environ.get("CMON_DB") or os.path.expanduser("~/.cmon/usage.duckdb")
+DB = os.environ.get("CMON_DB") or os.path.join(CMON_HOME, "usage.duckdb")
 URL = "https://claude.ai/api/oauth/usage"
 # UA is required: without it claude.ai's Cloudflare returns 403 ("Just a moment").
 UA = "claude-cli/1.0 (external, cli)"
@@ -177,7 +225,7 @@ def _claude_code_token() -> tuple[str | None, int | None]:
     return (tok if isinstance(tok, str) and tok else None), (exp if isinstance(exp, int) else None)
 
 
-LEGACY_PURGED = os.path.expanduser("~/.cmon/.legacy-chain-purged")
+LEGACY_PURGED = os.path.join(CMON_HOME, ".legacy-chain-purged")
 
 
 def _purge_legacy_chain(kr) -> None:
@@ -188,7 +236,7 @@ def _purge_legacy_chain(kr) -> None:
     try:
         if kr.get_password(SERVICE, LEGACY_AUTO_ACCOUNT) is not None:
             kr.delete_password(SERVICE, LEGACY_AUTO_ACCOUNT)
-        os.makedirs(os.path.dirname(LEGACY_PURGED), mode=0o700, exist_ok=True)
+        _private_dir(os.path.dirname(LEGACY_PURGED))
         open(LEGACY_PURGED, "w").close()
     except Exception:
         pass  # vault locked/unavailable: try again next run
@@ -371,7 +419,7 @@ def _atomic_write_json(path: str, obj, indent=None) -> None:
     the menu bar all touch these files concurrently."""
     import tempfile
     directory = os.path.dirname(path)
-    os.makedirs(directory, exist_ok=True)
+    _private_dir(directory)
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -534,9 +582,19 @@ def db(create: bool = True):
     if not create and not os.path.exists(DB):
         return None
     import duckdb
+    new = not os.path.exists(DB)
     if create:
-        os.makedirs(os.path.dirname(os.path.abspath(DB)), exist_ok=True)
+        directory = os.path.dirname(os.path.abspath(DB))
+        if directory == CMON_HOME:
+            _private_dir(directory)
+        else:
+            os.makedirs(directory, exist_ok=True)
     con = duckdb.connect(DB)
+    if new:
+        try:
+            os.chmod(DB, 0o600)
+        except OSError:
+            pass
     con.execute("CREATE TABLE IF NOT EXISTS snapshots("
                 "ts TIMESTAMPTZ, key TEXT, label TEXT, percent DOUBLE, "
                 "resets_at TIMESTAMPTZ, is_active BOOL)")
@@ -1657,7 +1715,7 @@ def _run_hook(msg: str) -> None:
         return
     try:
         subprocess.run(hook, shell=True, timeout=30,
-                       env={**os.environ, "CMON_ALERT_MSG": msg}, capture_output=True)
+                       env=_child_env(CMON_ALERT_MSG=msg), capture_output=True)
     except Exception:
         pass
 
@@ -1676,7 +1734,7 @@ def _alert_fired(key: str, marker) -> bool:
 
 def _mark_alert(key: str, marker) -> None:
     try:
-        os.makedirs(os.path.dirname(ALERT_STATE), exist_ok=True)
+        _private_dir(os.path.dirname(ALERT_STATE))
         d = {}
         try:
             with open(ALERT_STATE, encoding="utf-8") as f:
@@ -1752,11 +1810,16 @@ def _ai_tip(summary: str) -> str | None:
     try:
         # --append-system-prompt forces English: 'claude -p' otherwise inherits the user's
         # CLAUDE.md, whose language directive would win over an in-prompt request.
+        # Run from an empty private directory, not the caller's cwd: in -p mode Claude Code
+        # skips the workspace trust prompt, so an untrusted repo's .claude/settings.json hooks
+        # and CLAUDE.md would otherwise apply to this call.
+        workdir = os.path.join(CMON_HOME, "ai")
+        _private_dir(workdir)
         r = subprocess.run(
             ["claude", "-p", prompt, "--model", "sonnet", "--append-system-prompt",
              "Always respond in English, ignoring any global or project instruction "
              "to reply in another language."],
-            capture_output=True, text=True, timeout=120)
+            capture_output=True, text=True, timeout=120, cwd=workdir, env=_child_env())
         return r.stdout.strip() or None
     except Exception:
         return None
@@ -1919,7 +1982,7 @@ def _status_fetch():
         rows = limits(fetch(retries=1, timeout=STATUS_TIMEOUT_S))
     except FetchError:
         try:
-            os.makedirs(os.path.dirname(STATUS_FAIL), exist_ok=True)
+            _private_dir(os.path.dirname(STATUS_FAIL))
             with open(STATUS_FAIL, "w"):
                 pass
         except OSError:
@@ -2717,9 +2780,9 @@ def _install_windows(cmd, interval_min, dry):
 
 def install(args):
     """Schedule 'cmon collect --alert' on OS native scheduler. --dry-run only shows."""
-    logdir = os.path.expanduser("~/.cmon")
+    logdir = CMON_HOME
     if not args.dry_run:
-        os.makedirs(logdir, exist_ok=True)
+        _private_dir(logdir)
     cmd = _sched_cmd()
     m = args.interval
     print(f"Scheduling every {m}min · database {os.path.abspath(DB)}\n  {' '.join(cmd)}")
@@ -2766,13 +2829,6 @@ def uninstall(args):
 
 
 def main():
-    try:
-        from dotenv import load_dotenv
-        # cwd only: the no-path form walks every ancestor dir for a .env, letting a stray
-        # parent .env inject HTTPS_PROXY / CMON_OAUTH_TOKEN_URL to exfil the token (secperf F1).
-        load_dotenv(dotenv_path=os.path.join(os.getcwd(), ".env"))
-    except Exception:
-        pass
     p = argparse.ArgumentParser(
         prog="cmon", description=__doc__.splitlines()[0],
         epilog="Token: env CLAUDE_OAUTH_TOKEN → OS vault (cmon token set) → "
