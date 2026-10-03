@@ -24,7 +24,7 @@ struct Settings: Codable {
     var hotMinutes = 60
     var hotRefreshSeconds = 59
     var cmon = "~/.local/bin/cmon"
-    var watchCommand = "open -na Ghostty --args -e $HOME/.local/bin/cmon watch"
+    var watchCommand = #"osascript -e 'tell application "Terminal" to do script "~/.local/bin/cmon watch"' -e 'tell application "Terminal" to activate'"#
 
     enum CodingKeys: String, CodingKey {
         case segments, separator, cmon

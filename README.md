@@ -142,7 +142,8 @@ menubar/install.sh uninstall
 ```
 
 Title, refresh interval, stale threshold and the "Open cmon watch" command live in
-`~/.cmon/bar.json`, re-read on every refresh. The title is `segments` joined by
+`~/.cmon/bar.json`, re-read on every refresh. `watch_command` defaults to Terminal.app;
+for another terminal set e.g. `"open -na Ghostty --args -e $HOME/.local/bin/cmon watch"`. The title is `segments` joined by
 `separator`; an empty segment keeps its slot, so positions never shift. Placeholders: `{5h}` `{wk}` `{reset}` (minutes)
 `{reset_hm}` — both blank until 5h usage is above `reset_above_percent` — `{wk_reset_h}`
 (hours) `{wk_reset_hm}` `{age}` (minutes since collection). The title dims when data is
