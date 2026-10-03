@@ -111,15 +111,18 @@ func parseISO(_ s: String) -> Date? {
 
 // MARK: - Formatting
 
+// Under a minute, durations count in seconds: "0 min" reads as frozen.
 func compactDuration(_ seconds: TimeInterval) -> String {
-    let m = max(Int(seconds / 60), 0)
+    if seconds < 60 { return "\(max(Int(seconds), 0))s" }
+    let m = Int(seconds / 60)
     if m >= 1440 { return "\(m / 1440)d\(m % 1440 / 60)h" }
     if m >= 60 { return "\(m / 60)h\(m % 60)m" }
     return "\(m)m"
 }
 
 func spacedDuration(_ seconds: TimeInterval) -> String {
-    let m = max(Int(seconds / 60), 0)
+    if seconds < 60 { return "\(max(Int(seconds), 0))s" }
+    let m = Int(seconds / 60)
     if m >= 1440 { return "\(m / 1440)d \(m % 1440 / 60)h" }
     if m >= 60 { return "\(m / 60)h \(m % 60)m" }
     return "\(m) min"
@@ -136,7 +139,7 @@ func renderTitle(_ settings: Settings, _ snap: Snapshot, now: Date) -> String {
     let values: [String: String] = [
         "5h": pct(session),
         "wk": pct(weekly),
-        "reset": hot ? left(session).map { String(Int($0 / 60)) } ?? "" : "",
+        "reset": hot ? left(session).map { $0 < 60 ? "\(Int($0))s" : String(Int($0 / 60)) } ?? "" : "",
         "reset_hm": hot ? left(session).map(compactDuration) ?? "" : "",
         "wk_reset_h": left(weekly).map { String(Int($0 / 3600)) } ?? "–",
         "wk_reset_hm": left(weekly).map(compactDuration) ?? "–",
@@ -164,7 +167,8 @@ func resetDetail(_ q: Quota, now: Date) -> String {
 // MARK: - Menu row: label, percent, thin progress bar, reset line
 
 final class QuotaRowView: NSView {
-    private let title: String, percent: Double, detail: String
+    private let title: String, percent: Double
+    var detail: String { didSet { if detail != oldValue { needsDisplay = true } } }
 
     init(title: String, percent: Double, detail: String) {
         self.title = title
@@ -223,6 +227,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var error: String?
     private var timer: Timer?
     private var busy = false
+    // 1 Hz ticker: only redraws local text (no cmon, no network), and only runs while the menu
+    // is open or the 5h reset is under a minute away — so countdowns move second by second
+    // exactly when someone is looking, and the app is otherwise idle.
+    private var ticker: Timer?
+    private var menuOpen = false
+    private var rowViews: [String: QuotaRowView] = [:]
+    private var updatedItem: NSMenuItem?
+    private var lastResetPoll: Date?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         menu.delegate = self
@@ -245,6 +257,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let reset = s.resetDate else { return false }
         let left = reset.timeIntervalSinceNow
         return left > 0 && left < TimeInterval(settings.hotMinutes * 60)
+    }
+
+    private var sessionLeft: TimeInterval? { snapshot?.window("session")?.resetDate?.timeIntervalSinceNow }
+
+    private func updateTicker() {
+        let near = sessionLeft.map { $0 > -120 && $0 <= 60 } ?? false  // last minute + catch-up
+        if menuOpen || near {
+            guard ticker == nil else { return }
+            let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.tick() }
+            }
+            t.tolerance = 0.1
+            RunLoop.main.add(t, forMode: .common)
+            ticker = t
+        } else {
+            ticker?.invalidate()
+            ticker = nil
+        }
+    }
+
+    private func tick() {
+        let now = Date()
+        render()
+        if menuOpen, let snap = snapshot {
+            for q in snap.windows { rowViews[q.key]?.detail = resetDetail(q, now: now) }
+            updatedItem?.title = updatedTitle(snap, now: now)
+        }
+        // The window just rolled over: fetch the new cycle (every 5 s until it shows up).
+        if let left = sessionLeft, left <= 0, now.timeIntervalSince(lastResetPoll ?? .distantPast) >= 5 {
+            lastResetPoll = now
+            refresh(live: true)
+        }
+        updateTicker()
+    }
+
+    private func updatedTitle(_ snap: Snapshot, now: Date) -> String {
+        guard let observed = snap.observedDate else { return "Updated –" }
+        let age = now.timeIntervalSince(observed)
+        return age < 5 ? "Updated just now" : "Updated \(spacedDuration(age)) ago"
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        menuOpen = true
+        updateTicker()
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        menuOpen = false
+        updateTicker()
     }
 
     private func schedule() {
@@ -278,6 +339,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 self.schedule()  // hot mode may have started or ended
                 self.render()
+                if self.menuOpen { self.menuNeedsUpdate(self.menu) }  // fresh numbers in an open menu
+                self.updateTicker()
             }
         }
     }
@@ -329,21 +392,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .joined(separator: "  ·  ")
     }
 
-    // Rebuilt on open so relative times are always current.
+    // Rebuilt on open; while open, tick() keeps the countdowns and "Updated" line moving.
     func menuNeedsUpdate(_ menu: NSMenu) {
         let now = Date()
         menu.removeAllItems()
+        rowViews = [:]
+        updatedItem = nil
         menu.addItem(.sectionHeader(title: "Claude"))
         if let snap = snapshot, !snap.offline {
             for q in snap.windows {
                 let row = NSMenuItem()
-                row.view = QuotaRowView(title: displayName(q), percent: q.percent, detail: resetDetail(q, now: now))
+                let view = QuotaRowView(title: displayName(q), percent: q.percent, detail: resetDetail(q, now: now))
+                rowViews[q.key] = view
+                row.view = view
                 menu.addItem(row)
             }
             menu.addItem(.separator())
-            let age = snap.observedDate.map { spacedDuration(now.timeIntervalSince($0)) } ?? "–"
-            let updated = NSMenuItem(title: "Updated \(age) ago", action: nil, keyEquivalent: "")
+            let updated = NSMenuItem(title: updatedTitle(snap, now: now), action: nil, keyEquivalent: "")
             updated.isEnabled = false
+            updatedItem = updated
             menu.addItem(updated)
             if isStale(snap, now: now) {
                 let hint = NSMenuItem(title: "Data is stale — schedule collection with `cmon install`",
