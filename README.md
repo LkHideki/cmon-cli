@@ -108,8 +108,15 @@ uv run cmon tune      # fit the projection's parameters to your own history
 uv run cmon install   # schedule background collection in OS scheduler
 ```
 
-Global option `--db PATH` (before the subcommand) overrides `CMON_DB`:
-`uv run cmon --db ~/.cmon/usage.duckdb now`.
+History lives in `~/.cmon/usage.duckdb` whatever directory you run from. Global option
+`--db PATH` (before the subcommand) overrides `CMON_DB`: `uv run cmon --db /tmp/x.duckdb now`.
+
+Up to 0.5.0 the default was `./usage.duckdb`, so history may be split across the
+directories cmon ran in. Merge them once (sources are read-only, overlaps deduplicated):
+
+```sh
+cmon import ~/usage.duckdb ~/Projects/*/usage.duckdb
+```
 
 ### `cmon status` — statusline
 

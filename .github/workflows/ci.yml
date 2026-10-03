@@ -19,5 +19,7 @@ jobs:
       - run: uv sync
       - name: Ruff
         run: uv run ruff check .
+      - name: Tests
+        run: uv run pytest -q
       - name: Smoke (imports the module and validates CLI, no network)
         run: uv run cmon --help

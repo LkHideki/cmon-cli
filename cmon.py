@@ -35,7 +35,8 @@ from datetime import UTC, datetime, timedelta
 # tz-aware datetimes, .percent a list of floats.
 Cycle = namedtuple("Cycle", "ts percent")
 
-DB = os.environ.get("CMON_DB", "usage.duckdb")
+# Fixed home, not cwd: a relative default split history across every directory cmon ran in.
+DB = os.environ.get("CMON_DB") or os.path.expanduser("~/.cmon/usage.duckdb")
 URL = "https://claude.ai/api/oauth/usage"
 # UA is required: without it claude.ai's Cloudflare returns 403 ("Just a moment").
 UA = "claude-cli/1.0 (external, cli)"
@@ -563,6 +564,8 @@ def db(create: bool = True):
     if not create and not os.path.exists(DB):
         return None
     import duckdb
+    if create:
+        os.makedirs(os.path.dirname(os.path.abspath(DB)), exist_ok=True)
     con = duckdb.connect(DB)
     con.execute("CREATE TABLE IF NOT EXISTS snapshots("
                 "ts TIMESTAMPTZ, key TEXT, label TEXT, percent DOUBLE, "
@@ -733,6 +736,54 @@ def collect(args):
             print(f"⚠ {m}", file=sys.stderr)
             _notify("cmon — Claude limit", m)
         _fire_lead_alert(rows)  # time-based: 5h window resets in <= CMON_ALERT_LEAD min (+ hook)
+
+
+def import_db(args):
+    """Merge history from other cmon databases (e.g. the old per-directory usage.duckdb) into
+    DB. Sources are attached read-only and never modified. Snapshots within DEDUP_SECS of
+    one already stored for the same key are skipped, so overlapping collectors don't double
+    the series; token rows are re-deduplicated on the next scan (see scan_logs)."""
+    con = db()
+    target = os.path.realpath(DB)
+    for i, path in enumerate(args.paths):
+        src = os.path.realpath(os.path.expanduser(path))
+        if src == target:
+            print(f"skip {path}: it is the target database")
+            continue
+        if not os.path.exists(src):
+            sys.exit(f"cmon: {path}: not found")
+        alias = f"src{i}"
+        con.execute(f"ATTACH '{src.replace(chr(39), chr(39) * 2)}' AS {alias} (READ_ONLY)")
+        tables = {r[0] for r in con.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_catalog = ?", [alias]).fetchall()}
+        before = {t: con.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
+                  for t in ("snapshots", "forecasts")}
+        if "snapshots" in tables:
+            con.execute(
+                f"INSERT INTO snapshots SELECT s.ts, s.key, s.label, s.percent, s.resets_at, s.is_active "
+                f"FROM {alias}.snapshots s WHERE NOT EXISTS (SELECT 1 FROM snapshots t WHERE t.key = s.key "
+                f"AND t.ts BETWEEN s.ts - to_seconds(?) AND s.ts + to_seconds(?))",
+                [DEDUP_SECS, DEDUP_SECS])
+        if "forecasts" in tables:
+            con.execute(
+                f"INSERT INTO forecasts SELECT f.* FROM {alias}.forecasts f WHERE NOT EXISTS ("
+                f"SELECT 1 FROM forecasts t WHERE t.key = f.key AND t.ts = f.ts AND t.horizon_h = f.horizon_h)")
+        tokens = 0
+        if "token_log" in tables:
+            cols = [r[1] for r in con.execute(f"PRAGMA table_info('{alias}.token_log')").fetchall()]
+            if "entrypoint" in cols:
+                _ensure_token_tables(con)
+                n0 = con.execute("SELECT count(*) FROM token_log").fetchone()[0]
+                con.execute(f"INSERT INTO token_log SELECT uuid, ts, model, entrypoint, project, session, "
+                            f"in_tok, out_tok, cache_read, cache_create FROM {alias}.token_log "
+                            f"ON CONFLICT DO NOTHING")
+                tokens = con.execute("SELECT count(*) FROM token_log").fetchone()[0] - n0
+        con.execute(f"DETACH {alias}")
+        added = {t: con.execute(f"SELECT count(*) FROM {t}").fetchone()[0] - before[t] for t in before}
+        print(f"{path}: +{added['snapshots']} snapshots, +{added['forecasts']} forecasts, "
+              f"+{tokens} token rows")
+    _meta_set(con, TOKEN_KEY_META, "")  # imported rows may carry legacy keys: re-dedupe on next scan
+    print(f"merged into {DB}")
 
 
 def _parse_since(s: str | None):
@@ -2070,6 +2121,17 @@ def _parse_jsonl(path: str):
     return out
 
 
+TOKEN_KEY_META = "token_log_key"  # meta marker: token_log rows keyed per API message ("v2")
+
+
+def _ensure_token_tables(con) -> None:
+    con.execute("CREATE TABLE IF NOT EXISTS token_log("
+                "uuid TEXT PRIMARY KEY, ts TIMESTAMPTZ, model TEXT, entrypoint TEXT, "
+                "project TEXT, session TEXT, "
+                "in_tok BIGINT, out_tok BIGINT, cache_read BIGINT, cache_create BIGINT)")
+    con.execute("CREATE TABLE IF NOT EXISTS scanned(path TEXT PRIMARY KEY, mtime DOUBLE, size BIGINT)")
+
+
 def scan_logs(con, since=None, quiet: bool = False) -> None:
     """Incremental scan of JSONL -> token_log table. Caches by (mtime,size),
     deduplicates by uuid; with `since` skips files older than the window. Parse
@@ -2083,11 +2145,7 @@ def scan_logs(con, since=None, quiet: bool = False) -> None:
     if cols and "entrypoint" not in cols:
         con.execute("DROP TABLE token_log")
         con.execute("DROP TABLE IF EXISTS scanned")
-    con.execute("CREATE TABLE IF NOT EXISTS token_log("
-                "uuid TEXT PRIMARY KEY, ts TIMESTAMPTZ, model TEXT, entrypoint TEXT, "
-                "project TEXT, session TEXT, "
-                "in_tok BIGINT, out_tok BIGINT, cache_read BIGINT, cache_create BIGINT)")
-    con.execute("CREATE TABLE IF NOT EXISTS scanned(path TEXT PRIMARY KEY, mtime DOUBLE, size BIGINT)")
+    _ensure_token_tables(con)
     seen = {p: (m, s) for p, m, s in con.execute("SELECT path, mtime, size FROM scanned").fetchall()}
     since_epoch = since.timestamp() if since else None
     todo = []
@@ -2562,6 +2620,8 @@ def main():
     pin.add_argument("-i", "--interval", type=int, default=20, help="minutes between collections (default 20)")
     pin.add_argument("--dry-run", action="store_true", help="show what it would do, don't install")
     sub.add_parser("uninstall", help="remove scheduling created by install")
+    pim = sub.add_parser("import", help="merge history from other cmon databases (e.g. old ./usage.duckdb)")
+    pim.add_argument("paths", nargs="+", metavar="PATH", help="source .duckdb files (opened read-only)")
     pp = sub.add_parser("plot", help="generate charts -> PNG (trajectory, pace-vs-target, burn)")
     pp.add_argument("-o", "--out", default=None,
                     help="PNG path (default: usage_YYMMDD_HHMMSS.png)")
@@ -2605,7 +2665,7 @@ def main():
         {"now": now, "status": status, "trends": trends, "collect": collect,
          "burn": burn, "watch": watch, "wait": wait, "plot": plot,
          "backtest": backtest, "tune": tune, "install": install,
-         "uninstall": uninstall}[args.cmd](args)
+         "uninstall": uninstall, "import": import_db}[args.cmd](args)
     except FetchError as e:
         sys.exit(f"cmon: {e}")
 

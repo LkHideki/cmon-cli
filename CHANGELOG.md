@@ -7,6 +7,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **The database now defaults to `~/.cmon/usage.duckdb`** instead of `./usage.duckdb`, which
+  split history across every directory cmon ran in. `cmon import PATH...` merges old
+  databases (read-only sources; overlapping snapshots deduplicated).
+
 ### Added
 
 - **`cmon status --json`** — versioned, provider-grouped payload read from the local cache.
