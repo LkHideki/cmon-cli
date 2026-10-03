@@ -126,8 +126,9 @@ and prints `cmon offline` if the network fails (doesn't break the statusline):
 ### Menu bar (macOS)
 
 `menubar/` holds **cmon Bar**, a native menu bar item (Swift, no third-party app) that
-shows the quota as `2•44••76` — 5h %, weekly %, minutes to the 5h reset — and opens a
-per-window breakdown on click. It reads `cmon status --json` every minute (~70 ms, no
+shows the quota as `2•44•91` — 5h %, weekly %, hours to the weekly reset; minutes to
+the 5h reset join in (`88•44•75•91`) once 5h usage passes 85% — and opens a per-window
+breakdown on click. It reads `cmon status --json` every minute (~70 ms, no
 network), so keep the cache fresh with `cmon install`.
 
 ```sh
@@ -136,9 +137,11 @@ menubar/install.sh uninstall
 ```
 
 Title, refresh interval, stale threshold and the "Open cmon watch" command live in
-`~/.cmon/bar.json`, re-read on every refresh. Title placeholders: `{5h}` `{wk}`
-`{reset}` (minutes) `{reset_hm}` `{wk_reset_hm}` `{age}` (minutes since collection).
-The title dims when data is older than `stale_minutes`.
+`~/.cmon/bar.json`, re-read on every refresh. The title is `segments` joined by
+`separator`, empty segments dropped. Placeholders: `{5h}` `{wk}` `{reset}` (minutes)
+`{reset_hm}` — both blank until 5h usage is above `reset_above_percent` — `{wk_reset_h}`
+(hours) `{wk_reset_hm}` `{age}` (minutes since collection). The title dims when data is
+older than `stale_minutes`.
 
 ### `cmon wait` — notify when ready
 

@@ -9,15 +9,20 @@ import AppKit
 // MARK: - Settings (~/.cmon/bar.json)
 
 struct Settings: Codable {
-    /// Menu bar title. Placeholders: {5h} {wk} {reset} {reset_hm} {wk_reset_hm} {age}
-    var format = "{5h}•{wk}••{reset}"
+    /// Menu bar title: non-empty segments joined by `separator`. Placeholders:
+    /// {5h} {wk} {reset} {reset_hm} {wk_reset_h} {wk_reset_hm} {age}. The 5h reset
+    /// ({reset}, {reset_hm}) is blank unless 5h usage is above `resetAbovePercent`.
+    var segments = ["{5h}", "{wk}", "{reset}", "{wk_reset_h}"]
+    var separator = "•"
+    var resetAbovePercent = 85.0
     var refreshSeconds = 60
     var staleMinutes = 30
     var cmon = "~/.local/bin/cmon"
     var watchCommand = "open -na Ghostty --args -e $HOME/.local/bin/cmon watch"
 
     enum CodingKeys: String, CodingKey {
-        case format, cmon
+        case segments, separator, cmon
+        case resetAbovePercent = "reset_above_percent"
         case refreshSeconds = "refresh_seconds"
         case staleMinutes = "stale_minutes"
         case watchCommand = "watch_command"
@@ -30,7 +35,9 @@ struct Settings: Codable {
     init(from decoder: Decoder) throws {  // missing keys fall back to defaults
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let d = Settings()
-        format = try c.decodeIfPresent(String.self, forKey: .format) ?? d.format
+        segments = try c.decodeIfPresent([String].self, forKey: .segments) ?? d.segments
+        separator = try c.decodeIfPresent(String.self, forKey: .separator) ?? d.separator
+        resetAbovePercent = try c.decodeIfPresent(Double.self, forKey: .resetAbovePercent) ?? d.resetAbovePercent
         refreshSeconds = max(try c.decodeIfPresent(Int.self, forKey: .refreshSeconds) ?? d.refreshSeconds, 10)
         staleMinutes = try c.decodeIfPresent(Int.self, forKey: .staleMinutes) ?? d.staleMinutes
         cmon = try c.decodeIfPresent(String.self, forKey: .cmon) ?? d.cmon
@@ -106,22 +113,27 @@ func spacedDuration(_ seconds: TimeInterval) -> String {
     return "\(m) min"
 }
 
-func renderTitle(_ format: String, _ snap: Snapshot, now: Date) -> String {
+func renderTitle(_ settings: Settings, _ snap: Snapshot, now: Date) -> String {
     let session = snap.window("session"), weekly = snap.window("weekly_all")
     func pct(_ q: Quota?) -> String { q.map { String(Int($0.percent.rounded())) } ?? "–" }
     func left(_ q: Quota?) -> TimeInterval? {
         guard let d = q?.resetDate, d > now else { return nil }
         return d.timeIntervalSince(now)
     }
+    let hot = (session?.percent ?? 0) > settings.resetAbovePercent
     let values: [String: String] = [
         "5h": pct(session),
         "wk": pct(weekly),
-        "reset": left(session).map { String(Int($0 / 60)) } ?? "–",
-        "reset_hm": left(session).map(compactDuration) ?? "–",
+        "reset": hot ? left(session).map { String(Int($0 / 60)) } ?? "" : "",
+        "reset_hm": hot ? left(session).map(compactDuration) ?? "" : "",
+        "wk_reset_h": left(weekly).map { String(Int($0 / 3600)) } ?? "–",
         "wk_reset_hm": left(weekly).map(compactDuration) ?? "–",
         "age": snap.observedDate.map { String(Int(now.timeIntervalSince($0) / 60)) } ?? "–",
     ]
-    return values.reduce(format) { $0.replacingOccurrences(of: "{\($1.key)}", with: $1.value) }
+    return settings.segments
+        .map { seg in values.reduce(seg) { $0.replacingOccurrences(of: "{\($1.key)}", with: $1.value) } }
+        .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        .joined(separator: settings.separator)
 }
 
 func displayName(_ q: Quota) -> String {
@@ -277,7 +289,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             button.toolTip = error ?? "cmon offline"
             return
         }
-        button.title = renderTitle(settings.format, snap, now: now)
+        button.title = renderTitle(settings, snap, now: now)
         button.appearsDisabled = isStale(snap, now: now) || error != nil
         button.toolTip = snap.windows.map { "\(displayName($0)) \(Int($0.percent.rounded()))%" }
             .joined(separator: "  ·  ")
