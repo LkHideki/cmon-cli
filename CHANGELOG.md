@@ -5,7 +5,18 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.6.0] — 2026-10-03
+
+### Upgrading
+
+- History now lives in `~/.cmon/usage.duckdb`. If you ran 0.5 from several directories,
+  merge the old databases once: `cmon import ~/usage.duckdb ~/Projects/*/usage.duckdb`.
+- Token burn is re-counted per API message on the first scan (a one-off of a few seconds);
+  expect totals about half to a third of what 0.5 reported.
+- cmon no longer refreshes Claude Code's login. If Claude Code hasn't run for hours, its
+  access token may be expired until it runs again; `cmon token status` shows the expiry.
+- `.env` is read from `~/.cmon/.env` (not the current directory).
+- cmon Bar: `refresh_seconds` and `hot_*` in `bar.json` are replaced by the `refresh` rules.
 
 ### Changed
 
