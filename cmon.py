@@ -2082,7 +2082,11 @@ def _surface(entrypoint: str) -> str:
 
 def _parse_jsonl(path: str):
     """Extract assistant messages with usage from JSONL transcript.
-    Only json.loads lines containing '"usage"' — rest (user/tool) skipped cheaply."""
+    Only json.loads lines containing '"usage"' — rest (user/tool) skipped cheaply.
+    Claude Code writes one API response as several lines (thinking, text, tool_use), each
+    repeating the same usage, and copies lines into resumed/forked transcripts — so the row
+    key is the API message (message.id + requestId), not the line uuid; counting lines
+    inflated burn ~2-3x. The line uuid rides along last, only for the legacy migration."""
     proj_fallback = os.path.basename(os.path.dirname(path))
     out = []
     try:
@@ -2113,19 +2117,21 @@ def _parse_jsonl(path: str):
                 continue
             cwd = o.get("cwd")
             proj = os.path.basename(cwd.rstrip("/")) if cwd else proj_fallback
-            out.append((uid, dt, _safe(msg.get("model") or "?"), _safe(o.get("entrypoint") or "?"),
+            mid = msg.get("id")
+            key = f"{mid}:{o.get('requestId') or ''}" if mid else uid
+            out.append((key, dt, _safe(msg.get("model") or "?"), _safe(o.get("entrypoint") or "?"),
                         _safe(proj), _safe(o.get("sessionId") or "?"),
                         int(u.get("input_tokens") or 0), int(u.get("output_tokens") or 0),
                         int(u.get("cache_read_input_tokens") or 0),
-                        int(u.get("cache_creation_input_tokens") or 0)))
+                        int(u.get("cache_creation_input_tokens") or 0), uid))
     return out
 
 
 TOKEN_KEY_META = "token_log_key"  # meta marker: token_log rows keyed per API message ("v2")
 
 
-def _ensure_token_tables(con) -> None:
-    con.execute("CREATE TABLE IF NOT EXISTS token_log("
+def _ensure_token_tables(con, name: str = "token_log") -> None:
+    con.execute(f"CREATE TABLE IF NOT EXISTS {name}("
                 "uuid TEXT PRIMARY KEY, ts TIMESTAMPTZ, model TEXT, entrypoint TEXT, "
                 "project TEXT, session TEXT, "
                 "in_tok BIGINT, out_tok BIGINT, cache_read BIGINT, cache_create BIGINT)")
@@ -2146,6 +2152,10 @@ def scan_logs(con, since=None, quiet: bool = False) -> None:
         con.execute("DROP TABLE token_log")
         con.execute("DROP TABLE IF EXISTS scanned")
     _ensure_token_tables(con)
+    migrate = (_meta_get(con, TOKEN_KEY_META) or ("",))[0] != "v2"
+    if migrate:  # rows keyed by line uuid: rescan every transcript still on disk (see below)
+        con.execute("DELETE FROM scanned")
+        since = None
     seen = {p: (m, s) for p, m, s in con.execute("SELECT path, mtime, size FROM scanned").fetchall()}
     since_epoch = since.timestamp() if since else None
     todo = []
@@ -2159,29 +2169,88 @@ def scan_logs(con, since=None, quiet: bool = False) -> None:
         if since_epoch and st.st_mtime < since_epoch:
             continue  # outside window; don't mark as scanned so future scan picks it up
         todo.append((f, st))
-    if not todo:
+    if not todo and not migrate:
         return
-    if not quiet:
+    if not quiet and todo:
         print(f"scanning {len(todo)} log file(s)…", file=sys.stderr)
     parsed = _parse_many([f for f, _ in todo])  # parallel (with serial fallback)
     rows = [r for chunk in parsed for r in chunk]
     if rows:
-        # Vectorized insert via parallel unnest of column-arrays — native DuckDB, no pandas,
-        # and still bulk (one INSERT ... SELECT, not per-row executemany+ON CONFLICT).
-        # QUALIFY row_number() dedups duplicate uuids within the batch (mirrored transcripts).
-        cols = list(zip(*rows, strict=True))  # transpose rows -> one list per column (LIST params)
+        _stage_token_rows(con, rows)
+        if migrate:
+            _migrate_token_keys(con)
+        else:
+            con.execute("INSERT INTO token_log SELECT * EXCLUDE (line_uuid) FROM _fresh "
+                        "WHERE uuid NOT IN (SELECT uuid FROM token_log)")
+        con.execute("DROP TABLE _fresh")
+    elif migrate:
+        _meta_set(con, TOKEN_KEY_META, "v2")
+    if todo:
+        con.executemany("INSERT INTO scanned VALUES (?, ?, ?) ON CONFLICT (path) DO UPDATE "
+                        "SET mtime=excluded.mtime, size=excluded.size",
+                        [(f, st.st_mtime, st.st_size) for f, st in todo])
+
+
+def _stage_token_rows(con, rows) -> None:
+    """Load parsed rows into temp table _fresh, one row per message key (the line with the
+    most output wins). Goes through a private temp CSV: DuckDB binds Python list parameters
+    at ~100 us per element, so the old unnest(?::T[]) insert cost seconds per watch tick
+    and minutes on a full rescan; read_csv loads 120k rows in ~0.3 s."""
+    import csv
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix=".csv")  # 0600: rows carry project names/session ids
+    try:
+        with os.fdopen(fd, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            for r in rows:
+                w.writerow((r[0], r[1].timestamp(), *r[2:]))
         con.execute(
-            "INSERT INTO token_log SELECT * FROM ("
-            "  SELECT unnest(?::TEXT[]) uuid, unnest(?::TIMESTAMPTZ[]) ts, unnest(?::TEXT[]) model, "
-            "         unnest(?::TEXT[]) entrypoint, unnest(?::TEXT[]) project, unnest(?::TEXT[]) \"session\", "
-            "         unnest(?::BIGINT[]) in_tok, unnest(?::BIGINT[]) out_tok, "
-            "         unnest(?::BIGINT[]) cache_read, unnest(?::BIGINT[]) cache_create) "
-            "QUALIFY row_number() OVER (PARTITION BY uuid ORDER BY ts) = 1 "
-            "ON CONFLICT DO NOTHING",
-            [list(c) for c in cols])
-    con.executemany("INSERT INTO scanned VALUES (?, ?, ?) ON CONFLICT (path) DO UPDATE "
-                    "SET mtime=excluded.mtime, size=excluded.size",
-                    [(f, st.st_mtime, st.st_size) for f, st in todo])
+            "CREATE OR REPLACE TEMP TABLE _fresh AS SELECT uuid, to_timestamp(ts) ts, model, entrypoint, "
+            "project, \"session\", in_tok, out_tok, cache_read, cache_create, line_uuid "
+            "FROM read_csv(?, header = false, quote = '\"', columns = {"
+            "'uuid': 'TEXT', 'ts': 'DOUBLE', 'model': 'TEXT', 'entrypoint': 'TEXT', 'project': 'TEXT', "
+            "'session': 'TEXT', 'in_tok': 'BIGINT', 'out_tok': 'BIGINT', 'cache_read': 'BIGINT', "
+            "'cache_create': 'BIGINT', 'line_uuid': 'TEXT'}) "
+            "QUALIFY row_number() OVER (PARTITION BY uuid ORDER BY out_tok DESC, ts) = 1", [path])
+        # line uuids of every parsed line (not just the kept one) — the legacy keys they replace
+        con.execute("CREATE OR REPLACE TEMP TABLE _lines AS SELECT DISTINCT line_uuid u FROM read_csv(?, "
+                    "header = false, quote = '\"', all_varchar = true, column_names = ['k', 'ts', 'm', 'e', "
+                    "'p', 's', 'i', 'o', 'r', 'c', 'line_uuid'])", [path])
+    finally:
+        os.unlink(path)
+
+
+LEGACY_DEDUP_S = 600  # legacy rows: same model/surface/usage within this window = same message
+
+
+def _migrate_token_keys(con) -> None:
+    """One-off move from line-uuid keys to per-message keys (keys with ':'), rebuilding the
+    table from _fresh (a full rescan) instead of deleting in place, which is slow under the
+    primary-key index. Legacy rows whose line is still on disk are replaced by exact rows.
+    The rest come from transcripts Claude Code already deleted — the only copy of that
+    history — so they are deduplicated heuristically: a row repeating an earlier legacy row's
+    model, surface and full usage tuple within LEGACY_DEDUP_S is the same message. Measured
+    against exact keys on live transcripts this leaves ~+4% residual, versus 2-3x before."""
+    con.execute("BEGIN")
+    try:
+        con.execute("DROP TABLE IF EXISTS token_log_new")
+        _ensure_token_tables(con, "token_log_new")
+        con.execute(
+            "INSERT INTO token_log_new "
+            "SELECT * EXCLUDE (line_uuid) FROM _fresh "
+            "UNION ALL SELECT * FROM token_log WHERE uuid LIKE '%:%' AND uuid NOT IN (SELECT uuid FROM _fresh) "
+            "UNION ALL SELECT * EXCLUDE (gap) FROM ("
+            "  SELECT *, ts - lag(ts) OVER (PARTITION BY model, entrypoint, in_tok, out_tok, cache_read, "
+            "  cache_create ORDER BY ts) gap FROM token_log "
+            "  WHERE uuid NOT LIKE '%:%' AND uuid NOT IN (SELECT u FROM _lines)) "
+            "WHERE gap IS NULL OR gap > to_seconds(?)", [LEGACY_DEDUP_S])
+        con.execute("DROP TABLE token_log")
+        con.execute("ALTER TABLE token_log_new RENAME TO token_log")
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+    _meta_set(con, TOKEN_KEY_META, "v2")
 
 
 def _parse_many(paths: list) -> list:

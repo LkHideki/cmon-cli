@@ -13,6 +13,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   split history across every directory cmon ran in. `cmon import PATH...` merges old
   databases (read-only sources; overlapping snapshots deduplicated).
 
+### Fixed
+
+- **Token burn was counted 2–3× too high.** Claude Code writes one API response as several
+  transcript lines (thinking, text, tool_use) that repeat the same usage, and copies lines
+  into resumed sessions; rows are now keyed per API message (`message.id` + `requestId`).
+  Existing history migrates once: rows from transcripts still on disk are re-read exactly,
+  rows from deleted transcripts are deduplicated heuristically (~4% residual).
+- **Log scans no longer stall on large batches.** Rows are bulk-loaded through a private
+  temp CSV instead of list parameters (~100 µs/element in DuckDB); a full rescan of 1.5k
+  transcripts went from ~100 s to ~4 s.
+
 ### Added
 
 - **`cmon status --json`** — versioned, provider-grouped payload read from the local cache.
