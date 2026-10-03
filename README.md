@@ -44,21 +44,15 @@ Requires Python ≥ 3.11 and [uv](https://docs.astral.sh/uv/). Without uv,
    Keychain (macOS) or `~/.claude/.credentials.json` (Linux/Windows). Zero
    friction: nothing to configure.
 
-**Auto-refresh:** when the access token expires, `cmon` renews it automatically via
-`refresh_token` and stores the new token in its own vault (`claude-oauth-auto`),
-**without** rewriting the Claude Code credential. Renews proactively (reads
-`expiresAt`) and reactively (if the API returns 401 — including when an old
-`CLAUDE_OAUTH_TOKEN` is shadowing everything). **Self-heals:** if cmon's own refresh
-chain dies (its `refresh_token` gets rotated/revoked after a Claude Code re-login), it
-falls back to Claude Code's fresh credential and re-seeds the chain instead of getting
-stuck on a `401`. Side effect: the first renewal rotates Claude Code's `refresh_token`,
-so **it may ask for login once** the next time it renews — after that the two tokens
-become independent. `token status` shows validity; `client_id`/endpoint are configurable
-via `CMON_OAUTH_CLIENT_ID` / `CMON_OAUTH_TOKEN_URL` (the latter host-allowlisted to
-`*.anthropic.com`, so a stray `.env` can't redirect the refresh POST).
+**Claude Code's login is read-only.** cmon reads its access token and never redeems or
+stores its `refresh_token`: Anthropic rotates refresh tokens on use, so a second client
+spending it would log Claude Code out (cmon 0.5 did exactly that). Claude Code renews its
+own token whenever it runs; if it has expired because Claude Code hasn't run for a while,
+cmon says so and makes no request. After a `401` it re-reads Claude Code's credential once,
+in case it was renewed meanwhile. The refresh chain older versions kept in the vault
+(`claude-oauth-auto`) is deleted on first run.
 
-In short, with Claude Code logged in you need nothing — and it keeps working
-even with an expired token. Without it, `cmon token set` stores the token securely
+In short, with Claude Code logged in you need nothing. Without it, `cmon token set` stores the token securely
 on any system. `.env` still works for step 1 (see `.env.example`). Run `cmon --help`
 or `cmon token --help` for the rest.
 

@@ -13,8 +13,19 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   split history across every directory cmon ran in. `cmon import PATH...` merges old
   databases (read-only sources; overlapping snapshots deduplicated).
 
+### Security
+
+- **cmon no longer logs Claude Code out.** It used to redeem Claude Code's `refresh_token`
+  and keep the rotated chain in its own vault entry; since refresh tokens rotate on use,
+  this invalidated Claude Code's login. Claude Code's credential is now strictly read-only,
+  an expired token is reported without any request, and the old `claude-oauth-auto` vault
+  entry is deleted. `CMON_OAUTH_CLIENT_ID` / `CMON_OAUTH_TOKEN_URL` are gone.
+
 ### Fixed
 
+- **A 401 retry no longer costs an attempt.** After a 401 cmon re-reads Claude Code's
+  credential once without spending a retry, so `status` (one attempt) picks up a renewed
+  token instead of reporting offline.
 - **Token burn was counted 2–3× too high.** Claude Code writes one API response as several
   transcript lines (thinking, text, tool_use) that repeat the same usage, and copies lines
   into resumed sessions; rows are now keyed per API message (`message.id` + `requestId`).
