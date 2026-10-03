@@ -9,7 +9,8 @@ import AppKit
 // MARK: - Settings (~/.cmon/bar.json)
 
 struct Settings: Codable {
-    /// Menu bar title: non-empty segments joined by `separator`. Placeholders:
+    /// Menu bar title: segments joined by `separator`; an empty segment keeps its slot
+    /// (`2•44••91`), so positions never shift. Placeholders:
     /// {5h} {wk} {reset} {reset_hm} {wk_reset_h} {wk_reset_hm} {age}. The 5h reset
     /// ({reset}, {reset_hm}) is blank unless 5h usage is above `resetAbovePercent`.
     var segments = ["{5h}", "{wk}", "{reset}", "{wk_reset_h}"]
@@ -132,7 +133,6 @@ func renderTitle(_ settings: Settings, _ snap: Snapshot, now: Date) -> String {
     ]
     return settings.segments
         .map { seg in values.reduce(seg) { $0.replacingOccurrences(of: "{\($1.key)}", with: $1.value) } }
-        .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
         .joined(separator: settings.separator)
 }
 
