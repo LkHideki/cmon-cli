@@ -65,6 +65,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   different account no longer inflate burn, the hourly profile or `plot`; `burn` reports
   what it excluded and `--all-accounts` brings it back.
 - **`cmon status --json`** — versioned, provider-grouped payload read from the local cache.
+- **cmon Bar refresh schedule is a list of rules** (`refresh` in `~/.cmon/bar.json`):
+  each rule sets `every_s` under optional `reset_within_min` / `usage_above_pct`
+  conditions, the shortest applicable interval wins, and the bar queries the API itself
+  on that schedule (default 10 min, tightening to 59 s in the last hour or above 87%).
+  Replaces `refresh_seconds` and `hot_*`. The menu shows when the next update is due, and
+  an invalid `bar.json` is reported instead of silently ignored.
 - **cmon Bar live countdowns.** In the last minute durations count in seconds ("Resets in
   42s", "Updated 12s ago"); the open menu and the final minute redraw at 1 Hz, and the new
   cycle is fetched as soon as the 5h window rolls over.

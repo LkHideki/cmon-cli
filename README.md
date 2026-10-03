@@ -132,33 +132,52 @@ it never shows a dead cycle and never blocks a prompt. `--live` always queries t
 
 ### Menu bar (macOS)
 
-`menubar/` holds **cmon Bar**, a native menu bar item (Swift, no third-party app) that
-shows the quota as `2•44••91` — 5h %, weekly %, minutes to the 5h reset (blank until 5h
-usage passes 85%: `88•44•75•91`), hours to the weekly reset — and opens a per-window
-breakdown on click. It reads `cmon status --json` every minute (~70 ms, no
-network), so keep the cache fresh with `cmon install`.
+`menubar/` holds **cmon Bar**, a native menu bar item (Swift, no third-party app). The
+title shows the quota as `2•44••91` — 5h %, weekly %, minutes to the 5h reset (blank
+until 5h usage passes 85%, e.g. `88•44•75•91`), hours to the weekly reset — and a click
+opens a per-window breakdown with progress bars, reset times and when the next update is
+due.
 
 ```sh
 menubar/install.sh            # build with swiftc, start now and at login
 menubar/install.sh uninstall
+menubar/test.sh               # logic tests (title, refresh rules, settings)
 ```
 
-Title, refresh interval, stale threshold and the "Open cmon watch" command live in
-`~/.cmon/bar.json`, re-read on every refresh. `watch_command` defaults to Terminal.app;
-for another terminal set e.g. `"open -na Ghostty --args -e $HOME/.local/bin/cmon watch"`. The title is `segments` joined by
-`separator`; an empty segment keeps its slot, so positions never shift. Placeholders: `{5h}` `{wk}` `{reset}` (minutes)
-`{reset_hm}` — both blank until 5h usage is above `reset_above_percent` — `{wk_reset_h}`
-(hours) `{wk_reset_hm}` `{age}` (minutes since collection). The title dims when data is
-older than `stale_minutes`.
+Everything is configured in `~/.cmon/bar.json`, re-read on every refresh (an invalid file
+is reported in the menu and defaults are used):
 
-Near the limit it stops trusting the cache: while 5h usage is above `hot_percent` (87) or
-its reset is under `hot_minutes` (60) away, it queries the API itself (`status --live`)
-every `hot_refresh_seconds` (59) — about one HTTP call a minute, ~0.3 s of CPU each. A
-failed live call keeps the last numbers and dims the title. Countdowns switch to seconds
-in the last minute and, while the menu is open or the 5h reset is under a minute away,
-redraw every second (local text only — no extra `cmon` runs); when the window rolls over
-the bar fetches the new cycle right away. If you quit it from the menu,
-it comes back at next login, or now with `open ~/Applications/"cmon Bar.app"`.
+- **Title** — `segments` joined by `separator`; an empty segment keeps its slot, so
+  positions never shift. Placeholders: `{5h}` `{wk}` `{reset}` (minutes) `{reset_hm}` —
+  both blank until 5h usage is above `reset_above_percent` — `{wk_reset_h}` (hours)
+  `{wk_reset_hm}` `{age}` (minutes since the data was read). The title dims when the data
+  is older than `stale_minutes`.
+- **Refresh schedule** — `refresh` is a list of rules for how often the bar queries the
+  API (`status --live`, which also refreshes the cache the statusline reads). A rule
+  applies when all its conditions hold: `reset_within_min` (the 5h reset is at most that
+  many minutes away), `usage_above_pct` (5h usage is above it), or none for the default.
+  The shortest `every_s` among applicable rules wins (minimum 30 s). Defaults:
+
+  ```json
+  "refresh": [
+    { "every_s": 600 },
+    { "reset_within_min": 120, "every_s": 180 },
+    { "reset_within_min": 90,  "every_s": 120 },
+    { "reset_within_min": 60,  "every_s": 59 },
+    { "usage_above_pct": 87,   "every_s": 59 }
+  ]
+  ```
+
+  The bar wakes exactly when a tighter rule starts applying. A failed call keeps the last
+  numbers, dims the title and retries after a full interval. Each call costs ~0.3 s of
+  CPU; at the defaults that is 6 calls an hour, 60 in the last hour before a reset.
+- **`watch_command`** — what "Open cmon watch" runs; defaults to Terminal.app. For another
+  terminal, e.g. `"open -na Ghostty --args -e $HOME/.local/bin/cmon watch"`.
+
+Countdowns switch to seconds in the last minute and, while the menu is open or the 5h
+reset is under a minute away, redraw every second (local text only, no extra `cmon`
+runs); when the window rolls over the bar fetches the new cycle right away. Quit from the
+menu and it returns at next login, or now with `open ~/Applications/"cmon Bar.app"`.
 
 ### `cmon wait` — notify when ready
 

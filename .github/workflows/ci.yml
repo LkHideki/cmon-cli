@@ -23,3 +23,10 @@ jobs:
         run: uv run pytest -q
       - name: Smoke (imports the module and validates CLI, no network)
         run: uv run cmon --help
+
+  menubar:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test cmon Bar (Swift)
+        run: menubar/test.sh

@@ -1,12 +1,41 @@
 // cmon Bar — Claude quota in the macOS menu bar.
 //
-// Data comes from `cmon status --json` (local cache, no network; kept fresh by
-// `cmon install`). Look and behaviour live in ~/.cmon/bar.json, re-read on every
-// refresh, so edits apply without rebuilding. Build/install: menubar/install.sh.
+// Data comes from `cmon status --json --live` on the schedule set by the `refresh` rules
+// (each call also warms the cache the statusline reads). Look and behaviour live in
+// ~/.cmon/bar.json, re-read on every refresh, so edits apply without rebuilding.
+// Build/install: menubar/install.sh.
 
 import AppKit
 
 // MARK: - Settings (~/.cmon/bar.json)
+
+/// One refresh rule. It applies when all of its conditions hold (none = always); among the
+/// rules that apply, the shortest `every_s` wins. Conditions look at the 5h window:
+/// `reset_within_min` — its reset is at most this many minutes away;
+/// `usage_above_pct` — its usage is above this percent.
+struct RefreshRule: Codable, Equatable {
+    var resetWithinMin: Double?
+    var usageAbovePct: Double?
+    var everyS: Double
+
+    static let minimumEvery: Double = 30  // the usage endpoint is shared with claude.ai: be polite
+
+    enum CodingKeys: String, CodingKey {
+        case resetWithinMin = "reset_within_min"
+        case usageAbovePct = "usage_above_pct"
+        case everyS = "every_s"
+    }
+
+    func applies(resetLeft: TimeInterval?, usage: Double?) -> Bool {
+        if let m = resetWithinMin {
+            guard let left = resetLeft, left > 0, left <= m * 60 else { return false }
+        }
+        if let p = usageAbovePct {
+            guard let u = usage, u > p else { return false }
+        }
+        return true
+    }
+}
 
 struct Settings: Codable {
     /// Menu bar title: segments joined by `separator`; an empty segment keeps its slot
@@ -16,24 +45,22 @@ struct Settings: Codable {
     var segments = ["{5h}", "{wk}", "{reset}", "{wk_reset_h}"]
     var separator = "•"
     var resetAbovePercent = 85.0
-    var refreshSeconds = 60
+    /// How often to query the API, tightening as the 5h reset or limit approaches.
+    var refresh: [RefreshRule] = [
+        RefreshRule(everyS: 600),
+        RefreshRule(resetWithinMin: 120, everyS: 180),
+        RefreshRule(resetWithinMin: 90, everyS: 120),
+        RefreshRule(resetWithinMin: 60, everyS: 59),
+        RefreshRule(usageAbovePct: 87, everyS: 59),
+    ]
     var staleMinutes = 30
-    /// Hot mode — 5h usage above `hotPercent` or its reset under `hotMinutes` away: poll the
-    /// API itself (`status --live`) every `hotRefreshSeconds` instead of reading the cache.
-    var hotPercent = 87.0
-    var hotMinutes = 60
-    var hotRefreshSeconds = 59
     var cmon = "~/.local/bin/cmon"
     var watchCommand = #"osascript -e 'tell application "Terminal" to do script "~/.local/bin/cmon watch"' -e 'tell application "Terminal" to activate'"#
 
     enum CodingKeys: String, CodingKey {
-        case segments, separator, cmon
+        case segments, separator, refresh, cmon
         case resetAbovePercent = "reset_above_percent"
-        case refreshSeconds = "refresh_seconds"
         case staleMinutes = "stale_minutes"
-        case hotPercent = "hot_percent"
-        case hotMinutes = "hot_minutes"
-        case hotRefreshSeconds = "hot_refresh_seconds"
         case watchCommand = "watch_command"
     }
 
@@ -47,29 +74,43 @@ struct Settings: Codable {
         segments = try c.decodeIfPresent([String].self, forKey: .segments) ?? d.segments
         separator = try c.decodeIfPresent(String.self, forKey: .separator) ?? d.separator
         resetAbovePercent = try c.decodeIfPresent(Double.self, forKey: .resetAbovePercent) ?? d.resetAbovePercent
-        refreshSeconds = max(try c.decodeIfPresent(Int.self, forKey: .refreshSeconds) ?? d.refreshSeconds, 10)
+        let rules = (try c.decodeIfPresent([RefreshRule].self, forKey: .refresh) ?? d.refresh)
+            .filter { $0.everyS.isFinite && $0.everyS > 0 }
+        refresh = rules.isEmpty ? d.refresh : rules
         staleMinutes = try c.decodeIfPresent(Int.self, forKey: .staleMinutes) ?? d.staleMinutes
-        hotPercent = try c.decodeIfPresent(Double.self, forKey: .hotPercent) ?? d.hotPercent
-        hotMinutes = try c.decodeIfPresent(Int.self, forKey: .hotMinutes) ?? d.hotMinutes
-        hotRefreshSeconds = max(try c.decodeIfPresent(Int.self, forKey: .hotRefreshSeconds) ?? d.hotRefreshSeconds, 30)
         cmon = try c.decodeIfPresent(String.self, forKey: .cmon) ?? d.cmon
         watchCommand = try c.decodeIfPresent(String.self, forKey: .watchCommand) ?? d.watchCommand
     }
 
-    static func load() -> Settings {
-        if let data = try? Data(contentsOf: url), let s = try? JSONDecoder().decode(Settings.self, from: data) {
-            return s
+    /// Seconds between API queries right now; boundary = when a tighter rule kicks in.
+    func refreshInterval(resetLeft: TimeInterval?, usage: Double?) -> TimeInterval {
+        let every = refresh.filter { $0.applies(resetLeft: resetLeft, usage: usage) }.map(\.everyS).min()
+        return max(every ?? 600, RefreshRule.minimumEvery)
+    }
+
+    /// Seconds until a `reset_within_min` rule not yet active starts applying, if any.
+    func nextBoundary(resetLeft: TimeInterval?) -> TimeInterval? {
+        guard let left = resetLeft, left > 0 else { return nil }
+        return refresh.compactMap { $0.resetWithinMin }.map { left - $0 * 60 }.filter { $0 > 0 }.min()
+    }
+
+    /// Settings plus a problem to show in the menu: a broken bar.json must not fail silently.
+    static func load() -> (Settings, String?) {
+        if let data = try? Data(contentsOf: url) {
+            do {
+                return (try JSONDecoder().decode(Settings.self, from: data), nil)
+            } catch {
+                return (Settings(), "bar.json is invalid — using defaults")
+            }
         }
-        if !FileManager.default.fileExists(atPath: url.path) {  // first run: write editable defaults
-            let enc = JSONEncoder()
-            enc.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-            try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
-                                                     withIntermediateDirectories: true,
-                                                     attributes: [.posixPermissions: 0o700])
-            try? enc.encode(Settings()).write(to: url)
-            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
-        }
-        return Settings()
+        let enc = JSONEncoder()  // first run: write editable defaults
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                 withIntermediateDirectories: true,
+                                                 attributes: [.posixPermissions: 0o700])
+        try? enc.encode(Settings()).write(to: url)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        return (Settings(), nil)
     }
 }
 
@@ -224,10 +265,12 @@ final class QuotaRowView: NSView {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
-    private var settings = Settings.load()
+    private var settings = Settings()
+    private var settingsProblem: String?
     private var snapshot: Snapshot?
     private var error: String?
-    private var timer: Timer?
+    private var timer: Timer?          // one-shot: the next scheduled API query
+    private var lastAttempt: Date?     // last query, successful or not (failures wait a full interval)
     private var busy = false
     // 1 Hz ticker: only redraws local text (no cmon, no network), and only runs while the menu
     // is open or the 5h reset is under a minute away — so countdowns move second by second
@@ -253,18 +296,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.button?.appearsDisabled = true
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
-        ) { [weak self] _ in MainActor.assumeIsolated { self?.refresh() } }
-        refresh()
-        schedule()
+        ) { [weak self] _ in MainActor.assumeIsolated { self?.refresh(live: true) } }
+        reloadSettings()
+        refresh(live: false)  // instant first frame from the cache; schedule() goes live as due
     }
 
-    /// Close to the 5h limit or its reset, minute-old numbers matter: go live.
-    private var isHot: Bool {
-        guard let s = snapshot?.window("session"), snapshot?.offline == false else { return false }
-        if s.percent > settings.hotPercent { return true }
-        guard let reset = s.resetDate else { return false }
-        let left = reset.timeIntervalSinceNow
-        return left > 0 && left < TimeInterval(settings.hotMinutes * 60)
+    private func reloadSettings() {
+        (settings, settingsProblem) = Settings.load()
+    }
+
+    private var currentInterval: TimeInterval {
+        let session = snapshot?.offline == false ? snapshot?.window("session") : nil
+        return settings.refreshInterval(resetLeft: sessionLeft, usage: session?.percent)
+    }
+
+    /// When the next API query is due: one interval after the newer of the data's own age and
+    /// the last attempt, so cached data that is already fresh isn't refetched and a failure
+    /// isn't retried in a loop.
+    private var nextDue: Date {
+        let base = [snapshot?.observedDate, lastAttempt].compactMap { $0 }.max() ?? .distantPast
+        return base.addingTimeInterval(currentInterval)
     }
 
     private var sessionLeft: TimeInterval? { snapshot?.window("session")?.resetDate?.timeIntervalSinceNow }
@@ -303,7 +354,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func updatedTitle(_ snap: Snapshot, now: Date) -> String {
         guard let observed = snap.observedDate else { return "Updated –" }
         let age = now.timeIntervalSince(observed)
-        return age < 5 ? "Updated just now" : "Updated \(spacedDuration(age)) ago"
+        let updated = age < 5 ? "Updated just now" : "Updated \(spacedDuration(age)) ago"
+        if busy { return updated + " · updating…" }
+        let next = nextDue.timeIntervalSince(now)
+        return next > 0 ? updated + " · next in \(spacedDuration(next))" : updated
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -316,23 +370,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateTicker()
     }
 
+    /// Arm a one-shot timer for the next due query — or earlier, at the moment a tighter
+    /// `reset_within_min` rule starts applying, so a 10-minute wait can't overshoot it.
     private func schedule() {
-        let interval = TimeInterval(isHot ? settings.hotRefreshSeconds : settings.refreshSeconds)
-        guard timer?.timeInterval != interval else { return }
         timer?.invalidate()
-        let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.refresh() }
+        let now = Date()
+        var fire = max(nextDue, now.addingTimeInterval(1))
+        if let boundary = settings.nextBoundary(resetLeft: sessionLeft) {
+            fire = min(fire, now.addingTimeInterval(boundary + 1))
         }
-        t.tolerance = interval * 0.1  // lets macOS coalesce wakeups
-        RunLoop.main.add(t, forMode: .common)  // keeps ticking while the menu is open
+        let t = Timer(fire: fire, interval: 0, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated { self?.timerFired() }
+        }
+        t.tolerance = min(currentInterval * 0.05, 5)  // lets macOS coalesce wakeups
+        RunLoop.main.add(t, forMode: .common)  // keeps running while the menu is open
         timer = t
     }
 
-    private func refresh(live explicit: Bool = false) {
-        settings = Settings.load()
+    private func timerFired() {
+        reloadSettings()
+        if Date() >= nextDue.addingTimeInterval(-1) {
+            refresh(live: true)
+        } else {
+            schedule()  // woke at a rule boundary; the new interval isn't due yet
+        }
+    }
+
+    private func refresh(live: Bool) {
+        reloadSettings()
         guard !busy else { return }
         busy = true
-        let live = explicit || isHot
+        if live { lastAttempt = Date() }
         let path = NSString(string: settings.cmon).expandingTildeInPath
         let args = live ? ["status", "--json", "--live"] : ["status", "--json"]
         Task.detached {
@@ -340,12 +408,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             await MainActor.run {
                 self.busy = false
                 switch result {
-                case .success(let snap) where snap.offline && live && self.snapshot != nil:
-                    self.error = "Live refresh failed — showing last data"  // keep last numbers
+                case .success(let snap) where snap.offline && self.snapshot != nil:
+                    self.error = "Refresh failed — showing last data"  // keep last numbers
                 case .success(let snap): self.snapshot = snap; self.error = nil
                 case .failure(let err): self.error = err.message
                 }
-                self.schedule()  // hot mode may have started or ended
+                self.schedule()  // the interval may have changed with the new numbers
                 self.render()
                 if self.menuOpen { self.menuNeedsUpdate(self.menu) }  // fresh numbers in an open menu
                 self.updateTicker()
@@ -421,13 +489,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             updatedItem = updated
             menu.addItem(updated)
             if isStale(snap, now: now) {
-                let hint = NSMenuItem(title: "Data is stale — schedule collection with `cmon install`",
+                let hint = NSMenuItem(title: "Data is over \(settings.staleMinutes) min old — refreshes are failing",
                                       action: nil, keyEquivalent: "")
                 hint.isEnabled = false
                 menu.addItem(hint)
             }
         } else {
             let msg = NSMenuItem(title: "Offline — no usage data", action: nil, keyEquivalent: "")
+            msg.isEnabled = false
+            menu.addItem(msg)
+        }
+        if let problem = settingsProblem {
+            let msg = NSMenuItem(title: problem, action: nil, keyEquivalent: "")
             msg.isEnabled = false
             menu.addItem(msg)
         }
