@@ -237,6 +237,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastResetPoll: Date?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // One bar only: launchd starts it at login, and `open` (or Spotlight) can start another.
+        let me = NSRunningApplication.current
+        if NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
+            .contains(where: { $0 != me }) {
+            exit(0)  // clean exit: launchd's KeepAlive (crash-only) won't respawn it
+        }
         menu.delegate = self
         menu.autoenablesItems = false
         item.menu = menu

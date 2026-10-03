@@ -12,6 +12,7 @@ DOMAIN="gui/$(id -u)"
 
 if [ "${1:-}" = "uninstall" ]; then
     launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+    pkill -f "$APP/Contents/MacOS/CmonBar" 2>/dev/null || true
     rm -rf "$APP" "$PLIST"
     echo "cmon Bar removed (settings kept in ~/.cmon/bar.json)"
     exit 0
@@ -43,6 +44,7 @@ EOF
 codesign --force --sign - "$BUILD"
 
 launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+pkill -f "$APP/Contents/MacOS/CmonBar" 2>/dev/null || true  # copies started via open/Spotlight
 rm -rf "$APP"
 mv "$BUILD" "$APP"
 
