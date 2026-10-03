@@ -5,6 +5,14 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`cmon status --json`** — versioned, provider-grouped payload read from the local cache.
+- **cmon Bar** (`menubar/`) — native macOS menu bar item with a configurable compact title
+  and a per-window breakdown; installed with `menubar/install.sh`.
+
 ## [0.5.0] — 2026-08-30
 
 ### Fixed

@@ -120,6 +120,26 @@ and prints `cmon offline` if the network fails (doesn't break the statusline):
 5h 18% · week 42% · reset 3h18m
 ```
 
+`--json` prints a versioned payload (`version`, `offline`, `observed_at`, `age_s`,
+`providers.claude.windows[]`) for scripts and the menu bar app; same cache, no network.
+
+### Menu bar (macOS)
+
+`menubar/` holds **cmon Bar**, a native menu bar item (Swift, no third-party app) that
+shows the quota as `2•44••76` — 5h %, weekly %, minutes to the 5h reset — and opens a
+per-window breakdown on click. It reads `cmon status --json` every minute (~70 ms, no
+network), so keep the cache fresh with `cmon install`.
+
+```sh
+menubar/install.sh            # build with swiftc, start now and at login
+menubar/install.sh uninstall
+```
+
+Title, refresh interval, stale threshold and the "Open cmon watch" command live in
+`~/.cmon/bar.json`, re-read on every refresh. Title placeholders: `{5h}` `{wk}`
+`{reset}` (minutes) `{reset_hm}` `{wk_reset_hm}` `{age}` (minutes since collection).
+The title dims when data is older than `stale_minutes`.
+
 ### `cmon wait` — notify when ready
 
 Blocks until the window resets and then triggers a native notification — so you

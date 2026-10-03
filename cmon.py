@@ -1831,34 +1831,54 @@ def _reset_expired(rows) -> bool:
         return False
 
 
-def status(args):
-    """Single line for statusline/tmux/prompt. By default reads local cache (fast,
-    ~sub-20ms, no network) fed by 'collect'; --live forces API. A cache whose session
-    window already reset is auto-refreshed from the API (and re-cached) so the line never
-    shows a dead 'reset expired' cycle; on network failure it falls back to the stale
-    rows with an 'Xm ago' marker."""
-    age = None
-    if args.live:
+def _status_rows(live: bool):
+    """(rows, age_s) for 'status': local cache by default (fast, no network) fed by
+    'collect'; live forces API. A cache whose session window already reset is
+    auto-refreshed from the API (and re-cached) so callers never see a dead 'reset
+    expired' cycle; on network failure it falls back to the stale rows. None = offline
+    with nothing cached. age_s is 0 for rows just fetched."""
+    if live:
         try:
             rows = limits(fetch())
-            _write_cache(rows, datetime.now(UTC))  # warm the cache so plain 'status' stays fresh
         except FetchError:
-            print("cmon offline")
-            return
-    else:
-        got = _read_cache() or _rows_from_db()
-        if got and not _reset_expired(got[0]):
-            rows, age = got
-        else:
-            try:
-                rows = limits(fetch(retries=1))  # no/stale cache: refresh and re-cache
-                _write_cache(rows, datetime.now(UTC))
-            except FetchError:
-                if got:  # offline: keep stale rows; staleness shown via 'Xm ago'
-                    rows, age = got
-                else:
-                    print("cmon offline")
-                    return
+            return None
+        _write_cache(rows, datetime.now(UTC))  # warm the cache so plain 'status' stays fresh
+        return rows, 0.0
+    got = _read_cache() or _rows_from_db()
+    if got and not _reset_expired(got[0]):
+        return got
+    try:
+        rows = limits(fetch(retries=1))  # no/stale cache: refresh and re-cache
+    except FetchError:
+        return got  # offline: keep stale rows (or None); staleness shown via age
+    _write_cache(rows, datetime.now(UTC))
+    return rows, 0.0
+
+
+def _status_json(got) -> dict:
+    """Stable machine contract for 'status --json' (menu bar, scripts). Versioned and
+    grouped under 'providers' so more providers can be added without breaking readers."""
+    if got is None:
+        return {"version": 1, "offline": True, "observed_at": None, "age_s": None, "providers": {}}
+    rows, age = got
+    observed = datetime.now(UTC) - timedelta(seconds=age)
+    windows = [{"key": key, "label": label, "percent": percent, "resets_at": resets_at,
+                "active": bool(active)} for key, label, percent, resets_at, active in rows]
+    return {"version": 1, "offline": False, "observed_at": observed.isoformat(),
+            "age_s": round(age), "providers": {"claude": {"windows": windows}}}
+
+
+def status(args):
+    """Single line for statusline/tmux/prompt (or --json for the menu bar/scripts). Reads
+    the local cache by default (~sub-20ms, no network); --live forces API."""
+    got = _status_rows(args.live)
+    if args.json:
+        print(json.dumps(_status_json(got)))
+        return
+    if got is None:
+        print("cmon offline")
+        return
+    rows, age = got
     parts = []
     for key, short in (("session", "5h"), ("weekly_all", "wk")):
         r = next((x for x in rows if x[0] == key), None)
@@ -1867,7 +1887,7 @@ def status(args):
     sess = next((x for x in rows if x[0] == "session"), None)
     if sess and sess[3]:
         parts.append(f"reset {_eta_short(sess[3])}")
-    if age is not None and age > 1800:  # stale data: signal without noise
+    if age > 1800:  # stale data: signal without noise
         parts.append(f"{age / 60:.0f}m ago")
     print(" · ".join(parts))
 
@@ -2506,6 +2526,7 @@ def main():
     pn.add_argument("--no-ai", action="store_true", help="with --advice: local projections only, skip Claude")
     ps = sub.add_parser("status", help="single line for statusline/tmux/prompt (reads local cache)")
     ps.add_argument("--live", action="store_true", help="query API instead of local cache")
+    ps.add_argument("--json", action="store_true", help="versioned JSON for the menu bar/scripts")
     ptr = sub.add_parser("trends", help="consumption history: per-label summary + per-cycle peaks/anomaly")
     ptr.add_argument("--since", help="filter the summary from '24h', '7d' or ISO date")
     ptr.add_argument("--json", action="store_true", help="JSON output of the summary")
