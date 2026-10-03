@@ -24,6 +24,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   connection for its whole session, so `collect --alert`, `burn`, `trends` and `plot` failed
   while it ran. Each tick now fetches first, then opens, writes and closes; `collect` waits
   up to 30 s for the lock, and `now --advice` releases it before the slow AI tip.
+- **`status` can no longer hang or traceback.** The cache is written atomically (temp file +
+  `os.replace`, mode 0600), so a concurrent reader never sees a torn file; the DuckDB
+  fallback degrades when another cmon holds the lock; and an expired cache refetches with a
+  5 s timeout, at most once every 2 min while offline (it used to block up to 30 s on every
+  render). `config` and alert state use the same atomic write.
 - **Log scans no longer stall on large batches.** Rows are bulk-loaded through a private
   temp CSV instead of list parameters (~100 µs/element in DuckDB); a full rescan of 1.5k
   transcripts went from ~100 s to ~4 s.

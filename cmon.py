@@ -423,13 +423,34 @@ def _read_config() -> dict:
         return {}
 
 
+def _atomic_write_json(path: str, obj, indent=None) -> None:
+    """Write JSON so readers see the old file or the new one, never a torn mix: temp file in
+    the same directory (0600 via mkstemp), fsync, os.replace. collect, watch, status and
+    the menu bar all touch these files concurrently."""
+    import tempfile
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=indent)
+            if indent:
+                f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _write_config(cfg: dict) -> None:
     """Persist user preferences to ~/.cmon/config.json. Unlike _write_cache this does NOT
     swallow errors — 'config set/clear' is the primary action, callers must surface failure."""
-    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
-    with open(CONFIG, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
-        f.write("\n")
+    _atomic_write_json(CONFIG, cfg, indent=2)
 
 
 def _resolve_tz():
@@ -511,7 +532,7 @@ def _retry_after(r) -> float | None:
         return None
 
 
-def fetch(retries: int = RETRIES) -> dict:
+def fetch(retries: int = RETRIES, timeout: float = 30) -> dict:
     """Query usage endpoint with retry/backoff. Raises FetchError with user-readable message —
     401/403 fail immediately (no point retrying); 429 and 5xx and network errors retry
     with exponential backoff (respecting Retry-After)."""
@@ -525,7 +546,7 @@ def fetch(retries: int = RETRIES) -> dict:
         headers = {"Authorization": f"Bearer {override or get_token()}",
                    "anthropic-beta": "oauth-2025-04-20", "User-Agent": UA}
         try:
-            r = s.get(URL, timeout=30, headers=headers)
+            r = s.get(URL, timeout=timeout, headers=headers)
             if r.status_code == 401:
                 if override is None and (new := _force_refresh()):
                     override = new
@@ -1711,8 +1732,7 @@ def _mark_alert(key: str, marker) -> None:
         except Exception:
             pass
         d[key] = marker
-        with open(ALERT_STATE, "w", encoding="utf-8") as f:
-            json.dump(d, f)
+        _atomic_write_json(ALERT_STATE, d)
     except Exception:
         pass
 
@@ -1864,9 +1884,7 @@ CACHE = os.path.expanduser("~/.cmon/status.json")  # fixed: statusline runs from
 def _write_cache(rows, ts) -> None:
     """Save latest snapshot to lightweight cache for 'status' to read without network/DuckDB."""
     try:
-        os.makedirs(os.path.dirname(CACHE), exist_ok=True)
-        with open(CACHE, "w", encoding="utf-8") as f:
-            json.dump({"ts": ts.isoformat(), "rows": [list(r) for r in rows]}, f)
+        _atomic_write_json(CACHE, {"ts": ts.isoformat(), "rows": [list(r) for r in rows]})
     except Exception:
         pass
 
@@ -1885,12 +1903,18 @@ def _read_cache():
 
 
 def _rows_from_db():
-    """(rows, age_s) from latest snapshot in database, or None if none."""
-    con = db(create=False)
+    """(rows, age_s) from latest snapshot in database, or None if none or the DB is busy
+    (another cmon holds the write lock) — status must degrade, never traceback."""
+    con = _read_db()
     if con is None:
         return None
-    res = con.execute("SELECT key,label,percent,resets_at,is_active,ts FROM snapshots "
-                      "WHERE ts=(SELECT max(ts) FROM snapshots)").fetchall()
+    try:
+        res = con.execute("SELECT key,label,percent,resets_at,is_active,ts FROM snapshots "
+                          "WHERE ts=(SELECT max(ts) FROM snapshots)").fetchall()
+    except Exception:
+        return None
+    finally:
+        con.close()
     if not res:
         return None
     rows = [(key, label, float(percent),
@@ -1912,6 +1936,38 @@ def _reset_expired(rows) -> bool:
         return False
 
 
+STATUS_FAIL = os.path.expanduser("~/.cmon/status.fail")  # mtime = last failed status fetch
+STATUS_RETRY_S = 120   # after a failed fetch, plain 'status' serves the cache this long
+STATUS_TIMEOUT_S = 5   # status runs every minute from a menu bar/statusline: fail fast
+
+
+def _status_fetch():
+    """Rows from the API for 'status', or None. Short timeout, one attempt, and after a
+    failure no retry for STATUS_RETRY_S — offline, every statusline/menu bar render used to
+    block up to 30 s on the same dead request."""
+    try:
+        if 0 <= datetime.now(UTC).timestamp() - os.path.getmtime(STATUS_FAIL) < STATUS_RETRY_S:
+            return None
+    except OSError:
+        pass
+    try:
+        rows = limits(fetch(retries=1, timeout=STATUS_TIMEOUT_S))
+    except FetchError:
+        try:
+            os.makedirs(os.path.dirname(STATUS_FAIL), exist_ok=True)
+            with open(STATUS_FAIL, "w"):
+                pass
+        except OSError:
+            pass
+        return None
+    try:
+        os.unlink(STATUS_FAIL)
+    except OSError:
+        pass
+    _write_cache(rows, datetime.now(UTC))
+    return rows
+
+
 def _status_rows(live: bool):
     """(rows, age_s) for 'status': local cache by default (fast, no network) fed by
     'collect'; live forces API. A cache whose session window already reset is
@@ -1920,7 +1976,7 @@ def _status_rows(live: bool):
     with nothing cached. age_s is 0 for rows just fetched."""
     if live:
         try:
-            rows = limits(fetch())
+            rows = limits(fetch(retries=2, timeout=10))  # explicit refresh: bounded, ~20 s worst case
         except FetchError:
             return None
         _write_cache(rows, datetime.now(UTC))  # warm the cache so plain 'status' stays fresh
@@ -1928,11 +1984,9 @@ def _status_rows(live: bool):
     got = _read_cache() or _rows_from_db()
     if got and not _reset_expired(got[0]):
         return got
-    try:
-        rows = limits(fetch(retries=1))  # no/stale cache: refresh and re-cache
-    except FetchError:
+    rows = _status_fetch()  # no/expired cache: refresh and re-cache
+    if rows is None:
         return got  # offline: keep stale rows (or None); staleness shown via age
-    _write_cache(rows, datetime.now(UTC))
     return rows, 0.0
 
 

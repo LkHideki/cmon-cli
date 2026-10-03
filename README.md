@@ -124,11 +124,15 @@ One compact line, ideal for status bar / tmux / prompt. Exits with code 0
 and prints `cmon offline` if the network fails (doesn't break the statusline):
 
 ```
-5h 18% · week 42% · reset 3h18m
+5h 18% · wk 42% · reset 3h18m
 ```
 
+It reads the local cache. Only when the cached 5h window has already reset does it call
+the API (5 s timeout; after a failure it serves the cache for 2 min before retrying), so
+it never shows a dead cycle and never blocks a prompt. `--live` always queries the API.
+
 `--json` prints a versioned payload (`version`, `offline`, `observed_at`, `age_s`,
-`providers.claude.windows[]`) for scripts and the menu bar app; same cache, no network.
+`providers.claude.windows[]`) for scripts and the menu bar app.
 
 ### Menu bar (macOS)
 
