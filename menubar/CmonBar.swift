@@ -18,6 +18,11 @@ struct Settings: Codable {
     var resetAbovePercent = 85.0
     var refreshSeconds = 60
     var staleMinutes = 30
+    /// Hot mode — 5h usage above `hotPercent` or its reset under `hotMinutes` away: poll the
+    /// API itself (`status --live`) every `hotRefreshSeconds` instead of reading the cache.
+    var hotPercent = 87.0
+    var hotMinutes = 60
+    var hotRefreshSeconds = 59
     var cmon = "~/.local/bin/cmon"
     var watchCommand = "open -na Ghostty --args -e $HOME/.local/bin/cmon watch"
 
@@ -26,6 +31,9 @@ struct Settings: Codable {
         case resetAbovePercent = "reset_above_percent"
         case refreshSeconds = "refresh_seconds"
         case staleMinutes = "stale_minutes"
+        case hotPercent = "hot_percent"
+        case hotMinutes = "hot_minutes"
+        case hotRefreshSeconds = "hot_refresh_seconds"
         case watchCommand = "watch_command"
     }
 
@@ -41,6 +49,9 @@ struct Settings: Codable {
         resetAbovePercent = try c.decodeIfPresent(Double.self, forKey: .resetAbovePercent) ?? d.resetAbovePercent
         refreshSeconds = max(try c.decodeIfPresent(Int.self, forKey: .refreshSeconds) ?? d.refreshSeconds, 10)
         staleMinutes = try c.decodeIfPresent(Int.self, forKey: .staleMinutes) ?? d.staleMinutes
+        hotPercent = try c.decodeIfPresent(Double.self, forKey: .hotPercent) ?? d.hotPercent
+        hotMinutes = try c.decodeIfPresent(Int.self, forKey: .hotMinutes) ?? d.hotMinutes
+        hotRefreshSeconds = max(try c.decodeIfPresent(Int.self, forKey: .hotRefreshSeconds) ?? d.hotRefreshSeconds, 30)
         cmon = try c.decodeIfPresent(String.self, forKey: .cmon) ?? d.cmon
         watchCommand = try c.decodeIfPresent(String.self, forKey: .watchCommand) ?? d.watchCommand
     }
@@ -224,22 +235,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
         ) { [weak self] _ in MainActor.assumeIsolated { self?.refresh() } }
         refresh()
+        schedule()
+    }
+
+    /// Close to the 5h limit or its reset, minute-old numbers matter: go live.
+    private var isHot: Bool {
+        guard let s = snapshot?.window("session"), snapshot?.offline == false else { return false }
+        if s.percent > settings.hotPercent { return true }
+        guard let reset = s.resetDate else { return false }
+        let left = reset.timeIntervalSinceNow
+        return left > 0 && left < TimeInterval(settings.hotMinutes * 60)
     }
 
     private func schedule() {
-        let interval = TimeInterval(settings.refreshSeconds)
+        let interval = TimeInterval(isHot ? settings.hotRefreshSeconds : settings.refreshSeconds)
         guard timer?.timeInterval != interval else { return }
         timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+        let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.refresh() }
         }
+        t.tolerance = interval * 0.1  // lets macOS coalesce wakeups
+        RunLoop.main.add(t, forMode: .common)  // keeps ticking while the menu is open
+        timer = t
     }
 
-    private func refresh(live: Bool = false) {
+    private func refresh(live explicit: Bool = false) {
         settings = Settings.load()
-        schedule()
         guard !busy else { return }
         busy = true
+        let live = explicit || isHot
         let path = NSString(string: settings.cmon).expandingTildeInPath
         let args = live ? ["status", "--json", "--live"] : ["status", "--json"]
         Task.detached {
@@ -247,9 +271,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             await MainActor.run {
                 self.busy = false
                 switch result {
+                case .success(let snap) where snap.offline && live && self.snapshot != nil:
+                    self.error = "Live refresh failed — showing last data"  // keep last numbers
                 case .success(let snap): self.snapshot = snap; self.error = nil
                 case .failure(let err): self.error = err.message
                 }
+                self.schedule()  // hot mode may have started or ended
                 self.render()
             }
         }
@@ -261,18 +288,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard FileManager.default.isExecutableFile(atPath: path) else {
             return .failure(FetchError(message: "cmon not found at \(path)"))
         }
-        let proc = Process(), out = Pipe()
+        let proc = Process(), out = Pipe(), err = Pipe()
         proc.executableURL = URL(fileURLWithPath: path)
         proc.arguments = args
         proc.standardOutput = out
-        proc.standardError = FileHandle.nullDevice
+        proc.standardError = err
         do { try proc.run() } catch { return .failure(FetchError(message: "cmon failed to start")) }
+        // cmon bounds its own network time (status 5 s, --live ~20 s); this is the backstop
+        // so a wedged child can never freeze the bar with `busy` stuck on.
+        let watchdog = DispatchWorkItem { if proc.isRunning { proc.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 30, execute: watchdog)
         let data = out.fileHandleForReading.readDataToEndOfFile()
+        let errData = err.fileHandleForReading.readDataToEndOfFile()
         proc.waitUntilExit()
-        guard let snap = try? JSONDecoder().decode(Snapshot.self, from: data) else {
-            return .failure(FetchError(message: "cmon status --json unavailable (update cmon)"))
-        }
-        return .success(snap)
+        watchdog.cancel()
+        if let snap = try? JSONDecoder().decode(Snapshot.self, from: data) { return .success(snap) }
+        if proc.terminationReason == .uncaughtSignal { return .failure(FetchError(message: "cmon timed out")) }
+        let detail = String(decoding: errData, as: UTF8.self)
+            .split(separator: "\n").last.map(String.init) ?? "cmon status --json unavailable (update cmon)"
+        return .failure(FetchError(message: String(detail.prefix(120))))
     }
 
     private func isStale(_ snap: Snapshot, now: Date) -> Bool {

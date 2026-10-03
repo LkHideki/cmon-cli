@@ -39,6 +39,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   different account no longer inflate burn, the hourly profile or `plot`; `burn` reports
   what it excluded and `--all-accounts` brings it back.
 - **`cmon status --json`** — versioned, provider-grouped payload read from the local cache.
+- **cmon Bar hot mode and icon.** Above 87% of the 5h window or within its last hour the
+  bar polls the API every 59 s; a watchdog kills a wedged `cmon` child, its stderr shows in
+  the menu, and the timer keeps running while the menu is open. `install.sh` builds aside
+  before replacing the running app and draws the app icon (a two-ring quota gauge).
 - **cmon Bar** (`menubar/`) — native macOS menu bar item with a configurable compact title
   and a per-window breakdown; installed with `menubar/install.sh`.
 

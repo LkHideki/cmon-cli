@@ -154,6 +154,12 @@ Title, refresh interval, stale threshold and the "Open cmon watch" command live 
 (hours) `{wk_reset_hm}` `{age}` (minutes since collection). The title dims when data is
 older than `stale_minutes`.
 
+Near the limit it stops trusting the cache: while 5h usage is above `hot_percent` (87) or
+its reset is under `hot_minutes` (60) away, it queries the API itself (`status --live`)
+every `hot_refresh_seconds` (59) — about one HTTP call a minute, ~0.3 s of CPU each. A
+failed live call keeps the last numbers and dims the title. If you quit it from the menu,
+it comes back at next login, or now with `open ~/Applications/"cmon Bar.app"`.
+
 ### `cmon wait` — notify when ready
 
 Blocks until the window resets and then triggers a native notification — so you
