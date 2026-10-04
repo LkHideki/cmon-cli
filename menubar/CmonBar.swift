@@ -41,10 +41,12 @@ struct Settings: Codable {
     /// Menu bar title: segments joined by `separator`; an empty segment keeps its slot
     /// (`2•44••91`), so positions never shift. Placeholders:
     /// {5h} {wk} {reset} {reset_hm} {wk_reset_h} {wk_reset_hm} {age}. The 5h reset
-    /// ({reset}, {reset_hm}) is blank unless 5h usage is above `resetAbovePercent`.
+    /// ({reset}, {reset_hm}) is blank unless 5h usage is above `resetAbovePercent` or the
+    /// reset is at most `resetWithinMin` minutes away.
     var segments = ["{5h}", "{wk}", "{reset}", "{wk_reset_h}"]
     var separator = "•"
     var resetAbovePercent = 85.0
+    var resetWithinMin = 100.0
     /// How often to query the API, tightening as the 5h reset or limit approaches.
     var refresh: [RefreshRule] = [
         RefreshRule(everyS: 600),
@@ -60,6 +62,7 @@ struct Settings: Codable {
     enum CodingKeys: String, CodingKey {
         case segments, separator, refresh, cmon
         case resetAbovePercent = "reset_above_percent"
+        case resetWithinMin = "reset_within_min"
         case staleMinutes = "stale_minutes"
         case watchCommand = "watch_command"
     }
@@ -74,6 +77,7 @@ struct Settings: Codable {
         segments = try c.decodeIfPresent([String].self, forKey: .segments) ?? d.segments
         separator = try c.decodeIfPresent(String.self, forKey: .separator) ?? d.separator
         resetAbovePercent = try c.decodeIfPresent(Double.self, forKey: .resetAbovePercent) ?? d.resetAbovePercent
+        resetWithinMin = try c.decodeIfPresent(Double.self, forKey: .resetWithinMin) ?? d.resetWithinMin
         let rules = (try c.decodeIfPresent([RefreshRule].self, forKey: .refresh) ?? d.refresh)
             .filter { $0.everyS.isFinite && $0.everyS > 0 }
         refresh = rules.isEmpty ? d.refresh : rules
@@ -171,6 +175,15 @@ func spacedDuration(_ seconds: TimeInterval) -> String {
     return "\(m) min"
 }
 
+/// Whether the title shows the 5h countdown ({reset}/{reset_hm}): usage above
+/// reset_above_percent, or the reset at most reset_within_min minutes away.
+func showsSessionReset(_ settings: Settings, _ snap: Snapshot, now: Date) -> Bool {
+    guard let session = snap.window("session") else { return false }
+    if session.percent > settings.resetAbovePercent { return true }
+    guard let left = session.resetDate?.timeIntervalSince(now), left > 0 else { return false }
+    return left <= settings.resetWithinMin * 60
+}
+
 func renderTitle(_ settings: Settings, _ snap: Snapshot, now: Date) -> String {
     let session = snap.window("session"), weekly = snap.window("weekly_all")
     func pct(_ q: Quota?) -> String { q.map { String(Int($0.percent.rounded())) } ?? "–" }
@@ -178,7 +191,7 @@ func renderTitle(_ settings: Settings, _ snap: Snapshot, now: Date) -> String {
         guard let d = q?.resetDate, d > now else { return nil }
         return d.timeIntervalSince(now)
     }
-    let hot = (session?.percent ?? 0) > settings.resetAbovePercent
+    let hot = showsSessionReset(settings, snap, now: now)
     let values: [String: String] = [
         "5h": pct(session),
         "wk": pct(weekly),
@@ -322,7 +335,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func updateTicker() {
         let near = sessionLeft.map { $0 > -120 && $0 <= 60 } ?? false  // last minute + catch-up
-        if menuOpen || near {
+        // A visible countdown in the title must move on its own, not only when data refreshes.
+        let counting = snapshot.map { !$0.offline && showsSessionReset(settings, $0, now: Date()) } ?? false
+        if menuOpen || near || counting {
             guard ticker == nil else { return }
             let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated { self?.tick() }
@@ -379,6 +394,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let boundary = settings.nextBoundary(resetLeft: sessionLeft) {
             fire = min(fire, now.addingTimeInterval(boundary + 1))
         }
+        if let left = sessionLeft, left > settings.resetWithinMin * 60 {  // countdown appears in the title
+            fire = min(fire, now.addingTimeInterval(left - settings.resetWithinMin * 60 + 1))
+        }
         let t = Timer(fire: fire, interval: 0, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated { self?.timerFired() }
         }
@@ -389,6 +407,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func timerFired() {
         reloadSettings()
+        render()
+        updateTicker()
         if Date() >= nextDue.addingTimeInterval(-1) {
             refresh(live: true)
         } else {
@@ -462,7 +482,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             button.toolTip = error ?? "cmon offline"
             return
         }
-        button.title = renderTitle(settings, snap, now: now)
+        let title = renderTitle(settings, snap, now: now)
+        if button.title != title { button.title = title }  // the ticker calls this every second
         button.appearsDisabled = isStale(snap, now: now) || error != nil
         button.toolTip = snap.windows.map { "\(displayName($0)) \(Int($0.percent.rounded()))%" }
             .joined(separator: "  ·  ")

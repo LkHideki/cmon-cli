@@ -23,7 +23,8 @@ func snapshot(session pct: Double, resetIn left: Double) -> Snapshot {
 
 // Title: 5h reset only above reset_above_percent; empty slot kept; seconds in the last minute.
 let d = Settings()
-check(renderTitle(d, snapshot(session: 2, resetIn: 50 * m), now: now) == "2•44••91", "title, 5h reset hidden")
+check(renderTitle(d, snapshot(session: 2, resetIn: 150 * m), now: now) == "2•44••91", "title, 5h reset hidden")
+check(renderTitle(d, snapshot(session: 2, resetIn: 99.5 * m), now: now) == "2•44•99•91", "title, shown within 100 min")
 check(renderTitle(d, snapshot(session: 90, resetIn: 75.5 * m), now: now) == "90•44•75•91", "title, 5h reset shown")
 let lastMinute = renderTitle(d, snapshot(session: 90, resetIn: 42.5), now: now)  // ISO drops sub-seconds
 check(lastMinute.hasPrefix("90•44•4") && lastMinute.hasSuffix("s•91"), "title, last minute in seconds")

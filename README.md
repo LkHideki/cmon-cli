@@ -134,7 +134,8 @@ it never shows a dead cycle and never blocks a prompt. `--live` always queries t
 
 `menubar/` holds **cmon Bar**, a native menu bar item (Swift, no third-party app). The
 title shows the quota as `2•44••91` — 5h %, weekly %, minutes to the 5h reset (blank
-until 5h usage passes 85%, e.g. `88•44•75•91`), hours to the weekly reset — and a click
+until 5h usage passes 85% or the reset is under 100 min away, e.g. `5•44•75•91`), hours
+to the weekly reset — and a click
 opens a per-window breakdown with progress bars, reset times and when the next update is
 due.
 
@@ -149,7 +150,9 @@ is reported in the menu and defaults are used):
 
 - **Title** — `segments` joined by `separator`; an empty segment keeps its slot, so
   positions never shift. Placeholders: `{5h}` `{wk}` `{reset}` (minutes) `{reset_hm}` —
-  both blank until 5h usage is above `reset_above_percent` — `{wk_reset_h}` (hours)
+  both blank unless 5h usage is above `reset_above_percent` (85) or the reset is at most
+  `reset_within_min` (100) minutes away; while shown they count down on their own —
+  `{wk_reset_h}` (hours)
   `{wk_reset_hm}` `{age}` (minutes since the data was read). The title dims when the data
   is older than `stale_minutes`.
 - **Refresh schedule** — `refresh` is a list of rules for how often the bar queries the

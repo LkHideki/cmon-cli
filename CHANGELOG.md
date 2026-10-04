@@ -5,6 +5,14 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **cmon Bar shows the 5h countdown near the reset**, not only near the limit:
+  `reset_within_min` (default 100) joins `reset_above_percent`, and the visible countdown
+  now ticks every minute on its own instead of waiting for the next data refresh.
+
 ## [0.6.0] — 2026-10-03
 
 ### Upgrading
