@@ -11,15 +11,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 - History moves to a provider-aware schema on first use. Older cmon versions can't read it;
   `make install` first copies your database to `~/.cmon/usage.before-provider-schema.duckdb`.
-- A `bar.json` still holding the old default layout switches once to the one with units. To go
-  back, set `"segments": ["{5h}", "{wk}", "{reset}", "{wk_reset_h}"]`; it won't be changed again.
+- A `bar.json` still holding the old default layout switches once to the new one. To go back,
+  set `"segments": ["{5h}", "{wk}", "{reset}", "{wk_reset_h}"]` and `"separator": "•"`; it won't
+  be changed again.
 
 ### Added
 
 - **`make install`, `make uninstall`, `make doctor`**: one command sets up the `cmon` command,
   cmon Bar and background collection at user level, and says what to fix if something is off.
-- **cmon Bar title with units** (`2%•44%••91h`), through the new `{5h_pct}` `{wk_pct}`
-  `{reset_short}` `{wk_reset_short}` placeholders, plus a legend in the menu and tooltip.
+- **cmon Bar title in two groups** (`90%/75m  44%/91h`): the 5h window and the weekly limit, each
+  as percent used / time left, through `{5h_pair}` `{wk_pair}`, with a legend in the menu and
+  tooltip. `{5h_pct}` `{wk_pct}` `{reset_short}` `{wk_reset_short}` are there for other layouts.
 - **Labelled title layouts**: `hide_empty` in `bar.json` drops blank values with their
   decoration, and `{5h_bar}` `{wk_bar}` `{5h_dot}` `{wk_dot}` show usage as blocks or a traffic light.
 

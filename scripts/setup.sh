@@ -7,8 +7,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BAR_JSON="$HOME/.cmon/bar.json"
 APP="$HOME/Applications/cmon Bar.app"
 OLD_LAYOUT='["{5h}","{wk}","{reset}","{wk_reset_h}"]'
-NEW_LAYOUT='["{5h_pct}","{wk_pct}","{reset_short}","{wk_reset_short}"]'
-LAYOUT_MARK="$HOME/.cmon/.bar-layout-units"
+NEW_LAYOUT='["{5h_pair}","{wk_pair}"]'
+LAYOUT_MARK="$HOME/.cmon/.bar-layout-pairs"
 DB_BACKUP="$HOME/.cmon/usage.before-provider-schema.duckdb"
 
 say() { printf '\n==> %s\n' "$1"; }
@@ -34,7 +34,7 @@ backup_db() {
     echo "History backed up to $DB_BACKUP"
 }
 
-# Once only: a bar.json still holding the old default gets the labelled layout; any other
+# Once only: a bar.json still holding the old default gets the new layout; any other
 # layout, or one restored after this ran, is the user's choice and stays.
 configure_bar() {
     mkdir -p "$HOME/.cmon"
@@ -43,7 +43,8 @@ configure_bar() {
         current="$(plutil -extract segments json -o - "$BAR_JSON" 2>/dev/null || true)"
         if [ "$current" = "$OLD_LAYOUT" ]; then
             plutil -replace segments -json "$NEW_LAYOUT" "$BAR_JSON"
-            echo "Menu bar title now shows units: 2%•44%••91h"
+            plutil -replace separator -string "  " "$BAR_JSON"
+            echo "Menu bar title now reads: 2%/2h  44%/91h"
         fi
     fi
     : > "$LAYOUT_MARK"
@@ -75,10 +76,9 @@ do_install() {
     "$(cmon_path)" status --live || true
     if do_doctor; then printf '\nDone. '; else printf '\nInstalled, but fix the items marked FAIL above, then run: make doctor\n'; fi
     cat <<MSG
-How to read the menu bar: 2%•44%••91h
-  2%   5h window used         44%  weekly limit used
-  91h  until the weekly reset
-A 5h countdown appears in the empty slot near the limit or the reset: 90%•44%•75m•91h
+How to read the menu bar: 90%/75m  44%/91h
+  left group:  5h window, 90% used, 75 minutes until it resets
+  right group: weekly limit, 44% used, 91 hours until it resets
 Click the title for details. Settings: ~/.cmon/bar.json. Remove all: make uninstall
 MSG
 }

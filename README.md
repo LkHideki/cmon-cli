@@ -22,9 +22,9 @@ make uninstall   # removes all of it, keeps your history in ~/.cmon
 ```
 
 macOS may ask to allow Keychain access when cmon first reads Claude Code's login; choose
-**Always Allow**, or the menu bar can't refresh. The menu bar then reads `2%•44%••91h`:
-5h window used, weekly limit used, a slot for the 5h countdown (`90%•44%•75m•91h` near the
-limit or the reset), and time to the weekly reset. Click it for details.
+**Always Allow**, or the menu bar can't refresh. The menu bar then reads `90%/75m  44%/91h`:
+the 5h window on the left and the weekly limit on the right, each as percent used / time
+until it resets. Click it for details.
 
 ## Installation (CLI only, any OS)
 
@@ -150,9 +150,9 @@ it never shows a dead cycle and never blocks a prompt. `--live` always queries t
 ### Menu bar (macOS)
 
 `menubar/` holds **cmon Bar**, a native menu bar item (Swift, no third-party app). The
-title shows the quota as `2%•44%••91h` — 5h used, weekly used, minutes to the 5h reset
-(blank until 5h usage passes 85% or the reset is under 100 min away, e.g.
-`5%•44%•75m•91h`), time to the weekly reset — and a click
+title shows the quota as `90%/75m  44%/91h` — 5h window, then weekly limit, each as percent
+used / time until it resets, in hours from 2 h up, minutes below that and seconds in the
+last minute — and a click
 opens a per-window breakdown with progress bars, reset times and when the next update is
 due.
 
@@ -167,7 +167,8 @@ Everything is configured in `~/.cmon/bar.json`, re-read on every refresh (an inv
 is reported in the menu and defaults are used):
 
 - **Title** — `segments` joined by `separator`; an empty segment keeps its slot, so
-  positions never shift. Placeholders with their unit: `{5h_pct}` `{wk_pct}` `{reset_short}`
+  positions never shift. Placeholders: `{5h_pair}` `{wk_pair}` (`90%/75m`, always shown);
+  with their unit: `{5h_pct}` `{wk_pct}` `{reset_short}`
   `{wk_reset_short}`; bare numbers: `{5h}` `{wk}` `{reset}` (minutes) `{reset_hm}` — the 5h
   reset ones are blank unless 5h usage is above `reset_above_percent` (85) or the reset is at most
   `reset_within_min` (100) minutes away; while shown they count down on their own —

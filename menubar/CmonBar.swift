@@ -39,7 +39,8 @@ struct RefreshRule: Codable, Equatable {
 
 struct Settings: Codable {
     /// Menu bar title: segments joined by `separator`; an empty segment keeps its slot
-    /// (`2%•44%••91h`), so positions never shift. Placeholders: {5h_pct} {wk_pct}
+    /// so positions never shift. Placeholders: {5h_pair} {wk_pair} are used/left
+    /// (`90%/75m`), always shown; {5h_pct} {wk_pct}
     /// {reset_short} {wk_reset_short} carry their unit; {5h} {wk} {reset} {reset_hm}
     /// {wk_reset_h} {wk_reset_hm} {age} are bare numbers. The 5h reset ({reset_short},
     /// {reset}, {reset_hm}) is blank unless 5h usage is above `resetAbovePercent` or the
@@ -50,7 +51,7 @@ struct Settings: Codable {
     /// layouts, where positions don't carry the meaning.
     var segments = Settings.defaultSegments
     var hideEmpty = false
-    var separator = "•"
+    var separator = Settings.defaultSeparator
     var resetAbovePercent = 85.0
     var resetWithinMin = 100.0
     /// How often to query the API, tightening as the 5h reset or limit approaches.
@@ -74,7 +75,8 @@ struct Settings: Codable {
         case watchCommand = "watch_command"
     }
 
-    static let defaultSegments = ["{5h_pct}", "{wk_pct}", "{reset_short}", "{wk_reset_short}"]
+    static let defaultSegments = ["{5h_pair}", "{wk_pair}"]
+    static let defaultSeparator = "  "
     static let url = URL(fileURLWithPath: NSString(string: "~/.cmon/bar.json").expandingTildeInPath)
 
     init() {}
@@ -202,7 +204,20 @@ func unitDuration(_ seconds: TimeInterval, hours: Bool) -> String {
 
 /// What the title's positions mean, shown in the menu and tooltip; nil for a custom layout.
 func titleLegend(_ settings: Settings) -> String? {
-    settings.segments == Settings.defaultSegments ? "5h • week • 5h reset • week reset" : nil
+    settings.segments == Settings.defaultSegments ? "5h used/left   7d used/left" : nil
+}
+
+/// Time left in the unit that reads best: hours from 2 h up (91h is exact where 3d isn't),
+/// minutes below that, seconds in the last minute.
+func pairTime(_ seconds: TimeInterval) -> String {
+    if seconds < 60 { return "\(max(Int(seconds), 0))s" }
+    return seconds >= 7200 ? "\(Int(seconds / 3600))h" : "\(Int(seconds / 60))m"
+}
+
+/// One window as percent used / time left: 90%/75m. Unknown values read as –.
+func usagePair(percent: Double?, left: TimeInterval?) -> String {
+    let used = percent.map { "\(Int($0.rounded()))%" } ?? "–"
+    return "\(used)/\(left.map(pairTime) ?? "–")"
 }
 
 func usageBar(_ percent: Double) -> String {
@@ -225,6 +240,8 @@ func renderTitle(_ settings: Settings, _ snap: Snapshot, now: Date) -> String {
     let values: [String: String] = [
         "5h": pct(session),
         "wk": pct(weekly),
+        "5h_pair": usagePair(percent: session?.percent, left: left(session)),
+        "wk_pair": usagePair(percent: weekly?.percent, left: left(weekly)),
         "5h_bar": session.map { usageBar($0.percent) } ?? "–",
         "wk_bar": weekly.map { usageBar($0.percent) } ?? "–",
         "5h_dot": session.map { usageDot($0.percent) } ?? "–",
@@ -337,6 +354,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // is open or the 5h reset is under a minute away — so countdowns move second by second
     // exactly when someone is looking, and the app is otherwise idle.
     private var ticker: Timer?
+    private var clock: Timer?  // keeps always-visible times current between data refreshes
     private var menuOpen = false
     private var rowViews: [String: QuotaRowView] = [:]
     private var updatedItem: NSMenuItem?
@@ -358,6 +376,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
         ) { [weak self] _ in MainActor.assumeIsolated { self?.refresh(live: true) } }
+        // Local text only. The 1 Hz ticker stays off most of the time; a 30 s redraw is enough here.
+        let c = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.render() }
+        }
+        c.tolerance = 5
+        RunLoop.main.add(c, forMode: .common)
+        clock = c
         reloadSettings()
         refresh(live: false)  // instant first frame from the cache; schedule() goes live as due
     }
