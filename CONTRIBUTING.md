@@ -25,7 +25,8 @@ Requires **Python 3.11+**. CI validates on 3.11, 3.12, and 3.13.
 
 ## Before opening a PR
 
-Run the same checks that CI runs:
+Run the same checks that CI runs. `make test` does the lint, the Python tests and the cmon Bar
+tests in one go; individually:
 
 ```bash
 # Lint (mandatory — CI fails if there are violations)
@@ -60,7 +61,9 @@ Guidelines:
 
 ## Scope and style
 
-- The source code is a single module: [`cmon.py`](cmon.py). Keep changes cohesive with the existing style.
+- The CLI is a single module, [`cmon.py`](cmon.py), and the macOS app lives in [`menubar/`](menubar/). Keep changes cohesive with the existing style.
+- Behaviour changes need a test. `tests/` runs against a temporary home, with the network blocked, so it never touches real data.
+- Database changes must migrate existing data: see `_ensure_schema` in `cmon.py`, and test against a copy of a real database.
 - Heavy new dependencies should be added as **optional extras** (like `plot`), not in core.
 - Never version secrets. `.env`, `*.duckdb`, and `*.png` are already in `.gitignore`.
 

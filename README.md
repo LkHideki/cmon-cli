@@ -7,7 +7,20 @@
 
 CLI to track your Claude plan consumption over time. Reads the same endpoint
 the app uses (`https://claude.ai/api/oauth/usage`), stores snapshots in DuckDB,
-and displays consumption rate, projections, and charts.
+and displays consumption rate, projections, and charts. On macOS it adds **cmon Bar**, a
+native menu bar item showing your limits at a glance.
+
+cmon tracks Claude only for now. Its database is already prepared for other providers (see
+[the Codex plan](docs/plans/codex-provider.md)), but no command reads Codex data yet.
+
+| Path | What it is |
+|---|---|
+| [`cmon.py`](cmon.py) | The whole CLI, as a single module |
+| [`menubar/`](menubar/) | cmon Bar, the macOS app, in Swift |
+| [`scripts/setup.sh`](scripts/setup.sh) | What `make install`, `make uninstall` and `make doctor` run |
+| [`tests/`](tests/) | Python tests; they never touch your real data or the network |
+| [`docs/plans/`](docs/plans/) | Design plans, in Portuguese; not all of them are implemented |
+| [`CHANGELOG.md`](CHANGELOG.md) | What changed in each release, and how to upgrade |
 
 ## Quick start (macOS)
 
@@ -26,19 +39,29 @@ macOS may ask to allow Keychain access when cmon first reads Claude Code's login
 the 5h window on the left and the weekly limit on the right, each as percent used and time
 until it resets (plain numbers are hours, `'` minutes). Click it for details.
 
+### Ask Claude to install it
+
+Paste this into Claude Code:
+
+> Install cmon from https://github.com/LkHideki/cmon-cli following its AGENTS.md, and tell me
+> if anything needs me.
+
+[AGENTS.md](AGENTS.md) gives assistants the steps, what each failure means, what the setup
+changes, and what they must leave to you, such as logging in.
+
 ## Installation (CLI only, any OS)
 
+Requires Python ≥ 3.11 and [uv](https://docs.astral.sh/uv/). cmon isn't on PyPI, and the PyPI
+package named `cmon` is an unrelated project, so install from this repository:
+
 ```bash
-git clone https://github.com/LkHideki/cmon-cli && cd cmon-cli
-uv sync                  # lightweight install (without plotting libraries)
-uv sync --extra plot     # optional: pre-install the `plot` command's libs (matplotlib/seaborn/pandas)
+uv tool install git+https://github.com/LkHideki/cmon-cli
+cmon now
 ```
 
-`cmon plot` self-provisions: if the plotting libraries aren't installed, the first run
-installs them automatically. `uv sync --extra plot` is only to pre-install them (e.g. offline).
-
-Requires Python ≥ 3.11 and [uv](https://docs.astral.sh/uv/). Without uv,
-`pip install -e .` also works.
+To work on the code instead, clone it and run `uv sync`; commands then run as `uv run cmon …`.
+`uv sync --extra plot` pre-installs the libraries for `cmon plot`, which otherwise installs
+them on first use.
 
 ## Token
 
@@ -106,6 +129,9 @@ with Claude Code transcripts available, cmon learns your real quiet hours on its
 `CMON_QUIET_HOURS` overrides without persisting.
 
 ## Usage
+
+The examples use `uv run cmon`, for a clone of this repository. After `make install` or
+`uv tool install`, just use `cmon`.
 
 ```bash
 uv run cmon now       # current usage + reset + rate/projection (--advice adds pacing tips)
