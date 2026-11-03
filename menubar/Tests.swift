@@ -21,14 +21,41 @@ func snapshot(session pct: Double, resetIn left: Double) -> Snapshot {
     return try! JSONDecoder().decode(Snapshot.self, from: Data(json.utf8))
 }
 
-// Title: 5h reset only above reset_above_percent; empty slot kept; seconds in the last minute.
+// Default title: two used-and-left pairs, both always visible, each in its best unit.
 let d = Settings()
-check(renderTitle(d, snapshot(session: 2, resetIn: 150 * m), now: now) == "2•44••91", "title, 5h reset hidden")
-check(renderTitle(d, snapshot(session: 2, resetIn: 99.5 * m), now: now) == "2•44•99•91", "title, shown within 100 min")
-check(renderTitle(d, snapshot(session: 90, resetIn: 75.5 * m), now: now) == "90•44•75•91", "title, 5h reset shown")
-let lastMinute = renderTitle(d, snapshot(session: 90, resetIn: 42.5), now: now)  // ISO drops sub-seconds
-check(lastMinute.hasPrefix("90•44•4") && lastMinute.hasSuffix("s•91"), "title, last minute in seconds")
+check(renderTitle(d, snapshot(session: 2, resetIn: 150 * m), now: now) == "2% 2  44% 91", "title, hours from 2 h up")
+check(renderTitle(d, snapshot(session: 90, resetIn: 75.5 * m), now: now) == "90% 75'  44% 91", "title, minutes below 2 h")
+check(pairTime(7200) == "2" && pairTime(7199) == "119'", "unit changes exactly at 2 h")
+check(pairTime(42) == "42\"" && pairTime(60) == "1'", "seconds only in the last minute")
+check(usagePair(percent: 100, left: 600 * 60) == "100% 10", "three digits")
+check(usagePair(percent: nil, left: nil) == "– –", "unknown values")
+check(renderTitle(d, snapshot(session: 90, resetIn: -5), now: now).hasPrefix("90% –"), "reset passed shows no time")
+check(unitDuration(1800, hours: true) == "30m" && unitDuration(7300, hours: true) == "2h", "week reset under 1 h keeps a real unit")
+check(unitDuration(7300, hours: false) == "121m", "5h reset stays in minutes")
+check(titleLegend(d) != nil, "default layout is explained in the menu")
+
+// Bare placeholders keep working for layouts already saved in bar.json.
+var bare = Settings()
+bare.segments = ["{5h}", "{wk}", "{reset}", "{wk_reset_h}"]
+bare.separator = "•"
+check(renderTitle(bare, snapshot(session: 90, resetIn: 75.5 * m), now: now) == "90•44•75•91", "bare layout, reset shown")
+check(renderTitle(bare, snapshot(session: 2, resetIn: 150 * m), now: now) == "2•44••91", "bare layout, reset hidden")
+check(titleLegend(bare) == nil, "custom layout has no legend")
 check(spacedDuration(12) == "12s" && spacedDuration(3700) == "1h 1m", "durations")
+
+// hide_empty: a blank placeholder takes its word's decoration along; empty segments vanish.
+var labelled = Settings()
+labelled.hideEmpty = true
+labelled.separator = " · "
+labelled.segments = ["5h {5h_pct} {reset_short}", "7d {wk_pct} {wk_reset_short}"]
+check(renderTitle(labelled, snapshot(session: 2, resetIn: 150 * m), now: now) == "5h 2% · 7d 44% 91h", "labelled, reset hidden")
+check(renderTitle(labelled, snapshot(session: 90, resetIn: 75.5 * m), now: now) == "5h 90% 75m · 7d 44% 91h", "labelled, reset shown")
+labelled.segments = ["{5h_pct}", "↻{reset_short}", "{wk_pct}"]
+check(renderTitle(labelled, snapshot(session: 2, resetIn: 150 * m), now: now) == "2% · 44%", "decoration leaves with its value")
+check(usageBar(0) == "▁" && usageBar(50) == "▅" && usageBar(100) == "█", "usage blocks stay in range")
+check(usageDot(79) == "🟢" && usageDot(80) == "🟡" && usageDot(95) == "🔴", "traffic light thresholds")
+let hideOff = try! JSONDecoder().decode(Settings.self, from: Data("{}".utf8))
+check(!hideOff.hideEmpty, "hide_empty is off unless asked")
 
 // Refresh rules: shortest applicable interval wins.
 check(d.refreshInterval(resetLeft: 300 * m, usage: 5) == 600, "default 10 min far from reset")
@@ -48,7 +75,7 @@ let custom = try! JSONDecoder().decode(Settings.self, from: Data("""
 check(custom.refresh.count == 2, "invalid every_s dropped")
 check(custom.refreshInterval(resetLeft: 10 * m, usage: 1) == RefreshRule.minimumEvery, "clamped to minimum")
 check(custom.refreshInterval(resetLeft: 100 * m, usage: 1) == 300, "custom default")
-check(custom.separator == "•", "missing keys keep defaults")
+check(custom.separator == Settings.defaultSeparator, "missing keys keep defaults")
 let both = try! JSONDecoder().decode(Settings.self, from: Data("""
 {"refresh":[{"every_s":600},{"reset_within_min":60,"usage_above_pct":50,"every_s":45}]}
 """.utf8))

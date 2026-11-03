@@ -1,0 +1,52 @@
+{
+  "now": {
+    "exit_code": 0,
+    "stdout": "Current usage:\n  Current session  ████················   24%   resets in     2h 0m\n  All models       ████████············   41%   resets in    96h 0m\n\n5h window: 24% used — expires in 2h 0m.\nRate: no measurable consumption in this window.\n",
+    "stderr": ""
+  },
+  "status": {
+    "exit_code": 0,
+    "stdout": "5h 24% · wk 41% · reset 2h0m\n",
+    "stderr": ""
+  },
+  "trends": {
+    "exit_code": 0,
+    "stdout": "label            snapshots  peak_pct  consumed_pct\nAll models               3        20            10\nCurrent session          3        30            10\n\nWeekly (All models) — 1 cycle(s):\n  2030-01-01 00:00 UTC  peak 20%\n\n5h window — 2 cycle(s):\n  2030-01-01 00:00 UTC  peak 30%\n  2030-01-01 02:00 UTC  peak 5%  (-25 vs previous)\n",
+    "stderr": ""
+  },
+  "trends_json": {
+    "exit_code": 0,
+    "stdout": "[{\"label\": \"All models\", \"snapshots\": 3, \"peak_pct\": 20, \"consumed_pct\": 10}, {\"label\": \"Current session\", \"snapshots\": 3, \"peak_pct\": 30, \"consumed_pct\": 10}]\n",
+    "stderr": ""
+  },
+  "burn": {
+    "exit_code": 0,
+    "stdout": "Consumption by model (API equivalent):\n  claude-sonnet-fixture       3.1M tok   US$      5.40\n  claude-opus-fixture         1.6M tok   US$      4.45\n  TOTAL                       4.7M tok   US$      9.85\n\nBy component:\n  input              1.5M tok   US$      5.50     56%\n  output             0.1M tok   US$      2.75     28%\n  cache read         3.0M tok   US$      1.10     11%\n  cache write        0.1M tok   US$      0.50      5%\n\n→ Real work (input+output): US$ 8 · Cache (context re-reading): US$ 2\n\nAPI EQUIVALENT cost (pay-per-token) — you pay subscription, not this.\nEstimate; Claude Code sessions of the terminal's account only (not claude.ai chat).\n",
+    "stderr": "scanning 1 log file(s)…\n"
+  },
+  "burn_json": {
+    "exit_code": 0,
+    "stdout": "[{\"grp\": \"claude-sonnet-fixture\", \"tok\": 3150000, \"custo\": 5.4}, {\"grp\": \"claude-opus-fixture\", \"tok\": 1570000, \"custo\": 4.45}]\n",
+    "stderr": "scanning 1 log file(s)…\n"
+  },
+  "backtest": {
+    "exit_code": 0,
+    "stdout": "Live forecasts (resolved 0 new):\n\n  model        horizon       n     MAE    bias\n  learned      <=1h          1    2.00   -2.00\n  linear       1-6h          2    4.00   -1.00\n\nMAE = mean absolute error in percentage points; bias > 0 = projecting too high.\n",
+    "stderr": ""
+  },
+  "backtest_json": {
+    "exit_code": 0,
+    "stdout": "[\n  {\n    \"model\": \"learned\",\n    \"horizon\": \"<=1h\",\n    \"n\": 1,\n    \"mae\": 2.0,\n    \"bias\": -2.0\n  },\n  {\n    \"model\": \"linear\",\n    \"horizon\": \"1-6h\",\n    \"n\": 2,\n    \"mae\": 4.0,\n    \"bias\": -1.0\n  }\n]\n",
+    "stderr": ""
+  },
+  "tune_show": {
+    "exit_code": 0,
+    "stdout": "Active model parameters:\n  blend       1  (default)\n  halflife_d  10  (default)\n  harmonics   0  (default)\n  robust      0.5  (default)\n",
+    "stderr": ""
+  },
+  "trends_no_history": {
+    "exit_code": 1,
+    "stdout": "",
+    "stderr": "No history — run 'cmon collect' a few times first.\n"
+  }
+}

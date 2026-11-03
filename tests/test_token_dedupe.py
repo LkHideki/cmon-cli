@@ -23,7 +23,9 @@ def _write(home, name, lines):
 
 
 def _totals(con):
-    return con.execute("SELECT count(*), sum(in_tok + out_tok + cache_read + cache_create) FROM token_log").fetchone()
+    return con.execute("SELECT count(*), "
+                       "sum(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens) "
+                       "FROM token_log").fetchone()
 
 
 def test_one_row_per_api_message_across_lines_and_forked_transcripts(home):
@@ -42,9 +44,9 @@ def test_one_row_per_api_message_across_lines_and_forked_transcripts(home):
 
 def test_legacy_rows_migrate_exact_when_on_disk_and_heuristic_when_deleted(home):
     con = cmon.db()
-    cmon._ensure_token_tables(con)
-    legacy = lambda uuid, at, out=20: (uuid, at, "claude-opus-4-1", "cli", "proj", "s0", 10, out, 300, 40)  # noqa: E731
-    con.executemany("INSERT INTO token_log VALUES (?,?,?,?,?,?,?,?,?,?)", [
+    legacy = lambda uuid, at, out=20: ("claude", uuid, at, T0, "s0", uuid, "claude-opus-4-1", "cli", "proj",  # noqa: E731
+                                       "s0", 10, out, 0, 300, 40, 0, None)
+    con.executemany(f"INSERT INTO token_log({cmon._TOKEN_LOG_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [
         # transcript still on disk: three line-keyed rows of one message
         legacy("u0", T0), legacy("u1", T0 + timedelta(seconds=1)), legacy("u2", T0 + timedelta(seconds=2)),
         # transcript already deleted: two lines of one message + a distinct message an hour later
@@ -56,7 +58,7 @@ def test_legacy_rows_migrate_exact_when_on_disk_and_heuristic_when_deleted(home)
     _write(home, "s0.jsonl", [_line(f"u{i}", "msg_A", "req_A", "s0", T0 + timedelta(seconds=i), USAGE)
                               for i in range(3)])
     cmon.scan_logs(con, quiet=True)
-    keys = sorted(r[0] for r in con.execute("SELECT uuid FROM token_log").fetchall())
+    keys = sorted(r[0] for r in con.execute("SELECT source_event_id FROM token_log").fetchall())
     assert keys == ["d0", "d2", "d3", "msg_A:req_A"]
     assert cmon._meta_get(con, cmon.TOKEN_KEY_META)[0] == "v2"
     pk = con.execute("SELECT count(*) FROM duckdb_constraints() WHERE table_name = 'token_log' "
@@ -71,9 +73,7 @@ def test_import_after_migration_triggers_rededupe(home, tmp_path):
     con.close()
     src = tmp_path / "old.duckdb"
     import duckdb
-    s = duckdb.connect(str(src))
-    cmon._ensure_token_tables(s)
-    s.close()
+    duckdb.connect(str(src)).close()
     from argparse import Namespace
     cmon.import_db(Namespace(paths=[str(src)]))
     assert cmon._meta_get(cmon.db(), cmon.TOKEN_KEY_META)[0] == ""

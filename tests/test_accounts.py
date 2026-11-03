@@ -37,9 +37,9 @@ def accounts(home, monkeypatch):
 def test_only_terminal_account_counts(accounts):
     con = cmon.db()
     cmon.scan_logs(con, quiet=True)
-    counted = con.execute("SELECT sum(in_tok) FROM token_terminal").fetchone()[0]
+    counted = con.execute("SELECT sum(input_tokens) FROM token_terminal").fetchone()[0]
     assert counted == 1 + 10 + 100  # cli, vscode, Desktop session tied to the terminal account
-    assert con.execute("SELECT sum(in_tok) FROM token_log").fetchone()[0] == 11111  # all kept on record
+    assert con.execute("SELECT sum(input_tokens) FROM token_log").fetchone()[0] == 11111  # all kept on record
     assert cmon._burn_rows(con, None)[0][1] == 111
 
 
@@ -56,4 +56,4 @@ def test_unknown_terminal_account_excludes_all_desktop(accounts):
     (accounts / ".claude.json").unlink()
     con = cmon.db()
     cmon.scan_logs(con, quiet=True)
-    assert con.execute("SELECT sum(in_tok) FROM token_terminal").fetchone()[0] == 11
+    assert con.execute("SELECT sum(input_tokens) FROM token_terminal").fetchone()[0] == 11

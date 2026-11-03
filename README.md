@@ -1,27 +1,67 @@
 # Claude Monitor
 
-[![CI](https://github.com/LkHideki/cmon/actions/workflows/ci.yml/badge.svg)](https://github.com/LkHideki/cmon/actions/workflows/ci.yml)
+[![CI](https://github.com/LkHideki/cmon-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/LkHideki/cmon-cli/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
 CLI to track your Claude plan consumption over time. Reads the same endpoint
 the app uses (`https://claude.ai/api/oauth/usage`), stores snapshots in DuckDB,
-and displays consumption rate, projections, and charts.
+and displays consumption rate, projections, and charts. On macOS it adds **cmon Bar**, a
+native menu bar item showing your limits at a glance.
 
-## Installation
+cmon tracks Claude only for now. Its database is already prepared for other providers (see
+[the Codex plan](docs/plans/codex-provider.md)), but no command reads Codex data yet.
+
+| Path | What it is |
+|---|---|
+| [`cmon.py`](cmon.py) | The whole CLI, as a single module |
+| [`menubar/`](menubar/) | cmon Bar, the macOS app, in Swift |
+| [`scripts/setup.sh`](scripts/setup.sh) | What `make install`, `make uninstall` and `make doctor` run |
+| [`tests/`](tests/) | Python tests; they never touch your real data or the network |
+| [`docs/plans/`](docs/plans/) | Design plans, in Portuguese; not all of them are implemented |
+| [`CHANGELOG.md`](CHANGELOG.md) | What changed in each release, and how to upgrade |
+
+## Quick start (macOS)
+
+Needs [uv](https://docs.astral.sh/uv/) and the Xcode Command Line Tools; `make install` tells
+you the exact command if either is missing. Log in to Claude Code first: cmon reads its login.
 
 ```bash
-git clone https://github.com/LkHideki/cmon && cd cmon
-uv sync                  # lightweight install (without plotting libraries)
-uv sync --extra plot     # optional: pre-install the `plot` command's libs (matplotlib/seaborn/pandas)
+git clone https://github.com/LkHideki/cmon-cli && cd cmon-cli
+make install     # cmon command, ~/Applications/cmon Bar.app, background collection, then a check
+make doctor      # what's wrong and how to fix it
+make uninstall   # removes all of it, keeps your history in ~/.cmon
 ```
 
-`cmon plot` self-provisions: if the plotting libraries aren't installed, the first run
-installs them automatically. `uv sync --extra plot` is only to pre-install them (e.g. offline).
+macOS may ask to allow Keychain access when cmon first reads Claude Code's login; choose
+**Always Allow**, or the menu bar can't refresh. The menu bar then reads `90% 75'  44% 91`:
+the 5h window on the left and the weekly limit on the right, each as percent used and time
+until it resets (plain numbers are hours, `'` minutes). Click it for details.
 
-Requires Python ≥ 3.11 and [uv](https://docs.astral.sh/uv/). Without uv,
-`pip install -e .` also works.
+### Ask Claude to install it
+
+Paste this into Claude Code:
+
+> Install cmon from https://github.com/LkHideki/cmon-cli following its AGENTS.md, and tell me
+> if anything needs me.
+
+[AGENTS.md](AGENTS.md) gives assistants the steps, what each failure means, what the setup
+changes, and what they must leave to you, such as logging in.
+
+## Installation (CLI only, any OS)
+
+Requires Python ≥ 3.11 and [uv](https://docs.astral.sh/uv/). cmon isn't on PyPI, and the PyPI
+package named `cmon` is an unrelated project, so install from this repository:
+
+```bash
+uv tool install git+https://github.com/LkHideki/cmon-cli
+cmon now
+```
+
+To work on the code instead, clone it and run `uv sync`; commands then run as `uv run cmon …`.
+`uv sync --extra plot` pre-installs the libraries for `cmon plot`, which otherwise installs
+them on first use.
 
 ## Token
 
@@ -90,6 +130,9 @@ with Claude Code transcripts available, cmon learns your real quiet hours on its
 
 ## Usage
 
+The examples use `uv run cmon`, for a clone of this repository. After `make install` or
+`uv tool install`, just use `cmon`.
+
 ```bash
 uv run cmon now       # current usage + reset + rate/projection (--advice adds pacing tips)
 uv run cmon status    # one-liner for statusline/tmux/prompt
@@ -133,14 +176,15 @@ it never shows a dead cycle and never blocks a prompt. `--live` always queries t
 ### Menu bar (macOS)
 
 `menubar/` holds **cmon Bar**, a native menu bar item (Swift, no third-party app). The
-title shows the quota as `2•44••91` — 5h %, weekly %, minutes to the 5h reset (blank
-until 5h usage passes 85% or the reset is under 100 min away, e.g. `5•44•75•91`), hours
-to the weekly reset — and a click
+title shows the quota as `90% 75'  44% 91` — 5h window, then weekly limit, each as percent
+used and time until it resets: plain hours from 2 h up, minutes with `'` below that and
+seconds with `"` in the last minute — and a click
 opens a per-window breakdown with progress bars, reset times and when the next update is
 due.
 
 ```sh
-menubar/install.sh            # build with swiftc, start now and at login
+make install                  # everything, including the cmon command this app needs
+menubar/install.sh            # only the app: build with swiftc, start now and at login
 menubar/install.sh uninstall
 menubar/test.sh               # logic tests (title, refresh rules, settings)
 ```
@@ -149,12 +193,24 @@ Everything is configured in `~/.cmon/bar.json`, re-read on every refresh (an inv
 is reported in the menu and defaults are used):
 
 - **Title** — `segments` joined by `separator`; an empty segment keeps its slot, so
-  positions never shift. Placeholders: `{5h}` `{wk}` `{reset}` (minutes) `{reset_hm}` —
-  both blank unless 5h usage is above `reset_above_percent` (85) or the reset is at most
+  positions never shift. Placeholders: `{5h_pair}` `{wk_pair}` (`90% 75'`, always shown);
+  with their unit: `{5h_pct}` `{wk_pct}` `{reset_short}`
+  `{wk_reset_short}`; bare numbers: `{5h}` `{wk}` `{reset}` (minutes) `{reset_hm}` — the 5h
+  reset ones are blank unless 5h usage is above `reset_above_percent` (85) or the reset is at most
   `reset_within_min` (100) minutes away; while shown they count down on their own —
   `{wk_reset_h}` (hours)
-  `{wk_reset_hm}` `{age}` (minutes since the data was read). The title dims when the data
-  is older than `stale_minutes`.
+  `{wk_reset_hm}` `{age}` (minutes since the data was read); `{5h_bar}` `{wk_bar}` draw usage
+  as a block and `{5h_dot}` `{wk_dot}` as a traffic light. The title dims when the data is
+  older than `stale_minutes`. With `"hide_empty": true`, a word holding a blank placeholder and
+  any segment left empty disappear, which suits labelled layouts:
+
+  ```json
+  "segments": ["5h {5h_pct} {reset_short}", "7d {wk_pct} {wk_reset_short}"],
+  "separator": " · ",
+  "hide_empty": true
+  ```
+
+  This reads `5h 2% · 7d 44% 91h`, and `5h 90% 75m · 7d 44% 91h` near the reset.
 - **Refresh schedule** — `refresh` is a list of rules for how often the bar queries the
   API (`status --live`, which also refreshes the cache the statusline reads). A rule
   applies when all its conditions hold: `reset_within_min` (the 5h reset is at most that

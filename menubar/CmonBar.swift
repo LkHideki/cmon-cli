@@ -39,12 +39,19 @@ struct RefreshRule: Codable, Equatable {
 
 struct Settings: Codable {
     /// Menu bar title: segments joined by `separator`; an empty segment keeps its slot
-    /// (`2•44••91`), so positions never shift. Placeholders:
-    /// {5h} {wk} {reset} {reset_hm} {wk_reset_h} {wk_reset_hm} {age}. The 5h reset
-    /// ({reset}, {reset_hm}) is blank unless 5h usage is above `resetAbovePercent` or the
-    /// reset is at most `resetWithinMin` minutes away.
-    var segments = ["{5h}", "{wk}", "{reset}", "{wk_reset_h}"]
-    var separator = "•"
+    /// so positions never shift. Placeholders: {5h_pair} {wk_pair} are used and left
+    /// (`90% 75'`), always shown; {5h_pct} {wk_pct}
+    /// {reset_short} {wk_reset_short} carry their unit; {5h} {wk} {reset} {reset_hm}
+    /// {wk_reset_h} {wk_reset_hm} {age} are bare numbers. The 5h reset ({reset_short},
+    /// {reset}, {reset_hm}) is blank unless 5h usage is above `resetAbovePercent` or the
+    /// reset is at most `resetWithinMin` minutes away. {5h_bar} {wk_bar} draw the usage as a
+    /// block, {5h_dot} {wk_dot} as a traffic light.
+    /// With `hideEmpty`, a word holding a blank placeholder is dropped along with its
+    /// decoration (`↻{reset_short}`), and so is a segment left with nothing: for labelled
+    /// layouts, where positions don't carry the meaning.
+    var segments = Settings.defaultSegments
+    var hideEmpty = false
+    var separator = Settings.defaultSeparator
     var resetAbovePercent = 85.0
     var resetWithinMin = 100.0
     /// How often to query the API, tightening as the 5h reset or limit approaches.
@@ -61,12 +68,15 @@ struct Settings: Codable {
 
     enum CodingKeys: String, CodingKey {
         case segments, separator, refresh, cmon
+        case hideEmpty = "hide_empty"
         case resetAbovePercent = "reset_above_percent"
         case resetWithinMin = "reset_within_min"
         case staleMinutes = "stale_minutes"
         case watchCommand = "watch_command"
     }
 
+    static let defaultSegments = ["{5h_pair}", "{wk_pair}"]
+    static let defaultSeparator = "  "
     static let url = URL(fileURLWithPath: NSString(string: "~/.cmon/bar.json").expandingTildeInPath)
 
     init() {}
@@ -76,6 +86,7 @@ struct Settings: Codable {
         let d = Settings()
         segments = try c.decodeIfPresent([String].self, forKey: .segments) ?? d.segments
         separator = try c.decodeIfPresent(String.self, forKey: .separator) ?? d.separator
+        hideEmpty = try c.decodeIfPresent(Bool.self, forKey: .hideEmpty) ?? d.hideEmpty
         resetAbovePercent = try c.decodeIfPresent(Double.self, forKey: .resetAbovePercent) ?? d.resetAbovePercent
         resetWithinMin = try c.decodeIfPresent(Double.self, forKey: .resetWithinMin) ?? d.resetWithinMin
         let rules = (try c.decodeIfPresent([RefreshRule].self, forKey: .refresh) ?? d.refresh)
@@ -184,9 +195,43 @@ func showsSessionReset(_ settings: Settings, _ snap: Snapshot, now: Date) -> Boo
     return left <= settings.resetWithinMin * 60
 }
 
+/// Duration in one unit, for the title: 91h, 75m, 42s. Hours never round down to "0h".
+func unitDuration(_ seconds: TimeInterval, hours: Bool) -> String {
+    if seconds < 60 { return "\(Int(seconds))s" }
+    if hours && seconds >= 3600 { return "\(Int(seconds / 3600))h" }
+    return "\(Int(seconds / 60))m"
+}
+
+/// What the title's positions mean, shown in the menu and tooltip; nil for a custom layout.
+func titleLegend(_ settings: Settings) -> String? {
+    settings.segments == Settings.defaultSegments ? "5h: % used, time left   7d: % used, hours left" : nil
+}
+
+/// Time left in the unit that reads best: bare hours from 2 h up (91 is exact where 3d isn't),
+/// minutes with ' below that, seconds with " in the last minute.
+func pairTime(_ seconds: TimeInterval) -> String {
+    if seconds < 60 { return "\(max(Int(seconds), 0))\"" }
+    return seconds >= 7200 ? "\(Int(seconds / 3600))" : "\(Int(seconds / 60))'"
+}
+
+/// One window as percent used and time left: 90% 75'. Unknown values read as –.
+func usagePair(percent: Double?, left: TimeInterval?) -> String {
+    let used = percent.map { "\(Int($0.rounded()))%" } ?? "–"
+    return "\(used) \(left.map(pairTime) ?? "–")"
+}
+
+func usageBar(_ percent: Double) -> String {
+    let blocks = Array("▁▂▃▄▅▆▇█")
+    return String(blocks[min(max(Int(percent / 100 * Double(blocks.count)), 0), blocks.count - 1)])
+}
+
+/// Same thresholds as the menu's progress bars.
+func usageDot(_ percent: Double) -> String { percent >= 95 ? "🔴" : percent >= 80 ? "🟡" : "🟢" }
+
 func renderTitle(_ settings: Settings, _ snap: Snapshot, now: Date) -> String {
     let session = snap.window("session"), weekly = snap.window("weekly_all")
     func pct(_ q: Quota?) -> String { q.map { String(Int($0.percent.rounded())) } ?? "–" }
+    func pctUnit(_ q: Quota?) -> String { q.map { "\(Int($0.percent.rounded()))%" } ?? "–" }
     func left(_ q: Quota?) -> TimeInterval? {
         guard let d = q?.resetDate, d > now else { return nil }
         return d.timeIntervalSince(now)
@@ -195,14 +240,34 @@ func renderTitle(_ settings: Settings, _ snap: Snapshot, now: Date) -> String {
     let values: [String: String] = [
         "5h": pct(session),
         "wk": pct(weekly),
+        "5h_pair": usagePair(percent: session?.percent, left: left(session)),
+        "wk_pair": usagePair(percent: weekly?.percent, left: left(weekly)),
+        "5h_bar": session.map { usageBar($0.percent) } ?? "–",
+        "wk_bar": weekly.map { usageBar($0.percent) } ?? "–",
+        "5h_dot": session.map { usageDot($0.percent) } ?? "–",
+        "wk_dot": weekly.map { usageDot($0.percent) } ?? "–",
+        "5h_pct": pctUnit(session),
+        "wk_pct": pctUnit(weekly),
+        "reset_short": hot ? left(session).map { unitDuration($0, hours: false) } ?? "" : "",
+        "wk_reset_short": left(weekly).map { unitDuration($0, hours: true) } ?? "–",
         "reset": hot ? left(session).map { $0 < 60 ? "\(Int($0))s" : String(Int($0 / 60)) } ?? "" : "",
         "reset_hm": hot ? left(session).map(compactDuration) ?? "" : "",
         "wk_reset_h": left(weekly).map { String(Int($0 / 3600)) } ?? "–",
         "wk_reset_hm": left(weekly).map(compactDuration) ?? "–",
         "age": snap.observedDate.map { String(Int(now.timeIntervalSince($0) / 60)) } ?? "–",
     ]
+    func fill(_ text: String) -> String {
+        values.reduce(text) { $0.replacingOccurrences(of: "{\($1.key)}", with: $1.value) }
+    }
+    guard settings.hideEmpty else { return settings.segments.map(fill).joined(separator: settings.separator) }
+    let blanks = values.filter { $0.value.isEmpty }.keys.map { "{\($0)}" }
     return settings.segments
-        .map { seg in values.reduce(seg) { $0.replacingOccurrences(of: "{\($1.key)}", with: $1.value) } }
+        .map { seg in
+            seg.split(separator: " ").map(String.init)
+                .filter { word in !blanks.contains { word.contains($0) } }
+                .map(fill).joined(separator: " ")
+        }
+        .filter { !$0.isEmpty }
         .joined(separator: settings.separator)
 }
 
@@ -289,6 +354,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // is open or the 5h reset is under a minute away — so countdowns move second by second
     // exactly when someone is looking, and the app is otherwise idle.
     private var ticker: Timer?
+    private var clock: Timer?  // keeps always-visible times current between data refreshes
     private var menuOpen = false
     private var rowViews: [String: QuotaRowView] = [:]
     private var updatedItem: NSMenuItem?
@@ -310,6 +376,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
         ) { [weak self] _ in MainActor.assumeIsolated { self?.refresh(live: true) } }
+        // Local text only. The 1 Hz ticker stays off most of the time; a 30 s redraw is enough here.
+        let c = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.render() }
+        }
+        c.tolerance = 5
+        RunLoop.main.add(c, forMode: .common)
+        clock = c
         reloadSettings()
         refresh(live: false)  // instant first frame from the cache; schedule() goes live as due
     }
@@ -445,7 +518,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     nonisolated private static func fetch(_ path: String, _ args: [String]) -> Result<Snapshot, FetchError> {
         guard FileManager.default.isExecutableFile(atPath: path) else {
-            return .failure(FetchError(message: "cmon not found at \(path)"))
+            return .failure(FetchError(message: "cmon not found at \(path) — run make install"))
         }
         let proc = Process(), out = Pipe(), err = Pipe()
         proc.executableURL = URL(fileURLWithPath: path)
@@ -485,8 +558,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let title = renderTitle(settings, snap, now: now)
         if button.title != title { button.title = title }  // the ticker calls this every second
         button.appearsDisabled = isStale(snap, now: now) || error != nil
-        button.toolTip = snap.windows.map { "\(displayName($0)) \(Int($0.percent.rounded()))%" }
+        let usage = snap.windows.map { "\(displayName($0)) \(Int($0.percent.rounded()))%" }
             .joined(separator: "  ·  ")
+        button.toolTip = titleLegend(settings).map { "\($0)\n\(usage)" } ?? usage
     }
 
     // Rebuilt on open; while open, tick() keeps the countdowns and "Updated" line moving.
@@ -496,6 +570,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rowViews = [:]
         updatedItem = nil
         menu.addItem(.sectionHeader(title: "Claude"))
+        if let legend = titleLegend(settings) {
+            let row = NSMenuItem(title: "Title: \(legend)", action: nil, keyEquivalent: "")
+            row.isEnabled = false
+            menu.addItem(row)
+        }
         if let snap = snapshot, !snap.offline {
             for q in snap.windows {
                 let row = NSMenuItem()
@@ -516,9 +595,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 menu.addItem(hint)
             }
         } else {
-            let msg = NSMenuItem(title: "Offline — no usage data", action: nil, keyEquivalent: "")
-            msg.isEnabled = false
-            menu.addItem(msg)
+            for text in ["Offline — no usage data", "Log in to Claude Code, or check: cmon token status"] {
+                let msg = NSMenuItem(title: text, action: nil, keyEquivalent: "")
+                msg.isEnabled = false
+                menu.addItem(msg)
+            }
         }
         if let problem = settingsProblem {
             let msg = NSMenuItem(title: problem, action: nil, keyEquivalent: "")

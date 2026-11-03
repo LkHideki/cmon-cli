@@ -6,23 +6,33 @@ on:
   pull_request:
 
 jobs:
-  lint-and-smoke:
+  test-lint-and-smoke:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        include:
+          - python-version: "3.11"
+            duckdb: "duckdb==1.1.1"
+          - python-version: "3.11"
+            duckdb: "duckdb"
+          - python-version: "3.12"
+            duckdb: "duckdb"
+          - python-version: "3.13"
+            duckdb: "duckdb"
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: ${{ matrix.python-version }}
       - run: uv sync
+      - name: Select DuckDB compatibility target
+        run: uv pip install --upgrade "${{ matrix.duckdb }}"
+      - name: Pytest
+        run: uv run --no-sync pytest
       - name: Ruff
-        run: uv run ruff check .
-      - name: Tests
-        run: uv run pytest -q
+        run: uv run --no-sync ruff check .
       - name: Smoke (imports the module and validates CLI, no network)
-        run: uv run cmon --help
+        run: uv run --no-sync cmon --help
 
   menubar:
     runs-on: macos-latest
