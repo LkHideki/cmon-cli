@@ -21,13 +21,23 @@ func snapshot(session pct: Double, resetIn left: Double) -> Snapshot {
     return try! JSONDecoder().decode(Snapshot.self, from: Data(json.utf8))
 }
 
-// Title: 5h reset only above reset_above_percent; empty slot kept; seconds in the last minute.
+// Title: 5h reset only above reset_above_percent; empty slot kept; every number has its unit.
 let d = Settings()
-check(renderTitle(d, snapshot(session: 2, resetIn: 150 * m), now: now) == "2•44••91", "title, 5h reset hidden")
-check(renderTitle(d, snapshot(session: 2, resetIn: 99.5 * m), now: now) == "2•44•99•91", "title, shown within 100 min")
-check(renderTitle(d, snapshot(session: 90, resetIn: 75.5 * m), now: now) == "90•44•75•91", "title, 5h reset shown")
+check(renderTitle(d, snapshot(session: 2, resetIn: 150 * m), now: now) == "2%•44%••91h", "title, 5h reset hidden")
+check(renderTitle(d, snapshot(session: 2, resetIn: 99.5 * m), now: now) == "2%•44%•99m•91h", "title, shown within 100 min")
+check(renderTitle(d, snapshot(session: 90, resetIn: 75.5 * m), now: now) == "90%•44%•75m•91h", "title, 5h reset shown")
 let lastMinute = renderTitle(d, snapshot(session: 90, resetIn: 42.5), now: now)  // ISO drops sub-seconds
-check(lastMinute.hasPrefix("90•44•4") && lastMinute.hasSuffix("s•91"), "title, last minute in seconds")
+check(lastMinute.hasPrefix("90%•44%•4") && lastMinute.hasSuffix("s•91h"), "title, last minute in seconds")
+check(unitDuration(1800, hours: true) == "30m" && unitDuration(7300, hours: true) == "2h", "week reset under 1 h keeps a real unit")
+check(unitDuration(7300, hours: false) == "121m", "5h reset stays in minutes")
+check(titleLegend(d) != nil, "default layout is explained in the menu")
+
+// Bare placeholders keep working for layouts already saved in bar.json.
+var bare = Settings()
+bare.segments = ["{5h}", "{wk}", "{reset}", "{wk_reset_h}"]
+check(renderTitle(bare, snapshot(session: 2, resetIn: 150 * m), now: now) == "2•44••91", "bare layout, reset hidden")
+check(renderTitle(bare, snapshot(session: 90, resetIn: 75.5 * m), now: now) == "90•44•75•91", "bare layout, reset shown")
+check(titleLegend(bare) == nil, "custom layout has no legend")
 check(spacedDuration(12) == "12s" && spacedDuration(3700) == "1h 1m", "durations")
 
 // Refresh rules: shortest applicable interval wins.

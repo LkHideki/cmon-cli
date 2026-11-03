@@ -39,11 +39,12 @@ struct RefreshRule: Codable, Equatable {
 
 struct Settings: Codable {
     /// Menu bar title: segments joined by `separator`; an empty segment keeps its slot
-    /// (`2•44••91`), so positions never shift. Placeholders:
-    /// {5h} {wk} {reset} {reset_hm} {wk_reset_h} {wk_reset_hm} {age}. The 5h reset
-    /// ({reset}, {reset_hm}) is blank unless 5h usage is above `resetAbovePercent` or the
+    /// (`2%•44%••91h`), so positions never shift. Placeholders: {5h_pct} {wk_pct}
+    /// {reset_short} {wk_reset_short} carry their unit; {5h} {wk} {reset} {reset_hm}
+    /// {wk_reset_h} {wk_reset_hm} {age} are bare numbers. The 5h reset ({reset_short},
+    /// {reset}, {reset_hm}) is blank unless 5h usage is above `resetAbovePercent` or the
     /// reset is at most `resetWithinMin` minutes away.
-    var segments = ["{5h}", "{wk}", "{reset}", "{wk_reset_h}"]
+    var segments = Settings.defaultSegments
     var separator = "•"
     var resetAbovePercent = 85.0
     var resetWithinMin = 100.0
@@ -67,6 +68,7 @@ struct Settings: Codable {
         case watchCommand = "watch_command"
     }
 
+    static let defaultSegments = ["{5h_pct}", "{wk_pct}", "{reset_short}", "{wk_reset_short}"]
     static let url = URL(fileURLWithPath: NSString(string: "~/.cmon/bar.json").expandingTildeInPath)
 
     init() {}
@@ -184,9 +186,22 @@ func showsSessionReset(_ settings: Settings, _ snap: Snapshot, now: Date) -> Boo
     return left <= settings.resetWithinMin * 60
 }
 
+/// Duration in one unit, for the title: 91h, 75m, 42s. Hours never round down to "0h".
+func unitDuration(_ seconds: TimeInterval, hours: Bool) -> String {
+    if seconds < 60 { return "\(Int(seconds))s" }
+    if hours && seconds >= 3600 { return "\(Int(seconds / 3600))h" }
+    return "\(Int(seconds / 60))m"
+}
+
+/// What the title's positions mean, shown in the menu and tooltip; nil for a custom layout.
+func titleLegend(_ settings: Settings) -> String? {
+    settings.segments == Settings.defaultSegments ? "5h • week • 5h reset • week reset" : nil
+}
+
 func renderTitle(_ settings: Settings, _ snap: Snapshot, now: Date) -> String {
     let session = snap.window("session"), weekly = snap.window("weekly_all")
     func pct(_ q: Quota?) -> String { q.map { String(Int($0.percent.rounded())) } ?? "–" }
+    func pctUnit(_ q: Quota?) -> String { q.map { "\(Int($0.percent.rounded()))%" } ?? "–" }
     func left(_ q: Quota?) -> TimeInterval? {
         guard let d = q?.resetDate, d > now else { return nil }
         return d.timeIntervalSince(now)
@@ -195,6 +210,10 @@ func renderTitle(_ settings: Settings, _ snap: Snapshot, now: Date) -> String {
     let values: [String: String] = [
         "5h": pct(session),
         "wk": pct(weekly),
+        "5h_pct": pctUnit(session),
+        "wk_pct": pctUnit(weekly),
+        "reset_short": hot ? left(session).map { unitDuration($0, hours: false) } ?? "" : "",
+        "wk_reset_short": left(weekly).map { unitDuration($0, hours: true) } ?? "–",
         "reset": hot ? left(session).map { $0 < 60 ? "\(Int($0))s" : String(Int($0 / 60)) } ?? "" : "",
         "reset_hm": hot ? left(session).map(compactDuration) ?? "" : "",
         "wk_reset_h": left(weekly).map { String(Int($0 / 3600)) } ?? "–",
@@ -445,7 +464,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     nonisolated private static func fetch(_ path: String, _ args: [String]) -> Result<Snapshot, FetchError> {
         guard FileManager.default.isExecutableFile(atPath: path) else {
-            return .failure(FetchError(message: "cmon not found at \(path)"))
+            return .failure(FetchError(message: "cmon not found at \(path) — run make install"))
         }
         let proc = Process(), out = Pipe(), err = Pipe()
         proc.executableURL = URL(fileURLWithPath: path)
@@ -485,8 +504,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let title = renderTitle(settings, snap, now: now)
         if button.title != title { button.title = title }  // the ticker calls this every second
         button.appearsDisabled = isStale(snap, now: now) || error != nil
-        button.toolTip = snap.windows.map { "\(displayName($0)) \(Int($0.percent.rounded()))%" }
+        let usage = snap.windows.map { "\(displayName($0)) \(Int($0.percent.rounded()))%" }
             .joined(separator: "  ·  ")
+        button.toolTip = titleLegend(settings).map { "\($0)\n\(usage)" } ?? usage
     }
 
     // Rebuilt on open; while open, tick() keeps the countdowns and "Updated" line moving.
@@ -496,6 +516,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rowViews = [:]
         updatedItem = nil
         menu.addItem(.sectionHeader(title: "Claude"))
+        if let legend = titleLegend(settings) {
+            let row = NSMenuItem(title: "Title: \(legend)", action: nil, keyEquivalent: "")
+            row.isEnabled = false
+            menu.addItem(row)
+        }
         if let snap = snapshot, !snap.offline {
             for q in snap.windows {
                 let row = NSMenuItem()
@@ -516,9 +541,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 menu.addItem(hint)
             }
         } else {
-            let msg = NSMenuItem(title: "Offline — no usage data", action: nil, keyEquivalent: "")
-            msg.isEnabled = false
-            menu.addItem(msg)
+            for text in ["Offline — no usage data", "Log in to Claude Code, or check: cmon token status"] {
+                let msg = NSMenuItem(title: text, action: nil, keyEquivalent: "")
+                msg.isEnabled = false
+                menu.addItem(msg)
+            }
         }
         if let problem = settingsProblem {
             let msg = NSMenuItem(title: problem, action: nil, keyEquivalent: "")

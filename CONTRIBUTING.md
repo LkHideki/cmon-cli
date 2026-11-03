@@ -8,8 +8,8 @@ The project uses [uv](https://docs.astral.sh/uv/) to manage dependencies and env
 
 ```bash
 # Clone and enter the directory
-git clone https://github.com/LkHideki/cmon.git
-cd cmon
+git clone https://github.com/LkHideki/cmon-cli.git
+cd cmon-cli
 
 # Install dependencies (lean environment)
 uv sync
@@ -66,4 +66,4 @@ Guidelines:
 
 ## Reporting bugs and ideas
 
-Open an [issue](https://github.com/LkHideki/cmon/issues) describing what you expected, what happened, and how to reproduce it. For the CLI, include the exact command and relevant output (redact tokens).
+Open an [issue](https://github.com/LkHideki/cmon-cli/issues) describing what you expected, what happened, and how to reproduce it. For the CLI, include the exact command and relevant output (redact tokens).

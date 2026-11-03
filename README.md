@@ -1,6 +1,6 @@
 # Claude Monitor
 
-[![CI](https://github.com/LkHideki/cmon/actions/workflows/ci.yml/badge.svg)](https://github.com/LkHideki/cmon/actions/workflows/ci.yml)
+[![CI](https://github.com/LkHideki/cmon-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/LkHideki/cmon-cli/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
@@ -9,10 +9,27 @@ CLI to track your Claude plan consumption over time. Reads the same endpoint
 the app uses (`https://claude.ai/api/oauth/usage`), stores snapshots in DuckDB,
 and displays consumption rate, projections, and charts.
 
-## Installation
+## Quick start (macOS)
+
+Needs [uv](https://docs.astral.sh/uv/) and the Xcode Command Line Tools; `make install` tells
+you the exact command if either is missing. Log in to Claude Code first: cmon reads its login.
 
 ```bash
-git clone https://github.com/LkHideki/cmon && cd cmon
+git clone https://github.com/LkHideki/cmon-cli && cd cmon-cli
+make install     # cmon command, ~/Applications/cmon Bar.app, background collection, then a check
+make doctor      # what's wrong and how to fix it
+make uninstall   # removes all of it, keeps your history in ~/.cmon
+```
+
+macOS may ask to allow Keychain access when cmon first reads Claude Code's login; choose
+**Always Allow**, or the menu bar can't refresh. The menu bar then reads `2%•44%••91h`:
+5h window used, weekly limit used, a slot for the 5h countdown (`90%•44%•75m•91h` near the
+limit or the reset), and time to the weekly reset. Click it for details.
+
+## Installation (CLI only, any OS)
+
+```bash
+git clone https://github.com/LkHideki/cmon-cli && cd cmon-cli
 uv sync                  # lightweight install (without plotting libraries)
 uv sync --extra plot     # optional: pre-install the `plot` command's libs (matplotlib/seaborn/pandas)
 ```
@@ -133,14 +150,15 @@ it never shows a dead cycle and never blocks a prompt. `--live` always queries t
 ### Menu bar (macOS)
 
 `menubar/` holds **cmon Bar**, a native menu bar item (Swift, no third-party app). The
-title shows the quota as `2•44••91` — 5h %, weekly %, minutes to the 5h reset (blank
-until 5h usage passes 85% or the reset is under 100 min away, e.g. `5•44•75•91`), hours
-to the weekly reset — and a click
+title shows the quota as `2%•44%••91h` — 5h used, weekly used, minutes to the 5h reset
+(blank until 5h usage passes 85% or the reset is under 100 min away, e.g.
+`5%•44%•75m•91h`), time to the weekly reset — and a click
 opens a per-window breakdown with progress bars, reset times and when the next update is
 due.
 
 ```sh
-menubar/install.sh            # build with swiftc, start now and at login
+make install                  # everything, including the cmon command this app needs
+menubar/install.sh            # only the app: build with swiftc, start now and at login
 menubar/install.sh uninstall
 menubar/test.sh               # logic tests (title, refresh rules, settings)
 ```
@@ -149,8 +167,9 @@ Everything is configured in `~/.cmon/bar.json`, re-read on every refresh (an inv
 is reported in the menu and defaults are used):
 
 - **Title** — `segments` joined by `separator`; an empty segment keeps its slot, so
-  positions never shift. Placeholders: `{5h}` `{wk}` `{reset}` (minutes) `{reset_hm}` —
-  both blank unless 5h usage is above `reset_above_percent` (85) or the reset is at most
+  positions never shift. Placeholders with their unit: `{5h_pct}` `{wk_pct}` `{reset_short}`
+  `{wk_reset_short}`; bare numbers: `{5h}` `{wk}` `{reset}` (minutes) `{reset_hm}` — the 5h
+  reset ones are blank unless 5h usage is above `reset_above_percent` (85) or the reset is at most
   `reset_within_min` (100) minutes away; while shown they count down on their own —
   `{wk_reset_h}` (hours)
   `{wk_reset_hm}` `{age}` (minutes since the data was read). The title dims when the data

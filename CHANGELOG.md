@@ -5,6 +5,30 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Upgrading
+
+- History moves to a provider-aware schema on first use. Older cmon versions can't read it;
+  `make install` first copies your database to `~/.cmon/usage.before-provider-schema.duckdb`.
+- A `bar.json` still holding the old default layout switches once to the one with units. To go
+  back, set `"segments": ["{5h}", "{wk}", "{reset}", "{wk_reset_h}"]`; it won't be changed again.
+
+### Added
+
+- **`make install`, `make uninstall`, `make doctor`**: one command sets up the `cmon` command,
+  cmon Bar and background collection at user level, and says what to fix if something is off.
+- **cmon Bar title with units** (`2%•44%••91h`), through the new `{5h_pct}` `{wk_pct}`
+  `{reset_short}` `{wk_reset_short}` placeholders, plus a legend in the menu and tooltip.
+
+### Fixed
+
+- The clone URL in the docs pointed to a repository that doesn't exist.
+- Under an hour from the weekly reset, the title showed `0`; it now shows minutes.
+- On a Mac without the Command Line Tools, `menubar/install.sh` passed its check and then failed
+  on the system's `swiftc` stub. A failed icon build no longer stops the install.
+- A retired limit (a model-scoped weekly window) no longer stays in the status cache.
+
 ## [0.6.1] — 2026-10-03
 
 ### Added

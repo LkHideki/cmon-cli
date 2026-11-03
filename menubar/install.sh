@@ -18,15 +18,18 @@ if [ "${1:-}" = "uninstall" ]; then
     exit 0
 fi
 
-command -v swiftc >/dev/null || { echo "swiftc not found: xcode-select --install" >&2; exit 1; }
+# /usr/bin/swiftc exists on every Mac as a stub that only opens the installer dialog.
+xcrun --find swiftc >/dev/null 2>&1 || { echo "Swift not found. Run: xcode-select --install" >&2; exit 1; }
 
 # Build the whole bundle aside first: a failed compile must leave the running app untouched.
 BUILD="$(mktemp -d)/cmon Bar.app"
 trap 'rm -rf "$(dirname "$BUILD")"' EXIT
 mkdir -p "$BUILD/Contents/MacOS" "$BUILD/Contents/Resources" "$(dirname "$PLIST")" "$(dirname "$APP")"
 swiftc -O -parse-as-library -o "$BUILD/Contents/MacOS/CmonBar" "$SRC"
-swift "$DIR/make_icon.swift" "$(dirname "$BUILD")/AppIcon.iconset"
-iconutil -c icns "$(dirname "$BUILD")/AppIcon.iconset" -o "$BUILD/Contents/Resources/AppIcon.icns"
+# The icon is cosmetic, and 'swift' as an interpreter breaks on some toolchains: never block on it.
+swift "$DIR/make_icon.swift" "$(dirname "$BUILD")/AppIcon.iconset" 2>/dev/null \
+    && iconutil -c icns "$(dirname "$BUILD")/AppIcon.iconset" -o "$BUILD/Contents/Resources/AppIcon.icns" \
+    || echo "note: app icon skipped (it doesn't affect cmon Bar)"
 
 cat > "$BUILD/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -41,7 +44,7 @@ cat > "$BUILD/Contents/Info.plist" <<EOF
   <key>LSUIElement</key><true/>
 </dict></plist>
 EOF
-codesign --force --sign - "$BUILD"
+codesign --force --sign - "$BUILD" 2>/dev/null
 
 launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
 pkill -f "$APP/Contents/MacOS/CmonBar" 2>/dev/null || true  # copies started via open/Spotlight

@@ -46,9 +46,9 @@ plot = ["matplotlib>=3.8", "seaborn>=0.13", "pandas>=2.0"]
 cmon = "cmon:main"
 
 [project.urls]
-Homepage = "https://github.com/LkHideki/cmon"
-Repository = "https://github.com/LkHideki/cmon"
-Issues = "https://github.com/LkHideki/cmon/issues"
+Homepage = "https://github.com/LkHideki/cmon-cli"
+Repository = "https://github.com/LkHideki/cmon-cli"
+Issues = "https://github.com/LkHideki/cmon-cli/issues"
 
 [dependency-groups]
 dev = ["pytest>=8.3", "ruff>=0.6"]
