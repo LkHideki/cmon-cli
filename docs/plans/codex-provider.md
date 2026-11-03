@@ -24,6 +24,8 @@ premissas:
   - A revisão encontrou 22 JSONL Codex (~227 MB, maior ~206 MB), tornando obrigatório ler append em O(delta), não reprocessar o arquivo inteiro.
 -->
 
+> **Atualização (schema v2):** `snapshots` e `token_log` não têm mais índices únicos nem as colunas `ingested_at`, `thread_id` e `turn_id`, para reduzir o banco em 87%. A chave lógica do turno do Codex deve ir em `source_event_id`, e a deduplicação é por anti-join na inserção. As menções a `UNIQUE` e `PRIMARY KEY` nessas tabelas abaixo são anteriores a essa decisão.
+
 ## Fora de escopo
 - Consultar endpoints privados da OpenAI ou automatizar `/status`.
 - Alterar autenticação, token ou refresh OAuth da Anthropic.

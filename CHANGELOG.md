@@ -5,6 +5,26 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Upgrading
+
+- The database migrates once more on first use, in under a second on a real history. 0.7.0 can't
+  read the result, so copy `~/.cmon/usage.duckdb` first if you may go back. `make install` no
+  longer keeps a copy, because it would bring the weight back.
+
+### Changed
+
+- **The database is about 87% smaller with all its data**: 103 MB to 14 MB on a real history of
+  88k snapshots and 207k token rows. `snapshots` and `token_log` lost their unique indexes, which
+  took more space than the data, plus columns that repeated others; inserts now dedupe with an
+  anti-join, which takes about 11 ms on that history. After a migration the file is rewritten,
+  because DuckDB never returns freed space to the disk.
+
+### Fixed
+
+- The migration's row count check never ran, because it compared names that could not match.
+
 ## [0.7.0] — 2026-11-03
 
 ### Upgrading

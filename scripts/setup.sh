@@ -9,7 +9,6 @@ APP="$HOME/Applications/cmon Bar.app"
 OLD_LAYOUT='["{5h}","{wk}","{reset}","{wk_reset_h}"]'
 NEW_LAYOUT='["{5h_pair}","{wk_pair}"]'
 LAYOUT_MARK="$HOME/.cmon/.bar-layout-pairs"
-DB_BACKUP="$HOME/.cmon/usage.before-provider-schema.duckdb"
 
 say() { printf '\n==> %s\n' "$1"; }
 die() { printf '\nError: %s\n' "$1" >&2; exit 1; }
@@ -24,14 +23,6 @@ check_prereqs() {
   curl -LsSf https://astral.sh/uv/install.sh | sh"
     xcrun --find swiftc >/dev/null 2>&1 || die "Swift not found. Install the Command Line Tools, then run make install again:
   xcode-select --install"
-}
-
-# Once only: the new schema can't be read by older cmon versions, so keep a way back.
-backup_db() {
-    [ -f "$HOME/.cmon/usage.duckdb" ] && [ ! -e "$DB_BACKUP" ] || return 0
-    cp -p "$HOME/.cmon/usage.duckdb" "$DB_BACKUP"
-    [ ! -f "$HOME/.cmon/usage.duckdb.wal" ] || cp -p "$HOME/.cmon/usage.duckdb.wal" "$DB_BACKUP.wal"
-    echo "History backed up to $DB_BACKUP"
 }
 
 # Once only: a bar.json still holding the old default gets the new layout; any other
@@ -60,7 +51,6 @@ configure_bar() {
 do_install() {
     check_prereqs
     say "Installing the cmon command"
-    backup_db
     uv tool install --force --reinstall --quiet "$ROOT"
     case ":$PATH:" in
         *":$(uv tool dir --bin):"*) ;;

@@ -59,9 +59,8 @@ cmon Bar is macOS only. cmon isn't on PyPI; the PyPI package named `cmon` is an 
 
 - Never print or copy a token, and don't read Claude Code's credentials yourself. `cmon token status`
   shows the source with the token masked.
-- Don't edit `~/.cmon/usage.duckdb` by hand. The first run of 0.7 or later migrates it, and older
-  versions can't read the result. `make install` keeps a copy at
-  `~/.cmon/usage.before-provider-schema.duckdb`.
+- Don't edit `~/.cmon/usage.duckdb` by hand. Newer cmon versions migrate it on first use, in one
+  transaction, and older versions can't read the result: if the user may go back, copy it first.
 - `cmon watch` and `cmon collect` hold DuckDB's write lock. Read commands degrade rather than fail.
 
 ## Reading the data
