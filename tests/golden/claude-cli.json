@@ -21,7 +21,7 @@
   },
   "burn": {
     "exit_code": 0,
-    "stdout": "Consumption by model (API equivalent):\n  claude-sonnet-fixture       3.1M tok   US$      5.40\n  claude-opus-fixture         1.6M tok   US$      4.45\n  TOTAL                       4.7M tok   US$      9.85\n\nBy component:\n  input              1.5M tok   US$      5.50     56%\n  output             0.1M tok   US$      2.75     28%\n  cache read         3.0M tok   US$      1.10     11%\n  cache write        0.1M tok   US$      0.50      5%\n\n→ Real work (input+output): US$ 8 · Cache (context re-reading): US$ 2\n\nAPI EQUIVALENT cost (pay-per-token) — you pay subscription, not this.\nEstimate; Claude Code CLI usage only (doesn't include claude.ai web/desktop).\n",
+    "stdout": "Consumption by model (API equivalent):\n  claude-sonnet-fixture       3.1M tok   US$      5.40\n  claude-opus-fixture         1.6M tok   US$      4.45\n  TOTAL                       4.7M tok   US$      9.85\n\nBy component:\n  input              1.5M tok   US$      5.50     56%\n  output             0.1M tok   US$      2.75     28%\n  cache read         3.0M tok   US$      1.10     11%\n  cache write        0.1M tok   US$      0.50      5%\n\n→ Real work (input+output): US$ 8 · Cache (context re-reading): US$ 2\n\nAPI EQUIVALENT cost (pay-per-token) — you pay subscription, not this.\nEstimate; Claude Code sessions of the terminal's account only (not claude.ai chat).\n",
     "stderr": "scanning 1 log file(s)…\n"
   },
   "burn_json": {

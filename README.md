@@ -44,22 +44,18 @@ Requires Python ≥ 3.11 and [uv](https://docs.astral.sh/uv/). Without uv,
    Keychain (macOS) or `~/.claude/.credentials.json` (Linux/Windows). Zero
    friction: nothing to configure.
 
-**Auto-refresh:** when the access token expires, `cmon` renews it automatically via
-`refresh_token` and stores the new token in its own vault (`claude-oauth-auto`),
-**without** rewriting the Claude Code credential. Renews proactively (reads
-`expiresAt`) and reactively (if the API returns 401 — including when an old
-`CLAUDE_OAUTH_TOKEN` is shadowing everything). **Self-heals:** if cmon's own refresh
-chain dies (its `refresh_token` gets rotated/revoked after a Claude Code re-login), it
-falls back to Claude Code's fresh credential and re-seeds the chain instead of getting
-stuck on a `401`. Side effect: the first renewal rotates Claude Code's `refresh_token`,
-so **it may ask for login once** the next time it renews — after that the two tokens
-become independent. `token status` shows validity; `client_id`/endpoint are configurable
-via `CMON_OAUTH_CLIENT_ID` / `CMON_OAUTH_TOKEN_URL` (the latter host-allowlisted to
-`*.anthropic.com`, so a stray `.env` can't redirect the refresh POST).
+**Claude Code's login is read-only.** cmon reads its access token and never redeems or
+stores its `refresh_token`: Anthropic rotates refresh tokens on use, so a second client
+spending it would log Claude Code out (cmon 0.5 did exactly that). Claude Code renews its
+own token whenever it runs; if it has expired because Claude Code hasn't run for a while,
+cmon says so and makes no request. After a `401` it re-reads Claude Code's credential once,
+in case it was renewed meanwhile. The refresh chain older versions kept in the vault
+(`claude-oauth-auto`) is deleted on first run.
 
-In short, with Claude Code logged in you need nothing — and it keeps working
-even with an expired token. Without it, `cmon token set` stores the token securely
-on any system. `.env` still works for step 1 (see `.env.example`). Run `cmon --help`
+In short, with Claude Code logged in you need nothing. Without it, `cmon token set` stores the token securely
+on any system. Settings and step 1 can also live in `~/.cmon/.env` (see `.env.example`);
+cmon never reads a `.env` from the directory you run it in, so a project's `.env` can't
+set its alert hook or swap in another account's token. Run `cmon --help`
 or `cmon token --help` for the rest.
 
 ## Config
@@ -108,8 +104,15 @@ uv run cmon tune      # fit the projection's parameters to your own history
 uv run cmon install   # schedule background collection in OS scheduler
 ```
 
-Global option `--db PATH` (before the subcommand) overrides `CMON_DB`:
-`uv run cmon --db ~/.cmon/usage.duckdb now`.
+History lives in `~/.cmon/usage.duckdb` whatever directory you run from. Global option
+`--db PATH` (before the subcommand) overrides `CMON_DB`: `uv run cmon --db /tmp/x.duckdb now`.
+
+Up to 0.5.0 the default was `./usage.duckdb`, so history may be split across the
+directories cmon ran in. Merge them once (sources are read-only, overlaps deduplicated):
+
+```sh
+cmon import ~/usage.duckdb ~/Projects/*/usage.duckdb
+```
 
 ### `cmon status` — statusline
 
@@ -117,8 +120,67 @@ One compact line, ideal for status bar / tmux / prompt. Exits with code 0
 and prints `cmon offline` if the network fails (doesn't break the statusline):
 
 ```
-5h 18% · week 42% · reset 3h18m
+5h 18% · wk 42% · reset 3h18m
 ```
+
+It reads the local cache. Only when the cached 5h window has already reset does it call
+the API (5 s timeout; after a failure it serves the cache for 2 min before retrying), so
+it never shows a dead cycle and never blocks a prompt. `--live` always queries the API.
+
+`--json` prints a versioned payload (`version`, `offline`, `observed_at`, `age_s`,
+`providers.claude.windows[]`) for scripts and the menu bar app.
+
+### Menu bar (macOS)
+
+`menubar/` holds **cmon Bar**, a native menu bar item (Swift, no third-party app). The
+title shows the quota as `2•44••91` — 5h %, weekly %, minutes to the 5h reset (blank
+until 5h usage passes 85% or the reset is under 100 min away, e.g. `5•44•75•91`), hours
+to the weekly reset — and a click
+opens a per-window breakdown with progress bars, reset times and when the next update is
+due.
+
+```sh
+menubar/install.sh            # build with swiftc, start now and at login
+menubar/install.sh uninstall
+menubar/test.sh               # logic tests (title, refresh rules, settings)
+```
+
+Everything is configured in `~/.cmon/bar.json`, re-read on every refresh (an invalid file
+is reported in the menu and defaults are used):
+
+- **Title** — `segments` joined by `separator`; an empty segment keeps its slot, so
+  positions never shift. Placeholders: `{5h}` `{wk}` `{reset}` (minutes) `{reset_hm}` —
+  both blank unless 5h usage is above `reset_above_percent` (85) or the reset is at most
+  `reset_within_min` (100) minutes away; while shown they count down on their own —
+  `{wk_reset_h}` (hours)
+  `{wk_reset_hm}` `{age}` (minutes since the data was read). The title dims when the data
+  is older than `stale_minutes`.
+- **Refresh schedule** — `refresh` is a list of rules for how often the bar queries the
+  API (`status --live`, which also refreshes the cache the statusline reads). A rule
+  applies when all its conditions hold: `reset_within_min` (the 5h reset is at most that
+  many minutes away), `usage_above_pct` (5h usage is above it), or none for the default.
+  The shortest `every_s` among applicable rules wins (minimum 30 s). Defaults:
+
+  ```json
+  "refresh": [
+    { "every_s": 600 },
+    { "reset_within_min": 120, "every_s": 180 },
+    { "reset_within_min": 90,  "every_s": 120 },
+    { "reset_within_min": 60,  "every_s": 59 },
+    { "usage_above_pct": 87,   "every_s": 59 }
+  ]
+  ```
+
+  The bar wakes exactly when a tighter rule starts applying. A failed call keeps the last
+  numbers, dims the title and retries after a full interval. Each call costs ~0.3 s of
+  CPU; at the defaults that is 6 calls an hour, 60 in the last hour before a reset.
+- **`watch_command`** — what "Open cmon watch" runs; defaults to Terminal.app. For another
+  terminal, e.g. `"open -na Ghostty --args -e $HOME/.local/bin/cmon watch"`.
+
+Countdowns switch to seconds in the last minute and, while the menu is open or the 5h
+reset is under a minute away, redraw every second (local text only, no extra `cmon`
+runs); when the window rolls over the bar fetches the new cycle right away. Quit from the
+menu and it returns at next login, or now with `open ~/Applications/"cmon Bar.app"`.
 
 ### `cmon wait` — notify when ready
 
@@ -158,7 +220,17 @@ uv run cmon burn --by project       # attribution by project (where your plan we
 uv run cmon burn --since 7d         # smaller window (24h, 7d, ISO date…)
 uv run cmon burn --since all        # full history (but Claude Code only keeps ~30d)
 uv run cmon burn --json
+uv run cmon burn --all-accounts     # include Desktop sessions of other accounts (see below)
 ```
+
+**Which account counts.** Only the account the terminal's Claude Code is signed into
+(`~/.claude.json`) — the one whose quota cmon reads. The Claude Desktop app may be signed
+into another account yet writes its Claude Code sessions to the same transcripts folder;
+those count only when Desktop's session index
+(`~/Library/Application Support/Claude/claude-code-sessions/<account>/…`) ties them to the
+terminal account. Sessions it can't attribute are left out of burn, the `watch` burn line,
+the hourly profile and `plot`, and `burn` reports how much was excluded. VS Code and
+terminal sessions share the terminal's login, so they always count.
 
 The default window is **30 days** — Claude Code deletes transcripts older than
 that, so beyond 30d there's usually no data. Use `--since all` for everything

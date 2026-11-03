@@ -81,6 +81,12 @@ def isolated_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Isolate
     monkeypatch.setattr(cmon, "CACHE", str(paths.cache))
     monkeypatch.setattr(cmon, "CONFIG", str(paths.config))
     monkeypatch.setattr(cmon, "LOGS_ROOT", str(paths.logs))
+    # Module constants resolved at import time, against the real HOME.
+    monkeypatch.setattr(cmon, "CMON_HOME", str(home / ".cmon"))
+    monkeypatch.setattr(cmon, "ALERT_STATE", str(home / ".cmon" / "alerts.json"))
+    monkeypatch.setattr(cmon, "STATUS_FAIL", str(home / ".cmon" / "status.fail"))
+    monkeypatch.setattr(cmon, "LEGACY_PURGED", str(home / ".cmon" / ".legacy-chain-purged"))
+    monkeypatch.setattr(cmon, "DESKTOP_SESSIONS", str(home / "desktop-sessions"))
 
     def blocked(*_args, **_kwargs):
         raise AssertionError("tests must not use the network")
@@ -162,3 +168,14 @@ def golden() -> Callable[[str, CliResult], None]:
         assert result.as_dict() == expected[name]
 
     return compare
+
+
+@pytest.fixture
+def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Isolated HOME rooted at tmp_path, with the DB under ~/.cmon as in production."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(cmon, "DB", str(tmp_path / ".cmon" / "usage.duckdb"))
+    monkeypatch.setattr(cmon, "CACHE", str(tmp_path / ".cmon" / "status.json"))
+    monkeypatch.setattr(cmon, "LOGS_ROOT", str(tmp_path / ".claude" / "projects"))
+    monkeypatch.setattr(cmon, "CMON_HOME", str(tmp_path / ".cmon"))
+    return tmp_path

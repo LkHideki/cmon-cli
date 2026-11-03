@@ -6,9 +6,8 @@ Token, resolved in order:
   2. OS secure vault — Keychain (macOS), Credential Manager (Windows) or
      Secret Service (Linux) —, saved once with `cmon token set`;
   3. Claude Code credentials, if you're logged in (zero friction).
-When the access token expires, cmon automatically renews it via refresh_token and stores
-the new string in its vault (doesn't re-save Claude Code credentials). If an old
-CLAUDE_OAUTH_TOKEN returns 401, cmon refreshes and uses the new one anyway.
+Claude Code's credentials are only ever read: cmon never refreshes them (refresh tokens
+rotate on use, so doing so would log Claude Code out). Claude Code renews its own token.
 
   cmon now         # current usage + reset + rate/projection (--advice adds pacing tips)
   cmon collect     # save 1 snapshot to database (run via cron every ~20min)
@@ -42,13 +41,64 @@ from typing import Protocol, runtime_checkable
 # tz-aware datetimes, .percent a list of floats.
 Cycle = namedtuple("Cycle", "ts percent")
 
-DB = os.environ.get("CMON_DB", "usage.duckdb")
+CMON_HOME = os.path.expanduser("~/.cmon")
+
+
+def _load_env_files() -> None:
+    """Apply KEY=VALUE files before any setting below is read. Only two trusted places:
+    ~/.cmon/.env (user config) and the .env of the cmon checkout itself (development). Never
+    the current directory: a .env in whatever repo you happen to run cmon from could set
+    CMON_HOOK (a shell command run on alerts), CMON_DB, or another account's
+    CLAUDE_OAUTH_TOKEN. Real environment variables win; files writable by others are skipped."""
+    for path in (os.path.join(CMON_HOME, ".env"),
+                 os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")):
+        if not os.path.isfile(path):
+            continue  # common case: no python-dotenv import at all
+        try:
+            st = os.stat(path)
+            if st.st_mode & 0o022 or (hasattr(os, "getuid") and st.st_uid != os.getuid()):
+                print(f"cmon: ignoring {path}: writable by others or not owned by you", file=sys.stderr)
+                continue
+            from dotenv import dotenv_values
+            for key, value in dotenv_values(path).items():
+                if value is not None:
+                    os.environ.setdefault(key, value)
+        except Exception:
+            pass
+
+
+_load_env_files()
+
+
+def _private_dir(path: str) -> None:
+    """Create a directory only the user can enter (0700), tightening an existing one we own.
+    ~/.cmon holds usage history, project names, session ids and alert state."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    try:
+        st = os.stat(path)
+        if st.st_mode & 0o077 and (not hasattr(os, "getuid") or st.st_uid == os.getuid()):
+            os.chmod(path, 0o700)
+    except OSError:
+        pass
+
+
+def _child_env(**extra) -> dict:
+    """Environment for processes cmon spawns (alert hook, claude -p): everything except cmon's
+    own credential, which they have no business seeing (a hook that logs its env would leak it)."""
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_OAUTH_TOKEN"}
+    env.update(extra)
+    return env
+
+# Fixed home, not cwd: a relative default split history across every directory cmon ran in.
+DB = os.environ.get("CMON_DB") or os.path.join(CMON_HOME, "usage.duckdb")
 URL = "https://claude.ai/api/oauth/usage"
 # UA is required: without it claude.ai's Cloudflare returns 403 ("Just a moment").
 UA = "claude-cli/1.0 (external, cli)"
 LABELS = {"session": "Current session", "weekly_all": "All models"}
 SERVICE, ACCOUNT = "cmon", "claude-oauth"  # entry in the OS secure vault (manual token set)
-AUTO_ACCOUNT = "claude-oauth-auto"  # chain refreshed by cmon, separate from Claude Code
+# Legacy (<= 0.5): a refresh chain cmon derived from Claude Code's refresh_token. Never used
+# now; purged from the vault once (see _purge_legacy_chain).
+LEGACY_AUTO_ACCOUNT = "claude-oauth-auto"
 RETRIES = int(os.environ.get("CMON_RETRIES", "3"))
 DEDUP_SECS = int(os.environ.get("CMON_DEDUP_SECS", "60"))  # window to deduplicate collect
 ALERT_LEAD_MIN = int(os.environ.get("CMON_ALERT_LEAD", "60"))  # minutes-before-reset to alert (5h window)
@@ -99,9 +149,6 @@ PROJ_NOTE = {"learned": " (weighted by your usage profile)",
 PROJ_NOTE_SHORT = {"learned": " (profile-weighted)", "quiet_hours": " (quiet hours skipped)"}
 PROJ_NOTE_WATCH = {"learned": "projection: profile-weighted",
                    "quiet_hours": "projection: skips quiet hours"}
-# Claude Code OAuth — public values from login flow; used only for token renewal.
-OAUTH_CLIENT_ID = os.environ.get("CMON_OAUTH_CLIENT_ID", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
-OAUTH_TOKEN_URL = os.environ.get("CMON_OAUTH_TOKEN_URL", "https://console.anthropic.com/v1/oauth/token")
 
 PROVIDER_ORDER = ("claude", "codex")
 SCHEMA_VERSION = 1
@@ -312,7 +359,13 @@ except ImportError:
 
 
 class FetchError(Exception):
-    """Failure to query the usage endpoint, with user-readable message."""
+    """Failure to query the usage endpoint, with user-readable message. transient=True when
+    waiting can fix it (network, 429/5xx, a Claude Code token that renews when it runs);
+    False when it can't (no credential at all, 403 block)."""
+
+    def __init__(self, msg: str, transient: bool = True):
+        super().__init__(msg)
+        self.transient = transient
 
 
 def _keyring():
@@ -368,126 +421,65 @@ def _session():
     return s
 
 
-def _anthropic_host(url: str) -> bool:
-    """True only if url targets Anthropic. Guards the CMON_OAUTH_TOKEN_URL override so a
-    stray .env can't redirect the refresh_token POST to an attacker endpoint (secperf F1)."""
-    from urllib.parse import urlparse
-    host = (urlparse(url).hostname or "").lower()
-    if host == "anthropic.com" or host.endswith(".anthropic.com"):
-        return True
-    print(f"cmon: refusing token refresh to non-Anthropic host {host!r} "
-          "(CMON_OAUTH_TOKEN_URL). Unset it to use the default.", file=sys.stderr)
-    return False
+def _claude_code_token() -> tuple[str | None, int | None]:
+    """(access_token, expiresAt ms) from Claude Code's login, strictly read-only. cmon never
+    redeems or stores Claude Code's refresh_token: Anthropic rotates refresh tokens on use, so
+    spending it (as cmon <= 0.5 did) silently invalidated Claude Code's copy and logged it out.
+    Claude Code renews its own access token whenever it runs; cmon just reads the result."""
+    cc = _claude_code_cred() or {}
+    tok = cc.get("accessToken")
+    exp = cc.get("expiresAt")
+    return (tok if isinstance(tok, str) and tok else None), (exp if isinstance(exp, int) else None)
 
 
-def _oauth_refresh(refresh_token: str) -> dict | None:
-    """Exchange refresh_token for a new access_token. Best-effort; None if it fails.
-    Only talks to Anthropic's OAuth endpoint (host-allowlisted) over a trust_env=False
-    session, so a stray .env proxy/endpoint override can't exfiltrate the token."""
-    import time
-    if not _anthropic_host(OAUTH_TOKEN_URL):
-        return None
+LEGACY_PURGED = os.path.join(CMON_HOME, ".legacy-chain-purged")
+
+
+def _purge_legacy_chain(kr) -> None:
+    """Delete the refresh chain cmon <= 0.5 kept in the vault (a copy of Claude Code's
+    refresh_token lineage — a live credential with no remaining use). Once per machine."""
+    if os.path.exists(LEGACY_PURGED):
+        return
     try:
-        r = _session().post(OAUTH_TOKEN_URL, timeout=30, json={
-            "grant_type": "refresh_token", "refresh_token": refresh_token,
-            "client_id": OAUTH_CLIENT_ID})
-        if r.status_code != 200:
-            return None
-        d = r.json()
-        if not d.get("access_token"):
-            return None
-        return {"accessToken": d["access_token"],
-                "refreshToken": d.get("refresh_token", refresh_token),
-                "expiresAt": int((time.time() + int(d.get("expires_in", 3600))) * 1000)}
+        if kr.get_password(SERVICE, LEGACY_AUTO_ACCOUNT) is not None:
+            kr.delete_password(SERVICE, LEGACY_AUTO_ACCOUNT)
+        _private_dir(os.path.dirname(LEGACY_PURGED))
+        open(LEGACY_PURGED, "w").close()
     except Exception:
-        return None
+        pass  # vault locked/unavailable: try again next run
 
 
-def _auto_load() -> dict | None:
-    kr = _keyring()
-    if not kr:
-        return None
-    try:
-        raw = kr.get_password(SERVICE, AUTO_ACCOUNT)
-        return json.loads(raw) if raw else None
-    except Exception:
-        return None
+CC_SOURCE = "Claude Code credentials"
 
 
-def _auto_save(blob: dict) -> None:
-    kr = _keyring()
-    if not kr or _insecure_backend(kr):
-        return  # never persist the refresh chain in cleartext on an insecure backend (F2)
-    try:
-        kr.set_password(SERVICE, AUTO_ACCOUNT, json.dumps(blob))
-    except Exception:
-        pass
-
-
-def _auto_token() -> tuple[str | None, str | None]:
-    """(source, access_token) from self-managed chain: prefers cmon's own, then re-bootstraps
-    from Claude Code. Renews via refresh_token when access expires. (None, None) if none.
-    Falls back to Claude Code's credentials (fresh after any re-login) when cmon's chain can't
-    renew, so a dead/rotated refresh_token never strands us on an expired access token."""
-    import time
-    now = time.time() * 1000
-    auto = _auto_load()
-    # 1. Unexpired access token already in cmon's chain (60s buffer).
-    if auto and auto.get("accessToken") and now < (auto.get("expiresAt") or 0) - 60_000:
-        return "cmon auto-refresh", auto["accessToken"]
-    # 2. Renew cmon's chain via its own refresh_token.
-    if auto and (rt := auto.get("refreshToken")) and (new := _oauth_refresh(rt)):
-        _auto_save(new)
-        return "cmon auto-refresh", new["accessToken"]
-    # 3. cmon's chain is missing or its refresh_token is dead -> (re-)bootstrap from Claude Code.
-    if cc := _claude_code_cred():
-        if cc.get("accessToken") and now < (cc.get("expiresAt") or 0) - 60_000:
-            _auto_save(cc)  # seed chain so the next run starts from a known-good blob
-            return "Claude Code credentials", cc["accessToken"]
-        if (rt := cc.get("refreshToken")) and (new := _oauth_refresh(rt)):
-            _auto_save(new)
-            return "cmon auto-refresh", new["accessToken"]
-    # 4. Nothing renewable: hand back any stale token (fetch() force-refreshes on the 401).
-    if auto and auto.get("accessToken"):
-        return "cmon auto-refresh", auto["accessToken"]
-    return None, None
-
-
-def _force_refresh() -> str | None:
-    """Force a refresh (used when API returns 401). Returns new access_token or None.
-    Tries cmon's chain refresh_token first, then Claude Code's — so a dead/rotated chain
-    token self-heals from Claude Code's fresh one, even if an old CLAUDE_OAUTH_TOKEN (env/.env)
-    is shadowing everything."""
-    seen: set[str] = set()
-    for blob in (_auto_load(), _claude_code_cred()):
-        rt = (blob or {}).get("refreshToken")
-        if rt and rt not in seen:
-            seen.add(rt)
-            if new := _oauth_refresh(rt):
-                _auto_save(new)
-                return new["accessToken"]
-    return None
-
-
-def _resolve_token() -> tuple[str | None, str | None]:
-    """(source, token) in order of precedence; (None, None) if none found."""
+def _resolve_token() -> tuple[str | None, str | None, int | None]:
+    """(source, token, expiresAt ms or None) in order of precedence; Nones if none found."""
     if tok := os.environ.get("CLAUDE_OAUTH_TOKEN"):
-        return "env CLAUDE_OAUTH_TOKEN", tok
+        return "env CLAUDE_OAUTH_TOKEN", tok, None
     if kr := _keyring():
+        _purge_legacy_chain(kr)
         try:
             if tok := kr.get_password(SERVICE, ACCOUNT):
-                return f"OS vault ({kr.get_keyring().name})", tok
+                return f"OS vault ({kr.get_keyring().name})", tok, None
         except Exception:
             pass
-    return _auto_token()
+    tok, exp = _claude_code_token()
+    return (CC_SOURCE, tok, exp) if tok else (None, None, None)
 
 
-def get_token() -> str:
-    _src, tok = _resolve_token()
+def get_token() -> tuple[str, str]:
+    """(source, token) for the usage API. Raises FetchError (never exits): watch/status/the
+    menu bar render it as an offline state instead of dying."""
+    import time
+    src, tok, exp = _resolve_token()
     if not tok:
-        sys.exit("No token. Run 'cmon token set' to save it securely, "
-                 "set CLAUDE_OAUTH_TOKEN, or log in to Claude Code.")
-    return tok
+        raise FetchError("no token — log in to Claude Code, run 'cmon token set', "
+                         "or set CLAUDE_OAUTH_TOKEN.", transient=False)
+    if exp is not None and exp / 1000 <= time.time():
+        raise FetchError("Claude Code's access token has expired; it renews the next time Claude "
+                         "Code runs (any prompt). cmon never refreshes it itself — that would log "
+                         "Claude Code out.")
+    return src, tok
 
 
 def _mask(tok: str) -> str:
@@ -525,17 +517,16 @@ def token_set(_):
 
 
 def token_status(_):
-    src, tok = _resolve_token()
+    import time
+    src, tok, exp = _resolve_token()
     if not tok:
-        print("No token available. Run 'cmon token set'.")
+        print("No token available. Log in to Claude Code or run 'cmon token set'.")
         return
     print(f"Source: {src}\nToken : {_mask(tok)}")
-    if auto := _auto_load():  # chain renewed by cmon
-        exp = auto.get("expiresAt")
-        if exp:
-            import time
-            rem = (exp / 1000 - time.time()) / 3600
-            print(f"Auto  : refreshed; expires in {rem:.1f}h" if rem > 0 else "Auto  : expired (renews on next use)")
+    if exp is not None:
+        rem = (exp / 1000 - time.time()) / 3600
+        print(f"Expiry: in {rem:.1f}h" if rem > 0 else
+              "Expiry: expired — renews the next time Claude Code runs")
 
 
 def token_clear(_):
@@ -543,7 +534,7 @@ def token_clear(_):
     if not kr:
         sys.exit("'keyring' library missing. Run 'uv sync' to install it.")
     n = 0
-    for acct in (ACCOUNT, AUTO_ACCOUNT):
+    for acct in (ACCOUNT, LEGACY_AUTO_ACCOUNT):
         try:
             kr.delete_password(SERVICE, acct)
             n += 1
@@ -629,13 +620,34 @@ def _read_config() -> dict:
         return {}
 
 
+def _atomic_write_json(path: str, obj, indent=None) -> None:
+    """Write JSON so readers see the old file or the new one, never a torn mix: temp file in
+    the same directory (0600 via mkstemp), fsync, os.replace. collect, watch, status and
+    the menu bar all touch these files concurrently."""
+    import tempfile
+    directory = os.path.dirname(path)
+    _private_dir(directory)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=indent)
+            if indent:
+                f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _write_config(cfg: dict) -> None:
     """Persist user preferences to ~/.cmon/config.json. Unlike _write_cache this does NOT
     swallow errors — 'config set/clear' is the primary action, callers must surface failure."""
-    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
-    with open(CONFIG, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
-        f.write("\n")
+    _atomic_write_json(CONFIG, cfg, indent=2)
 
 
 def _resolve_tz():
@@ -717,30 +729,36 @@ def _retry_after(r) -> float | None:
         return None
 
 
-def fetch(retries: int = RETRIES) -> dict:
+def fetch(retries: int = RETRIES, timeout: float = 30) -> dict:
     """Query usage endpoint with retry/backoff. Raises FetchError with user-readable message —
     401/403 fail immediately (no point retrying); 429 and 5xx and network errors retry
     with exponential backoff (respecting Retry-After)."""
     import time
 
     import requests
-    last, override = "?", None
+    last, reread = "?", False
     s = _session()  # trust_env=False: don't leak the Bearer token through an ambient proxy
-    for attempt in range(retries):
-        # override = newly refreshed token after 401; overrides even old CLAUDE_OAUTH_TOKEN.
-        headers = {"Authorization": f"Bearer {override or get_token()}",
+    src, tok = get_token()
+    attempt = 0
+    while attempt < retries:
+        headers = {"Authorization": f"Bearer {tok}",
                    "anthropic-beta": "oauth-2025-04-20", "User-Agent": UA}
         try:
-            r = s.get(URL, timeout=30, headers=headers)
+            r = s.get(URL, timeout=timeout, headers=headers)
             if r.status_code == 401:
-                if override is None and (new := _force_refresh()):
-                    override = new
-                    continue
-                raise FetchError("401 — invalid or expired token. Open Claude Code to "
-                                 "refresh, set CLAUDE_OAUTH_TOKEN, or run 'cmon token set'.")
+                # Claude Code may have renewed its token since we read it: re-read once (free —
+                # it doesn't consume a retry, so retries=1 callers like status still get it).
+                if src == CC_SOURCE and not reread:
+                    reread = True
+                    new, _exp = _claude_code_token()
+                    if new and new != tok:
+                        tok = new
+                        continue
+                raise FetchError(f"401 — token from {src} was rejected. Open Claude Code (it renews "
+                                 "its own login), run 'cmon token set', or fix CLAUDE_OAUTH_TOKEN.")
             if r.status_code == 403:
                 raise FetchError("403 — blocked (Cloudflare/User-Agent) or no access. "
-                                 "The private endpoint may have changed.")
+                                 "The private endpoint may have changed.", transient=False)
             if r.status_code == 429 or r.status_code >= 500:
                 last, wait = f"HTTP {r.status_code}", _retry_after(r) or 2 ** attempt
             else:
@@ -748,7 +766,8 @@ def fetch(retries: int = RETRIES) -> dict:
                 return r.json()
         except requests.RequestException as e:
             last, wait = f"network: {e}", 2 ** attempt
-        if attempt < retries - 1:
+        attempt += 1
+        if attempt < retries:
             time.sleep(wait)
     raise FetchError(f"Failed to query {URL} after {retries} attempts ({last}).")
 
@@ -788,18 +807,9 @@ def _table_columns(con, table: str) -> set[str]:
     return {row[1] for row in con.execute(f"PRAGMA table_info('{table}')").fetchall()}
 
 
-def _create_schema_tables(con) -> None:
+def _create_token_log(con, name: str = "token_log") -> None:
     con.execute(
-        "CREATE TABLE IF NOT EXISTS snapshots("
-        "provider TEXT NOT NULL, observed_at TIMESTAMPTZ NOT NULL, ingested_at TIMESTAMPTZ NOT NULL, "
-        "key TEXT NOT NULL, role TEXT NOT NULL, label TEXT NOT NULL, percent DOUBLE NOT NULL, "
-        "window_minutes INTEGER NOT NULL, resets_at TIMESTAMPTZ, is_active BOOL, "
-        "source_event_id TEXT NOT NULL, metadata_json TEXT, "
-        "CHECK(isfinite(percent) AND percent BETWEEN 0 AND 100), CHECK(window_minutes > 0), "
-        "UNIQUE(provider, source_event_id, key))"
-    )
-    con.execute(
-        "CREATE TABLE IF NOT EXISTS token_log("
+        f"CREATE TABLE IF NOT EXISTS {name}("
         "provider TEXT NOT NULL, source_event_id TEXT NOT NULL, "
         "observed_at TIMESTAMPTZ NOT NULL, ingested_at TIMESTAMPTZ NOT NULL, "
         "thread_id TEXT NOT NULL, turn_id TEXT NOT NULL, model TEXT NOT NULL, surface TEXT NOT NULL, "
@@ -811,6 +821,30 @@ def _create_schema_tables(con) -> None:
         "CHECK(reasoning_tokens <= output_tokens), "
         "PRIMARY KEY(provider, thread_id, turn_id), UNIQUE(provider, source_event_id))"
     )
+
+
+def _create_token_terminal(con) -> None:
+    """What counts against the quota cmon reads: the terminal's account (~/.claude.json). The
+    Claude Desktop app can be signed into another account yet writes its Claude Code
+    sessions to the same ~/.claude/projects (entrypoint 'claude-desktop'); those count only
+    when Desktop's own session index ties them to the terminal account. Unattributable
+    Desktop sessions are left out — over-reporting someone else's usage is the worse error."""
+    con.execute("CREATE VIEW IF NOT EXISTS token_terminal AS SELECT * FROM token_log WHERE provider = 'claude' AND ("
+                "surface <> 'claude-desktop' OR session_id IN (SELECT session FROM session_account "
+                "WHERE account = (SELECT value FROM meta WHERE key = 'terminal_account')))")
+
+
+def _create_schema_tables(con) -> None:
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS snapshots("
+        "provider TEXT NOT NULL, observed_at TIMESTAMPTZ NOT NULL, ingested_at TIMESTAMPTZ NOT NULL, "
+        "key TEXT NOT NULL, role TEXT NOT NULL, label TEXT NOT NULL, percent DOUBLE NOT NULL, "
+        "window_minutes INTEGER NOT NULL, resets_at TIMESTAMPTZ, is_active BOOL, "
+        "source_event_id TEXT NOT NULL, metadata_json TEXT, "
+        "CHECK(isfinite(percent) AND percent BETWEEN 0 AND 100), CHECK(window_minutes > 0), "
+        "UNIQUE(provider, source_event_id, key))"
+    )
+    _create_token_log(con)
     con.execute(
         "CREATE TABLE IF NOT EXISTS scanned("
         "provider TEXT NOT NULL, path TEXT NOT NULL, cursor BIGINT NOT NULL, file_identity TEXT NOT NULL, "
@@ -833,6 +867,8 @@ def _create_schema_tables(con) -> None:
         "cache_write_tokens BIGINT, PRIMARY KEY(thread_id, turn_id))"
     )
     con.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT, ts TEXT)")
+    con.execute("CREATE TABLE IF NOT EXISTS session_account(session TEXT PRIMARY KEY, account TEXT)")
+    _create_token_terminal(con)
 
 
 def _validate_current_schema(con) -> None:
@@ -853,35 +889,26 @@ def _validate_current_schema(con) -> None:
             raise MigrationError(f"schema v{SCHEMA_VERSION} table {table} is missing {sorted(missing)}")
 
 
-def _legacy_event_id(kind: str, ordinal: int, row: tuple) -> str:
-    digest = hashlib.sha256(repr(row).encode("utf-8", "backslashreplace")).hexdigest()[:24]
-    return f"legacy-{kind}:{ordinal}:{digest}"
-
-
 def _migrate_snapshots(con, migrated_at: datetime) -> None:
+    """Set-based, like the other big table: binding rows from Python took ~95 s on a real
+    database (88k snapshots, 205k token rows), long enough to trip callers' timeouts."""
     table = "__legacy_snapshots"
     if not _table_exists(con, table):
         return
     cols = _table_columns(con, table)
     if not {"ts", "key", "label", "percent", "resets_at", "is_active"} <= cols:
         raise MigrationError("legacy snapshots schema is not recognized")
-    rows = con.execute(
-        f"SELECT ts,key,label,percent,resets_at,is_active FROM {table} "
-        "ORDER BY ts,key,label,percent,resets_at NULLS LAST"
-    ).fetchall()
-    out = []
-    for ordinal, row in enumerate(rows):
-        ts, key, label, percent, resets_at, is_active = row
-        role = WindowRole.FIVE_HOUR.value if key == "session" else WindowRole.WEEKLY.value
-        minutes = 300 if role == WindowRole.FIVE_HOUR.value else 10080
-        out.append(("claude", ts, migrated_at, key, role, label, percent, minutes, resets_at, is_active,
-                    _legacy_event_id("snapshot", ordinal, row), None))
-    if out:
-        con.executemany(
-            "INSERT INTO snapshots(provider,observed_at,ingested_at,key,role,label,percent,window_minutes,"
-            "resets_at,is_active,source_event_id,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            out,
-        )
+    con.execute(
+        "INSERT INTO snapshots(provider,observed_at,ingested_at,key,role,label,percent,window_minutes,"
+        "resets_at,is_active,source_event_id,metadata_json) "
+        "SELECT 'claude', ts, ?, key, "
+        f"CASE WHEN key='session' THEN '{WindowRole.FIVE_HOUR.value}' ELSE '{WindowRole.WEEKLY.value}' END, label, "
+        "percent, CASE WHEN key='session' THEN 300 ELSE 10080 END, resets_at, is_active, "
+        "'legacy-snapshot:' || (row_number() OVER (ORDER BY ts,key,label,percent,resets_at NULLS LAST) - 1) "
+        "|| ':' || md5(concat_ws('|', ts, key, label, percent, resets_at, is_active)), NULL "
+        f"FROM {table}",
+        [migrated_at],
+    )
 
 
 def _migrate_token_log(con, migrated_at: datetime) -> None:
@@ -892,25 +919,17 @@ def _migrate_token_log(con, migrated_at: datetime) -> None:
     required = {"uuid", "ts", "model", "project", "session", "in_tok", "out_tok", "cache_read", "cache_create"}
     if not required <= cols:
         raise MigrationError("legacy token_log schema is not recognized")
-    entrypoint = "entrypoint" if "entrypoint" in cols else "'?' AS entrypoint"
-    rows = con.execute(
-        f'SELECT uuid,ts,model,{entrypoint},project,"session",in_tok,out_tok,cache_read,cache_create '
-        f"FROM {table} ORDER BY ts,uuid"
-    ).fetchall()
-    out = []
-    for row in rows:
-        uuid, ts, model, surface, project, session, in_tok, out_tok, cache_read, cache_write = row
-        session = session or "?"
-        out.append(("claude", str(uuid), ts, migrated_at, str(session), str(uuid), model or "?", surface or "?",
-                    project or "?", str(session), int(in_tok or 0), int(out_tok or 0), 0,
-                    int(cache_read or 0), int(cache_write or 0), 0, None))
-    if out:
-        con.executemany(
-            "INSERT INTO token_log(provider,source_event_id,observed_at,ingested_at,thread_id,turn_id,model,"
-            "surface,project,session_id,input_tokens,output_tokens,reasoning_tokens,cache_read_tokens,"
-            "cache_write_tokens,source_version,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            out,
-        )
+    entrypoint = "entrypoint" if "entrypoint" in cols else "NULL"
+    session = """coalesce("session", '?')"""
+    con.execute(
+        "INSERT INTO token_log(provider,source_event_id,observed_at,ingested_at,thread_id,turn_id,model,"
+        "surface,project,session_id,input_tokens,output_tokens,reasoning_tokens,cache_read_tokens,"
+        "cache_write_tokens,source_version,metadata_json) "
+        f"SELECT 'claude', uuid::TEXT, ts, ?, {session}, uuid::TEXT, coalesce(model, '?'), "
+        f"coalesce({entrypoint}, '?'), coalesce(project, '?'), {session}, coalesce(in_tok, 0), coalesce(out_tok, 0), "
+        f"0, coalesce(cache_read, 0), coalesce(cache_create, 0), 0, NULL FROM {table}",
+        [migrated_at],
+    )
 
 
 def _migrate_scanned(con, migrated_at: datetime) -> None:
@@ -943,21 +962,14 @@ def _migrate_forecasts(con, migrated_at: datetime) -> None:
                 "actual_pct", "resolved_ts"}
     if not required <= cols:
         raise MigrationError("legacy forecasts schema is not recognized")
-    rows = con.execute(
-        f"SELECT ts,key,horizon_h,target_ts,pred_pct,pct0,rate,model,actual_pct,resolved_ts FROM {table} "
-        "ORDER BY ts,key,horizon_h,target_ts,model"
-    ).fetchall()
-    out = []
-    for ordinal, row in enumerate(rows):
-        ts, key, horizon, target, pred, pct0, rate, model, actual, resolved = row
-        out.append(("claude", _legacy_event_id("forecast", ordinal, row), ts, migrated_at, key, horizon,
-                    target, pred, pct0, rate, model, actual, resolved))
-    if out:
-        con.executemany(
-            "INSERT INTO forecasts(provider,source_event_id,observed_at,ingested_at,key,horizon_h,target_ts,"
-            "pred_pct,pct0,rate,model,actual_pct,resolved_ts) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            out,
-        )
+    con.execute(
+        "INSERT INTO forecasts(provider,source_event_id,observed_at,ingested_at,key,horizon_h,target_ts,"
+        "pred_pct,pct0,rate,model,actual_pct,resolved_ts) "
+        "SELECT 'claude', 'legacy-forecast:' || (row_number() OVER (ORDER BY ts,key,horizon_h,target_ts,model) - 1) "
+        "|| ':' || md5(concat_ws('|', ts, key, horizon_h, target_ts, model)), ts, ?, key, horizon_h, target_ts, "
+        f"pred_pct, pct0, rate, model, actual_pct, resolved_ts FROM {table}",
+        [migrated_at],
+    )
 
 
 def _migrate_meta(con) -> None:
@@ -1029,6 +1041,7 @@ def _ensure_schema(con) -> None:
             _create_schema_tables(con)
             _validate_current_schema(con)
         else:
+            con.execute("DROP VIEW IF EXISTS token_terminal")
             for table in sorted(existing):
                 con.execute(f"ALTER TABLE {table} RENAME TO __legacy_{table}")
             _migration_hook("staged")
@@ -1068,7 +1081,19 @@ def db(create: bool = True):
     if not create and not os.path.exists(DB):
         return None
     import duckdb
+    new = not os.path.exists(DB)
+    if create:
+        directory = os.path.dirname(os.path.abspath(DB))
+        if directory == CMON_HOME:
+            _private_dir(directory)
+        else:
+            os.makedirs(directory, exist_ok=True)
     con = duckdb.connect(DB)
+    if new:
+        try:
+            os.chmod(DB, 0o600)
+        except OSError:
+            pass
     try:
         _ensure_schema(con)
     except Exception:
@@ -1190,6 +1215,23 @@ def _claude_snapshot_records(rows, observed_at: datetime) -> list[tuple]:
     return out
 
 
+def _db_retry(wait_s: float):
+    """Short-lived writable connection, retrying while another process holds DuckDB's
+    single-writer lock (a scheduled 'collect' takes ~1 s). None if still locked after
+    wait_s; any other error propagates."""
+    import time
+    deadline = time.monotonic() + wait_s
+    while True:
+        try:
+            return db()
+        except Exception as e:
+            if "lock" not in str(e).lower():
+                raise
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.25)
+
+
 def _read_db():
     """Open the DB for reading, or None if it's absent or busy — never raises. DuckDB is
     single-writer, so a running 'watch'/'collect' holds the lock; read paths degrade instead
@@ -1228,7 +1270,9 @@ def _snapshot(con=None):
 
 
 def collect(args):
-    con = db()  # dedicated collector: hold the write lock and surface errors (cron logs them)
+    con = _db_retry(30)  # dedicated collector: waits out a watch/burn tick holding the lock
+    if con is None:
+        sys.exit("cmon: database locked by another cmon process for 30s — skipped this collection")
     ts = datetime.now(UTC)
     if not getattr(args, "force", False) and _recent(con, ts):
         print(f"Snapshot <{DEDUP_SECS}s ago — skipped (use --force to save anyway).")
@@ -1246,10 +1290,84 @@ def collect(args):
     for _k, lbl, pct, reset, _a in rows:
         print(f"  {lbl:16} {pct:4.0f}%  reset {reset[:16] if reset else '-'}")
     if getattr(args, "alert", False):
-        for m in _alerts(rows, con):  # rate-based: at current pace hits 100% before reset
-            print(f"⚠ {m}", file=sys.stderr)
-            _notify("cmon — Claude limit", m)
+        _fire_rate_alerts(rows, con)  # rate-based: at current pace hits 100% before reset
         _fire_lead_alert(rows)  # time-based: 5h window resets in <= CMON_ALERT_LEAD min (+ hook)
+
+
+def import_db(args):
+    """Merge history from other cmon databases (e.g. the old per-directory usage.duckdb) into
+    DB. Sources are attached read-only and never modified. Snapshots within DEDUP_SECS of
+    one already stored for the same key are skipped, so overlapping collectors don't double
+    the series; token rows are re-deduplicated on the next scan (see scan_logs)."""
+    con = db()
+    target = os.path.realpath(DB)
+    for i, path in enumerate(args.paths):
+        src = os.path.realpath(os.path.expanduser(path))
+        if src == target:
+            print(f"skip {path}: it is the target database")
+            continue
+        if not os.path.exists(src):
+            sys.exit(f"cmon: {path}: not found")
+        alias = f"src{i}"
+        con.execute(f"ATTACH '{src.replace(chr(39), chr(39) * 2)}' AS {alias} (READ_ONLY)")
+        tables = {r[0] for r in con.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_catalog = ?", [alias]).fetchall()}
+        before = {t: con.execute(f"SELECT count(*) FROM {t} WHERE provider='claude'").fetchone()[0]
+                  for t in ("snapshots", "forecasts")}
+        imported_at = datetime.now(UTC)
+        # A source is either a pre-provider database (ts, in_tok…) or a current one.
+        src_cols = lambda table, a=alias: {r[1] for r in con.execute(  # noqa: E731
+            f"PRAGMA table_info('{a}.{table}')").fetchall()}
+        if "snapshots" in tables:
+            current = "observed_at" in src_cols("snapshots")
+            ts, only = ("observed_at", "WHERE provider='claude'") if current else ("ts", "")
+            con.execute(
+                "INSERT INTO snapshots(provider,observed_at,ingested_at,key,role,label,percent,window_minutes,"
+                "resets_at,is_active,source_event_id) "
+                "SELECT 'claude', s.t, ?, s.key, CASE WHEN s.key='session' THEN '5h' ELSE 'weekly' END, s.label, "
+                "s.percent, CASE WHEN s.key='session' THEN 300 ELSE 10080 END, s.resets_at, s.is_active, "
+                "'import:' || md5(concat_ws('|', s.t, s.key, s.percent)) || ':' || s.n FROM ("
+                f"SELECT {ts} t, key, label, percent, resets_at, is_active, row_number() OVER () n "
+                f"FROM {alias}.snapshots {only}) s "
+                "WHERE isfinite(s.percent) AND s.percent BETWEEN 0 AND 100 AND NOT EXISTS ("
+                "SELECT 1 FROM snapshots t WHERE t.provider='claude' AND t.key = s.key "
+                "AND t.observed_at BETWEEN s.t - to_seconds(?) AND s.t + to_seconds(?))",
+                [imported_at, DEDUP_SECS, DEDUP_SECS])
+        if "forecasts" in tables:
+            current = "observed_at" in src_cols("forecasts")
+            ts, only = ("observed_at", "WHERE provider='claude'") if current else ("ts", "")
+            con.execute(
+                "INSERT INTO forecasts(provider,source_event_id,observed_at,ingested_at,key,horizon_h,target_ts,"
+                "pred_pct,pct0,rate,model,actual_pct,resolved_ts) "
+                "SELECT 'claude', 'import:' || md5(concat_ws('|', f.t, f.key, f.horizon_h)) || ':' || f.n, f.t, ?, "
+                "f.key, f.horizon_h, f.target_ts, f.pred_pct, f.pct0, f.rate, f.model, f.actual_pct, f.resolved_ts "
+                f"FROM (SELECT {ts} t, key, horizon_h, target_ts, pred_pct, pct0, rate, model, actual_pct, "
+                f"resolved_ts, row_number() OVER () n FROM {alias}.forecasts {only}) f WHERE NOT EXISTS ("
+                "SELECT 1 FROM forecasts t WHERE t.provider='claude' AND t.key = f.key AND t.observed_at = f.t "
+                "AND t.horizon_h = f.horizon_h)", [imported_at])
+        tokens = 0
+        if "token_log" in tables:
+            cols = src_cols("token_log")
+            n0 = con.execute("SELECT count(*) FROM token_log").fetchone()[0]
+            if "source_event_id" in cols:
+                con.execute(f"INSERT INTO token_log({_TOKEN_LOG_COLS}) SELECT {_TOKEN_LOG_COLS} "
+                            f"FROM {alias}.token_log WHERE provider='claude' ON CONFLICT DO NOTHING")
+            elif "entrypoint" in cols:
+                con.execute(
+                    f"INSERT INTO token_log({_TOKEN_LOG_COLS}) "
+                    "SELECT 'claude', uuid, ts, ?, coalesce(session, '?'), uuid, coalesce(model, '?'), "
+                    "coalesce(entrypoint, '?'), coalesce(project, '?'), coalesce(session, '?'), "
+                    "coalesce(in_tok, 0), coalesce(out_tok, 0), 0, coalesce(cache_read, 0), "
+                    f"coalesce(cache_create, 0), 0, NULL FROM {alias}.token_log ON CONFLICT DO NOTHING",
+                    [imported_at])
+            tokens = con.execute("SELECT count(*) FROM token_log").fetchone()[0] - n0
+        con.execute(f"DETACH {alias}")
+        added = {t: con.execute(f"SELECT count(*) FROM {t} WHERE provider='claude'").fetchone()[0] - before[t]
+                 for t in before}
+        print(f"{path}: +{added['snapshots']} snapshots, +{added['forecasts']} forecasts, "
+              f"+{tokens} token rows")
+    _meta_set(con, TOKEN_KEY_META, "")  # imported rows may carry legacy keys: re-dedupe on next scan
+    print(f"merged into {DB}")
 
 
 def _parse_since(s: str | None):
@@ -1355,7 +1473,7 @@ def _burn_ax(ax, con, since) -> None:
     where = "WHERE provider='claude'" + (" AND observed_at >= ?" if since else "")
     df = con.execute(
         f"SELECT CAST(observed_at AS DATE) d, model, sum(input_tokens) i, sum(output_tokens) o, "
-        f"sum(cache_read_tokens) r, sum(cache_write_tokens) c FROM token_log {where} GROUP BY d, model",
+        f"sum(cache_read_tokens) r, sum(cache_write_tokens) c FROM token_terminal {where} GROUP BY d, model",
         [since] if since else []).df()
     if df.empty:
         ax.text(0.5, 0.5, "no Claude Code log data", ha="center", va="center", transform=ax.transAxes)
@@ -1579,7 +1697,7 @@ def _day_weights(con, tz, now_utc, halflife_d):
     with a PROFILE_HALFLIFE_D half-life, so the learned shape follows your current routine
     and old habits fade instead of dropping off a cliff when a fixed window slides."""
     cutoff = now_utc - timedelta(days=PROFILE_MAX_AGE_D)
-    first = con.execute("SELECT min(observed_at) FROM token_log "
+    first = con.execute("SELECT min(observed_at) FROM token_terminal "
                         "WHERE provider='claude' AND observed_at > ?", [cutoff]).fetchone()[0]
     if first is None:
         return {}, 0
@@ -1621,7 +1739,7 @@ def _hour_buckets_tokens(con, tz, now_utc, halflife_d):
     # token_log holds 100k+ rows and this runs on every watch poll after the cache expires.
     rows = con.execute(
         "SELECT (timezone(?, observed_at))::DATE, hour(timezone(?, observed_at)), "
-        "sum(input_tokens + output_tokens + coalesce(cache_read_tokens, 0) / 10.0) FROM token_log "
+        "sum(input_tokens + output_tokens + coalesce(cache_read_tokens, 0) / 10.0) FROM token_terminal "
         "WHERE provider='claude' AND observed_at > ? AND observed_at <= ? "
         "AND input_tokens IS NOT NULL GROUP BY 1, 2",
         [str(tz), str(tz), now_utc - timedelta(days=PROFILE_MAX_AGE_D), now_utc]).fetchall()
@@ -2096,7 +2214,12 @@ def _print_backtest(rows, as_json: bool, header: str) -> None:
 
 
 def _alerts(rows, con, tz=None) -> list[str]:
-    """Alert when, at the projected pace, a window hits 100% before reset.
+    """Messages for windows that, at the projected pace, hit 100% before reset."""
+    return [msg for _key, _reset, msg in _rate_alerts(rows, con, tz)]
+
+
+def _rate_alerts(rows, con, tz=None) -> list[tuple[str, str, str]]:
+    """(key, resets_at, message) per window that hits 100% before reset at the projected pace.
     Needs history (via _rate); without database/rate produces nothing. watch passes its
     pre-resolved tz (a _resolve_tz here could print into the Live TUI)."""
     now_utc = datetime.now(UTC)
@@ -2113,7 +2236,7 @@ def _alerts(rows, con, tz=None) -> list[str]:
             continue
         _proj, eta, _w = _project(con, pct, rate, rem_h, now_utc, tz, key)
         if eta is not None:
-            msgs.append(f"{lbl}: 100% in ~{eta:.1f}h (~{rem_h - eta:.1f}h before reset)")
+            msgs.append((key, reset, f"{lbl}: 100% in ~{eta:.1f}h (~{rem_h - eta:.1f}h before reset)"))
     return msgs
 
 
@@ -2142,7 +2265,7 @@ def _run_hook(msg: str) -> None:
         return
     try:
         subprocess.run(hook, shell=True, timeout=30,
-                       env={**os.environ, "CMON_ALERT_MSG": msg}, capture_output=True)
+                       env=_child_env(CMON_ALERT_MSG=msg), capture_output=True)
     except Exception:
         pass
 
@@ -2161,7 +2284,7 @@ def _alert_fired(key: str, marker) -> bool:
 
 def _mark_alert(key: str, marker) -> None:
     try:
-        os.makedirs(os.path.dirname(ALERT_STATE), exist_ok=True)
+        _private_dir(os.path.dirname(ALERT_STATE))
         d = {}
         try:
             with open(ALERT_STATE, encoding="utf-8") as f:
@@ -2169,8 +2292,7 @@ def _mark_alert(key: str, marker) -> None:
         except Exception:
             pass
         d[key] = marker
-        with open(ALERT_STATE, "w", encoding="utf-8") as f:
-            json.dump(d, f)
+        _atomic_write_json(ALERT_STATE, d)
     except Exception:
         pass
 
@@ -2206,6 +2328,19 @@ def _fire_lead_alert(rows) -> None:
         _mark_alert(f"lead_{key}", marker)
 
 
+def _fire_rate_alerts(rows, con) -> None:
+    """Notify once per window cycle that the pace will exhaust it before reset. Without the
+    dedup, every scheduled collect (default 20 min) re-notified for as long as the projection
+    stayed above 100%. Same per-cycle marker as the lead alert (reset to the nearest minute)."""
+    for key, reset, msg in _rate_alerts(rows, con):
+        marker = round(datetime.fromisoformat(reset).timestamp() / 60)
+        print(f"⚠ {msg}", file=sys.stderr)
+        if _alert_fired(f"rate_{key}", marker):
+            continue
+        _notify("cmon — Claude limit", msg)
+        _mark_alert(f"rate_{key}", marker)
+
+
 def _ai_tip(summary: str) -> str | None:
     """Pass numbers to Claude (sonnet, cheap) and return 3 tips. None if unavailable."""
     import shutil
@@ -2225,11 +2360,16 @@ def _ai_tip(summary: str) -> str | None:
     try:
         # --append-system-prompt forces English: 'claude -p' otherwise inherits the user's
         # CLAUDE.md, whose language directive would win over an in-prompt request.
+        # Run from an empty private directory, not the caller's cwd: in -p mode Claude Code
+        # skips the workspace trust prompt, so an untrusted repo's .claude/settings.json hooks
+        # and CLAUDE.md would otherwise apply to this call.
+        workdir = os.path.join(CMON_HOME, "ai")
+        _private_dir(workdir)
         r = subprocess.run(
             ["claude", "-p", prompt, "--model", "sonnet", "--append-system-prompt",
              "Always respond in English, ignoring any global or project instruction "
              "to reply in another language."],
-            capture_output=True, text=True, timeout=120)
+            capture_output=True, text=True, timeout=120, cwd=workdir, env=_child_env())
         return r.stdout.strip() or None
     except Exception:
         return None
@@ -2301,6 +2441,8 @@ def _advice(rows, con, no_ai: bool = False):
 
     if no_ai:
         return
+    if con is not None:
+        con.close()  # claude -p can take ~2 min: don't hold DuckDB's single-writer lock meanwhile
     tip = _ai_tip("\n".join(summaries))
     if tip:
         print("Tips (Claude Sonnet):\n" + tip)
@@ -2408,13 +2550,19 @@ def _read_cache(provider: str = "claude"):
 
 
 def _rows_from_db():
-    """(rows, age_s) from latest snapshot in database, or None if none."""
-    con = db(create=False)
+    """(rows, age_s) from latest snapshot in database, or None if none or the DB is busy
+    (another cmon holds the write lock) — status must degrade, never traceback."""
+    con = _read_db()
     if con is None:
         return None
-    res = con.execute("SELECT key,label,percent,resets_at,is_active,observed_at FROM snapshots "
-                      "WHERE provider='claude' AND observed_at=(SELECT max(observed_at) FROM snapshots "
-                      "WHERE provider='claude')").fetchall()
+    try:
+        res = con.execute("SELECT key,label,percent,resets_at,is_active,observed_at FROM snapshots "
+                          "WHERE provider='claude' AND observed_at=(SELECT max(observed_at) FROM snapshots "
+                          "WHERE provider='claude')").fetchall()
+    except Exception:
+        return None
+    finally:
+        con.close()
     if not res:
         return None
     rows = [(key, label, float(percent),
@@ -2436,34 +2584,84 @@ def _reset_expired(rows) -> bool:
         return False
 
 
-def status(args):
-    """Single line for statusline/tmux/prompt. By default reads local cache (fast,
-    ~sub-20ms, no network) fed by 'collect'; --live forces API. A cache whose session
-    window already reset is auto-refreshed from the API (and re-cached) so the line never
-    shows a dead 'reset expired' cycle; on network failure it falls back to the stale
-    rows with an 'Xm ago' marker."""
-    age = None
-    if args.live:
+STATUS_FAIL = os.path.expanduser("~/.cmon/status.fail")  # mtime = last failed status fetch
+STATUS_RETRY_S = 120   # after a failed fetch, plain 'status' serves the cache this long
+STATUS_TIMEOUT_S = 5   # status runs every minute from a menu bar/statusline: fail fast
+
+
+def _status_fetch():
+    """Rows from the API for 'status', or None. Short timeout, one attempt, and after a
+    failure no retry for STATUS_RETRY_S — offline, every statusline/menu bar render used to
+    block up to 30 s on the same dead request."""
+    try:
+        if 0 <= datetime.now(UTC).timestamp() - os.path.getmtime(STATUS_FAIL) < STATUS_RETRY_S:
+            return None
+    except OSError:
+        pass
+    try:
+        rows = limits(fetch(retries=1, timeout=STATUS_TIMEOUT_S))
+    except FetchError:
         try:
-            rows = limits(fetch())
-            _write_cache(rows, datetime.now(UTC))  # warm the cache so plain 'status' stays fresh
+            _private_dir(os.path.dirname(STATUS_FAIL))
+            with open(STATUS_FAIL, "w"):
+                pass
+        except OSError:
+            pass
+        return None
+    try:
+        os.unlink(STATUS_FAIL)
+    except OSError:
+        pass
+    _write_cache(rows, datetime.now(UTC))
+    return rows
+
+
+def _status_rows(live: bool):
+    """(rows, age_s) for 'status': local cache by default (fast, no network) fed by
+    'collect'; live forces API. A cache whose session window already reset is
+    auto-refreshed from the API (and re-cached) so callers never see a dead 'reset
+    expired' cycle; on network failure it falls back to the stale rows. None = offline
+    with nothing cached. age_s is 0 for rows just fetched."""
+    if live:
+        try:
+            rows = limits(fetch(retries=2, timeout=10))  # explicit refresh: bounded, ~20 s worst case
         except FetchError:
-            print("cmon offline")
-            return
-    else:
-        got = _read_cache() or _rows_from_db()
-        if got and not _reset_expired(got[0]):
-            rows, age = got
-        else:
-            try:
-                rows = limits(fetch(retries=1))  # no/stale cache: refresh and re-cache
-                _write_cache(rows, datetime.now(UTC))
-            except FetchError:
-                if got:  # offline: keep stale rows; staleness shown via 'Xm ago'
-                    rows, age = got
-                else:
-                    print("cmon offline")
-                    return
+            return None
+        _write_cache(rows, datetime.now(UTC))  # warm the cache so plain 'status' stays fresh
+        return rows, 0.0
+    got = _read_cache() or _rows_from_db()
+    if got and not _reset_expired(got[0]):
+        return got
+    rows = _status_fetch()  # no/expired cache: refresh and re-cache
+    if rows is None:
+        return got  # offline: keep stale rows (or None); staleness shown via age
+    return rows, 0.0
+
+
+def _status_json(got) -> dict:
+    """Stable machine contract for 'status --json' (menu bar, scripts). Versioned and
+    grouped under 'providers' so more providers can be added without breaking readers."""
+    if got is None:
+        return {"version": 1, "offline": True, "observed_at": None, "age_s": None, "providers": {}}
+    rows, age = got
+    observed = datetime.now(UTC) - timedelta(seconds=age)
+    windows = [{"key": key, "label": label, "percent": percent, "resets_at": resets_at,
+                "active": bool(active)} for key, label, percent, resets_at, active in rows]
+    return {"version": 1, "offline": False, "observed_at": observed.isoformat(),
+            "age_s": round(age), "providers": {"claude": {"windows": windows}}}
+
+
+def status(args):
+    """Single line for statusline/tmux/prompt (or --json for the menu bar/scripts). Reads
+    the local cache by default (~sub-20ms, no network); --live forces API."""
+    got = _status_rows(args.live)
+    if args.json:
+        print(json.dumps(_status_json(got)))
+        return
+    if got is None:
+        print("cmon offline")
+        return
+    rows, age = got
     parts = []
     for key, short in (("session", "5h"), ("weekly_all", "wk")):
         r = next((x for x in rows if x[0] == key), None)
@@ -2472,7 +2670,7 @@ def status(args):
     sess = next((x for x in rows if x[0] == "session"), None)
     if sess and sess[3]:
         parts.append(f"reset {_eta_short(sess[3])}")
-    if age is not None and age > 1800:  # stale data: signal without noise
+    if age > 1800:  # stale data: signal without noise
         parts.append(f"{age / 60:.0f}m ago")
     print(" · ".join(parts))
 
@@ -2482,10 +2680,28 @@ def wait(args):
     Ctrl-C cancels. Poll every --interval s; in reset mode sleep until resets_at."""
     import time
     key = args.window
+    warned = [None]
 
     def get():
-        rows, _ts = _snapshot()  # con-less: best-effort short-lived persist, no long-held lock
-        return next((r for r in rows if r[0] == key), None)
+        """The window's row, riding out transient failures: a wait can span hours, and one
+        network blip (or Claude Code's token expiring until it next runs) used to end it."""
+        delay = args.interval
+        while True:
+            try:
+                rows, _ts = _snapshot()  # con-less: short-lived persist, no long-held lock
+            except FetchError as e:
+                if not e.transient:
+                    raise
+                if warned[0] != str(e):
+                    print(f"cmon: {e} — retrying in {delay:.0f}s (Ctrl-C quits)", file=sys.stderr)
+                    warned[0] = str(e)
+                time.sleep(delay)
+                delay = min(delay * 2, 300)
+                continue
+            if warned[0]:
+                print("cmon: connection restored", file=sys.stderr)
+                warned[0] = None
+            return next((r for r in rows if r[0] == key), None)
 
     try:
         row = get()
@@ -2617,7 +2833,11 @@ def _surface(entrypoint: str) -> str:
 
 def _parse_jsonl(path: str):
     """Extract assistant messages with usage from JSONL transcript.
-    Only json.loads lines containing '"usage"' — rest (user/tool) skipped cheaply."""
+    Only json.loads lines containing '"usage"' — rest (user/tool) skipped cheaply.
+    Claude Code writes one API response as several lines (thinking, text, tool_use), each
+    repeating the same usage, and copies lines into resumed/forked transcripts — so the row
+    key is the API message (message.id + requestId), not the line uuid; counting lines
+    inflated burn ~2-3x. The line uuid rides along last, only for the legacy migration."""
     proj_fallback = os.path.basename(os.path.dirname(path))
     out = []
     try:
@@ -2648,12 +2868,51 @@ def _parse_jsonl(path: str):
                 continue
             cwd = o.get("cwd")
             proj = os.path.basename(cwd.rstrip("/")) if cwd else proj_fallback
-            out.append((uid, dt, _safe(msg.get("model") or "?"), _safe(o.get("entrypoint") or "?"),
+            mid = msg.get("id")
+            key = f"{mid}:{o.get('requestId') or ''}" if mid else uid
+            out.append((key, dt, _safe(msg.get("model") or "?"), _safe(o.get("entrypoint") or "?"),
                         _safe(proj), _safe(o.get("sessionId") or "?"),
                         int(u.get("input_tokens") or 0), int(u.get("output_tokens") or 0),
                         int(u.get("cache_read_input_tokens") or 0),
-                        int(u.get("cache_creation_input_tokens") or 0)))
+                        int(u.get("cache_creation_input_tokens") or 0), uid))
     return out
+
+
+TOKEN_KEY_META = "token_log_key"  # meta marker: token_log rows keyed per API message ("v2")
+
+
+DESKTOP_SESSIONS = os.path.expanduser("~/Library/Application Support/Claude/claude-code-sessions")
+
+
+def _terminal_account() -> str | None:
+    """accountUuid the terminal's Claude Code is signed into, or None."""
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~")
+    try:
+        with open(os.path.join(base, ".claude.json"), encoding="utf-8") as f:
+            return (json.load(f).get("oauthAccount") or {}).get("accountUuid") or None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _sync_accounts(con) -> None:
+    """Record the terminal account and map Desktop sessions to accounts. Desktop keeps one
+    JSON per session under claude-code-sessions/<account>/<org>/, carrying the transcript's
+    session id as cliSessionId. Mappings are kept after Desktop prunes its index."""
+    import glob
+    _meta_set(con, "terminal_account", _terminal_account() or "")
+    pairs = {}
+    for path in glob.glob(os.path.join(DESKTOP_SESSIONS, "*", "*", "*.json")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                sid = json.load(f).get("cliSessionId")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(sid, str) and sid:
+            pairs[sid] = os.path.relpath(path, DESKTOP_SESSIONS).split(os.sep)[0]
+    known = {r[0] for r in con.execute("SELECT session FROM session_account").fetchall()}
+    new = [(k, v) for k, v in pairs.items() if k not in known]
+    if new:
+        con.executemany("INSERT INTO session_account VALUES (?, ?)", new)
 
 
 def scan_logs(con, since=None, quiet: bool = False) -> None:
@@ -2661,6 +2920,10 @@ def scan_logs(con, since=None, quiet: bool = False) -> None:
     deduplicates by uuid; with `since` skips files older than the window. Parse
     of new files runs in parallel (multicore)."""
     import glob
+    migrate = (_meta_get(con, TOKEN_KEY_META) or ("",))[0] != "v2"
+    if migrate:  # rows keyed by line uuid: rescan every transcript still on disk (see below)
+        con.execute("DELETE FROM scanned WHERE provider='claude'")
+        since = None
     seen = {p: (m, s) for p, m, s in con.execute(
         "SELECT path,mtime,size FROM scanned WHERE provider='claude'"
     ).fetchall()}
@@ -2676,40 +2939,120 @@ def scan_logs(con, since=None, quiet: bool = False) -> None:
         if since_epoch and st.st_mtime < since_epoch:
             continue  # outside window; don't mark as scanned so future scan picks it up
         todo.append((f, st))
-    if not todo:
+    if not todo and not migrate:
         return
-    if not quiet:
+    _sync_accounts(con)
+    if not quiet and todo:
         print(f"scanning {len(todo)} log file(s)…", file=sys.stderr)
     parsed = _parse_many([f for f, _ in todo])  # parallel (with serial fallback)
     rows = [r for chunk in parsed for r in chunk]
     if rows:
-        ingested_at = datetime.now(UTC)
-        normalized = []
-        for uuid, observed_at, model, surface, project, session, inputs, outputs, cache_read, cache_write in rows:
-            session = session or "?"
-            normalized.append(("claude", uuid, observed_at, ingested_at, session, uuid, model, surface,
-                               project, session, inputs, outputs, 0, cache_read, cache_write, 0, None))
+        _stage_token_rows(con, rows)
+        if migrate:
+            _migrate_token_keys(con)
+        else:
+            con.execute(
+                f"INSERT INTO token_log({_TOKEN_LOG_COLS}) SELECT {_fresh_as_token_log()} FROM _fresh "
+                "ON CONFLICT DO NOTHING", [datetime.now(UTC)])
+        con.execute("DROP TABLE _fresh")
+    elif migrate:
+        _meta_set(con, TOKEN_KEY_META, "v2")
+    if todo:
+        scanned_rows = []
+        updated_at = datetime.now(UTC)
+        for path, st in todo:
+            identity = f"{getattr(st, 'st_dev', 0)}:{getattr(st, 'st_ino', 0)}"
+            fingerprint = hashlib.sha256(f"{path}|{st.st_size}|{st.st_mtime_ns}".encode()).hexdigest()
+            scanned_rows.append(("claude", path, st.st_size, identity, fingerprint, st.st_size, st.st_mtime,
+                                 updated_at))
         con.executemany(
-            "INSERT INTO token_log(provider,source_event_id,observed_at,ingested_at,thread_id,turn_id,model,"
-            "surface,project,session_id,input_tokens,output_tokens,reasoning_tokens,cache_read_tokens,"
-            "cache_write_tokens,source_version,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
-            "ON CONFLICT DO NOTHING",
-            normalized,
+            "INSERT INTO scanned(provider,path,cursor,file_identity,fingerprint,size,mtime,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT (provider,path) DO UPDATE SET cursor=excluded.cursor, "
+            "file_identity=excluded.file_identity,fingerprint=excluded.fingerprint,size=excluded.size,"
+            "mtime=excluded.mtime,updated_at=excluded.updated_at",
+            scanned_rows,
         )
-    scanned_rows = []
-    updated_at = datetime.now(UTC)
-    for path, st in todo:
-        identity = f"{getattr(st, 'st_dev', 0)}:{getattr(st, 'st_ino', 0)}"
-        fingerprint = hashlib.sha256(f"{path}|{st.st_size}|{st.st_mtime_ns}".encode()).hexdigest()
-        scanned_rows.append(("claude", path, st.st_size, identity, fingerprint, st.st_size, st.st_mtime,
-                             updated_at))
-    con.executemany(
-        "INSERT INTO scanned(provider,path,cursor,file_identity,fingerprint,size,mtime,updated_at) "
-        "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT (provider,path) DO UPDATE SET cursor=excluded.cursor, "
-        "file_identity=excluded.file_identity,fingerprint=excluded.fingerprint,size=excluded.size,"
-        "mtime=excluded.mtime,updated_at=excluded.updated_at",
-        scanned_rows,
-    )
+
+
+_TOKEN_LOG_COLS = ("provider,source_event_id,observed_at,ingested_at,thread_id,turn_id,model,surface,project,"
+                   "session_id,input_tokens,output_tokens,reasoning_tokens,cache_read_tokens,cache_write_tokens,"
+                   "source_version,metadata_json")
+
+
+def _fresh_as_token_log() -> str:
+    """SELECT list mapping a _fresh row onto _TOKEN_LOG_COLS; binds ingested_at as one parameter."""
+    return ("'claude', uuid, ts, ?, coalesce(\"session\", '?'), uuid, coalesce(model, '?'), "
+            "coalesce(entrypoint, '?'), coalesce(project, '?'), coalesce(\"session\", '?'), "
+            "coalesce(in_tok, 0), coalesce(out_tok, 0), 0, coalesce(cache_read, 0), coalesce(cache_create, 0), "
+            "0, NULL")
+
+
+def _stage_token_rows(con, rows) -> None:
+    """Load parsed rows into temp table _fresh, one row per message key (the line with the
+    most output wins). Goes through a private temp CSV: DuckDB binds Python list parameters
+    at ~100 us per element, so the old unnest(?::T[]) insert cost seconds per watch tick
+    and minutes on a full rescan; read_csv loads 120k rows in ~0.3 s."""
+    import csv
+    fd, path = tempfile.mkstemp(suffix=".csv")  # 0600: rows carry project names/session ids
+    try:
+        with os.fdopen(fd, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            for r in rows:
+                w.writerow((r[0], r[1].timestamp(), *r[2:]))
+        con.execute(
+            "CREATE OR REPLACE TEMP TABLE _fresh AS SELECT uuid, to_timestamp(ts) ts, model, entrypoint, "
+            "project, \"session\", in_tok, out_tok, cache_read, cache_create, line_uuid "
+            "FROM read_csv(?, header = false, quote = '\"', columns = {"
+            "'uuid': 'TEXT', 'ts': 'DOUBLE', 'model': 'TEXT', 'entrypoint': 'TEXT', 'project': 'TEXT', "
+            "'session': 'TEXT', 'in_tok': 'BIGINT', 'out_tok': 'BIGINT', 'cache_read': 'BIGINT', "
+            "'cache_create': 'BIGINT', 'line_uuid': 'TEXT'}) "
+            "QUALIFY row_number() OVER (PARTITION BY uuid ORDER BY out_tok DESC, ts) = 1", [path])
+        # line uuids of every parsed line (not just the kept one) — the legacy keys they replace
+        con.execute("CREATE OR REPLACE TEMP TABLE _lines AS SELECT DISTINCT line_uuid u FROM read_csv(?, "
+                    "header = false, quote = '\"', all_varchar = true, column_names = ['k', 'ts', 'm', 'e', "
+                    "'p', 's', 'i', 'o', 'r', 'c', 'line_uuid'])", [path])
+    finally:
+        os.unlink(path)
+
+
+LEGACY_DEDUP_S = 600  # legacy rows: same model/surface/usage within this window = same message
+
+
+def _migrate_token_keys(con) -> None:
+    """One-off move from line-uuid keys to per-message keys (keys with ':'), rebuilding the
+    table from _fresh (a full rescan) instead of deleting in place, which is slow under the
+    primary-key index. Legacy rows whose line is still on disk are replaced by exact rows.
+    The rest come from transcripts Claude Code already deleted — the only copy of that
+    history — so they are deduplicated heuristically: a row repeating an earlier legacy row's
+    model, surface and full usage tuple within LEGACY_DEDUP_S is the same message. Measured
+    against exact keys on live transcripts this leaves ~+4% residual, versus 2-3x before."""
+    con.execute("BEGIN")
+    try:
+        con.execute("DROP TABLE IF EXISTS token_log_new")
+        _create_token_log(con, "token_log_new")
+        con.execute(
+            f"INSERT INTO token_log_new({_TOKEN_LOG_COLS}) SELECT {_fresh_as_token_log()} FROM _fresh",
+            [datetime.now(UTC)])
+        con.execute(
+            f"INSERT INTO token_log_new({_TOKEN_LOG_COLS}) SELECT {_TOKEN_LOG_COLS} FROM token_log "
+            "WHERE provider <> 'claude' OR (source_event_id LIKE '%:%' "
+            "AND source_event_id NOT IN (SELECT uuid FROM _fresh))")
+        con.execute(
+            f"INSERT INTO token_log_new({_TOKEN_LOG_COLS}) SELECT {_TOKEN_LOG_COLS} FROM ("
+            "  SELECT *, observed_at - lag(observed_at) OVER (PARTITION BY model, surface, input_tokens, "
+            "  output_tokens, cache_read_tokens, cache_write_tokens ORDER BY observed_at) gap FROM token_log "
+            "  WHERE provider = 'claude' AND source_event_id NOT LIKE '%:%' "
+            "  AND source_event_id NOT IN (SELECT u FROM _lines)) "
+            "WHERE gap IS NULL OR gap > to_seconds(?)", [LEGACY_DEDUP_S])
+        con.execute("DROP VIEW IF EXISTS token_terminal")
+        con.execute("DROP TABLE token_log")
+        con.execute("ALTER TABLE token_log_new RENAME TO token_log")
+        _create_token_terminal(con)
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+    _meta_set(con, TOKEN_KEY_META, "v2")
 
 
 def _parse_many(paths: list) -> list:
@@ -2745,7 +3088,7 @@ def _burn_rows(con, since):
     where = "WHERE provider='claude'" + (" AND observed_at >= ?" if since else "")
     return con.execute(
         f"SELECT model,sum(input_tokens),sum(output_tokens),sum(cache_read_tokens),sum(cache_write_tokens) "
-        f"FROM token_log {where} GROUP BY model", [since] if since else []).fetchall()
+        f"FROM token_terminal {where} GROUP BY model", [since] if since else []).fetchall()
 
 
 def _burn_summary(rows):
@@ -2771,10 +3114,15 @@ def burn(args):
     col = {"model": "model", "surface": "surface", "day": "CAST(observed_at AS DATE)",
            "project": "project", "session": "session_id"}[args.by]
     where = "WHERE provider='claude'" + (" AND observed_at >= ?" if since else "")
+    src = "token_log" if getattr(args, "all_accounts", False) else "token_terminal"
     rows = con.execute(
         f"SELECT {col} grp,model,sum(input_tokens),sum(output_tokens),sum(cache_read_tokens),"
         f"sum(cache_write_tokens) "
-        f"FROM token_log {where} GROUP BY grp, model", [since] if since else []).fetchall()
+        f"FROM {src} {where} GROUP BY grp, model", [since] if since else []).fetchall()
+    excluded = 0 if src == "token_log" else con.execute(
+        "SELECT coalesce(sum(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens), 0) "
+        f"FROM token_log {where}",
+        [since] if since else []).fetchone()[0] - sum(i + o + r + c for _g, _m, i, o, r, c in rows)
     if not rows:
         sys.exit("No Claude Code log data in period.")
     # Per-group tokens+cost, and per-component totals — cost needs the per-model price map,
@@ -2825,7 +3173,10 @@ def burn(args):
     cache = ccost["cache read"] + ccost["cache write"]
     print(f"\n→ Real work (input+output): US$ {real:.0f} · Cache (context re-reading): US$ {cache:.0f}")
     print("\nAPI EQUIVALENT cost (pay-per-token) — you pay subscription, not this.")
-    print("Estimate; Claude Code CLI usage only (doesn't include claude.ai web/desktop).")
+    print("Estimate; Claude Code sessions of the terminal's account only (not claude.ai chat).")
+    if excluded:
+        print(f"Excluded {excluded / 1e6:.1f}M tok from Claude Desktop sessions of another or unknown "
+              f"account (--all-accounts to include).")
 
 
 def watch(args):
@@ -2840,13 +3191,24 @@ def watch(args):
     from rich.table import Table
     from rich.text import Text
 
-    con = db()  # writable: records each read (deduped), plus _rate and burn from logs
+    # No connection held across ticks: DuckDB allows one writer process, and a watch left open
+    # for hours used to lock out the scheduled collect (and burn/trends/plot). Each tick opens,
+    # writes and closes; meta writes do the same.
+    def remember_interval(value: float) -> None:
+        c = _db_retry(2)
+        if c is not None:
+            _meta_set(c, "watch_interval", str(value))
+            c.close()
+
     tz = _resolve_tz()  # resolved once, before Live(screen=True) takes over — any invalid-tz
                        # warning must print here, never inside render() (would corrupt the TUI)
     show_bar = getattr(args, "usage", False)
     base = float(args.interval)
     cur = base  # adaptive poll interval: grows on 403/errors, eases back on sustained success
-    learned = _meta_get(con, "watch_interval")
+    c0 = _db_retry(2)
+    learned = _meta_get(c0, "watch_interval")
+    if c0 is not None:
+        c0.close()
     if learned and learned[1] < 7200:  # reuse an interval learned safe within the last 2h
         try:
             cur = max(base, min(float(learned[0]), 300.0))
@@ -2863,12 +3225,20 @@ def watch(args):
         30s+ (timeout+retry), and before this the terminal stayed blank the whole time."""
         if cached is None:
             try:
-                rows, _ts = _snapshot(con)  # persists each read (deduped) via watch's own con
+                rows, _ts = _snapshot()  # network first, lock-free; persists via its own short write
             except FetchError as e:
                 return Panel(Text(f"{e}\nbacking off — next try in ~{cur:.0f}s", style="red"),
                              title="cmon watch — error", border_style="red"), False
         else:
             rows = cached[0]
+        con = _db_retry(5)  # None when collect holds the lock longer: show % without history
+        try:
+            return frame(con, rows, cached)
+        finally:
+            if con is not None:
+                con.close()
+
+    def frame(con, rows, cached):
         now_utc = datetime.now(UTC)
         t = Table(expand=True, header_style="bold")
         t.add_column("Window", ratio=None if show_bar else 1)
@@ -2880,7 +3250,7 @@ def watch(args):
         t.add_column("projection", justify="right")
         proj_src = ""
         for key, lbl, pct, reset, act in rows:
-            rate = _rate(con, key)
+            rate = _rate(con, key) if con is not None else None
             rem_h = ((datetime.fromisoformat(reset) - now_utc).total_seconds() / 3600
                      if reset else None)
             proj = "-"
@@ -2900,6 +3270,10 @@ def watch(args):
         now_local = now_utc.astimezone(tz)
         if cached is not None:  # no scan/burn/alerts on the cached frame: keep it instant
             body.append(Text(f"{now_local:%H:%M:%S} · cached {cached[1]:.0f}s ago · updating…",
+                             style="dim"))
+            return Panel(Group(*body), title="cmon watch", border_style="cyan"), True
+        if con is None:
+            body.append(Text(f"{now_local:%H:%M:%S} · history busy (another cmon is writing) · ^C quits",
                              style="dim"))
             return Panel(Group(*body), title="cmon watch", border_style="cyan"), True
         win = _session_window_start(rows, now_utc)
@@ -2932,12 +3306,12 @@ def watch(args):
                     ok_streak += 1
                     if ok_streak >= 5 and cur > base:  # stable again → ease back toward base
                         cur = max(base, cur / 1.5)
-                        _meta_set(con, "watch_interval", str(cur))
+                        remember_interval(cur)
                         ok_streak = 0
                 else:  # 403/blocked/error → back off (cap 5 min), remember for next session
                     cur = min(cur * 1.8, 300.0)
                     ok_streak = 0
-                    _meta_set(con, "watch_interval", str(cur))
+                    remember_interval(cur)
                 # jitter breaks the exact robotic cadence Cloudflare bot-detection flags
                 time.sleep(cur * random.uniform(0.85, 1.15))
         except KeyboardInterrupt:
@@ -3044,9 +3418,9 @@ def _install_windows(cmd, interval_min, dry):
 
 def install(args):
     """Schedule 'cmon collect --alert' on OS native scheduler. --dry-run only shows."""
-    logdir = os.path.expanduser("~/.cmon")
+    logdir = CMON_HOME
     if not args.dry_run:
-        os.makedirs(logdir, exist_ok=True)
+        _private_dir(logdir)
     cmd = _sched_cmd()
     m = args.interval
     print(f"Scheduling every {m}min · database {os.path.abspath(DB)}\n  {' '.join(cmd)}")
@@ -3093,13 +3467,6 @@ def uninstall(args):
 
 
 def main():
-    try:
-        from dotenv import load_dotenv
-        # cwd only: the no-path form walks every ancestor dir for a .env, letting a stray
-        # parent .env inject HTTPS_PROXY / CMON_OAUTH_TOKEN_URL to exfil the token (secperf F1).
-        load_dotenv(dotenv_path=os.path.join(os.getcwd(), ".env"))
-    except Exception:
-        pass
     p = argparse.ArgumentParser(
         prog="cmon", description=__doc__.splitlines()[0],
         epilog="Token: env CLAUDE_OAUTH_TOKEN → OS vault (cmon token set) → "
@@ -3113,6 +3480,7 @@ def main():
     pn.add_argument("--no-ai", action="store_true", help="with --advice: local projections only, skip Claude")
     ps = sub.add_parser("status", help="single line for statusline/tmux/prompt (reads local cache)")
     ps.add_argument("--live", action="store_true", help="query API instead of local cache")
+    ps.add_argument("--json", action="store_true", help="versioned JSON for the menu bar/scripts")
     ptr = sub.add_parser("trends", help="consumption history: per-label summary + per-cycle peaks/anomaly")
     ptr.add_argument("--since", help="filter the summary from '24h', '7d' or ISO date")
     ptr.add_argument("--json", action="store_true", help="JSON output of the summary")
@@ -3122,6 +3490,8 @@ def main():
     pb.add_argument("--since", default="30d",
                     help="window: '24h', '7d', '30d' (default), ISO date, or 'all' for everything")
     pb.add_argument("--json", action="store_true", help="JSON output")
+    pb.add_argument("--all-accounts", action="store_true",
+                    help="include Claude Desktop sessions not tied to the terminal's account")
     pc = sub.add_parser("collect", help="save 1 snapshot to database")
     pc.add_argument("--force", action="store_true", help="save even with recent snapshot (bypass dedup)")
     pc.add_argument("--alert", action="store_true",
@@ -3148,6 +3518,8 @@ def main():
     pin.add_argument("-i", "--interval", type=int, default=20, help="minutes between collections (default 20)")
     pin.add_argument("--dry-run", action="store_true", help="show what it would do, don't install")
     sub.add_parser("uninstall", help="remove scheduling created by install")
+    pim = sub.add_parser("import", help="merge history from other cmon databases (e.g. old ./usage.duckdb)")
+    pim.add_argument("paths", nargs="+", metavar="PATH", help="source .duckdb files (opened read-only)")
     pp = sub.add_parser("plot", help="generate charts -> PNG (trajectory, pace-vs-target, burn)")
     pp.add_argument("-o", "--out", default=None,
                     help="PNG path (default: usage_YYMMDD_HHMMSS.png)")
@@ -3191,7 +3563,7 @@ def main():
         {"now": now, "status": status, "trends": trends, "collect": collect,
          "burn": burn, "watch": watch, "wait": wait, "plot": plot,
          "backtest": backtest, "tune": tune, "install": install,
-         "uninstall": uninstall}[args.cmd](args)
+         "uninstall": uninstall, "import": import_db}[args.cmd](args)
     except FetchError as e:
         sys.exit(f"cmon: {e}")
 

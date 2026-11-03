@@ -2,7 +2,7 @@
 # The terminal command remains 'cmon' via [project.scripts] below.
 [project]
 name = "cmon-cli"
-version = "0.5.0"
+version = "0.6.1"
 description = "Claude Monitor — tracks your Claude plan consumption over time"
 readme = "README.md"
 license = "MIT"
@@ -66,3 +66,6 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

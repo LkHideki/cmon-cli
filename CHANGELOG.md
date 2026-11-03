@@ -5,6 +5,101 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.1] — 2026-10-03
+
+### Added
+
+- **cmon Bar shows the 5h countdown near the reset**, not only near the limit:
+  `reset_within_min` (default 100) joins `reset_above_percent`, and the visible countdown
+  now ticks every minute on its own instead of waiting for the next data refresh.
+
+## [0.6.0] — 2026-10-03
+
+### Upgrading
+
+- History now lives in `~/.cmon/usage.duckdb`. If you ran 0.5 from several directories,
+  merge the old databases once: `cmon import ~/usage.duckdb ~/Projects/*/usage.duckdb`.
+- Token burn is re-counted per API message on the first scan (a one-off of a few seconds);
+  expect totals about half to a third of what 0.5 reported.
+- cmon no longer refreshes Claude Code's login. If Claude Code hasn't run for hours, its
+  access token may be expired until it runs again; `cmon token status` shows the expiry.
+- `.env` is read from `~/.cmon/.env` (not the current directory).
+- cmon Bar: `refresh_seconds` and `hot_*` in `bar.json` are replaced by the `refresh` rules.
+
+### Changed
+
+- **The database now defaults to `~/.cmon/usage.duckdb`** instead of `./usage.duckdb`, which
+  split history across every directory cmon ran in. `cmon import PATH...` merges old
+  databases (read-only sources; overlapping snapshots deduplicated).
+
+### Security
+
+- **`.env` is no longer read from the current directory.** A project's `.env` could set
+  `CMON_HOOK` (run with a shell on alerts), `CMON_DB`, or another account's token. Only
+  `~/.cmon/.env` and the cmon checkout's own `.env` are read, before settings load (so
+  tuning variables there now take effect); files writable by others are refused.
+- **`claude -p` runs sandboxed** from an empty private directory, so an untrusted repo's
+  `.claude/settings.json` hooks and `CLAUDE.md` don't apply to the AI tip; it and the alert
+  hook no longer inherit `CLAUDE_OAUTH_TOKEN`.
+- **`~/.cmon` is private (0700)** and a new database is created 0600 — it holds project
+  names and session ids.
+- **cmon no longer logs Claude Code out.** It used to redeem Claude Code's `refresh_token`
+  and keep the rotated chain in its own vault entry; since refresh tokens rotate on use,
+  this invalidated Claude Code's login. Claude Code's credential is now strictly read-only,
+  an expired token is reported without any request, and the old `claude-oauth-auto` vault
+  entry is deleted. `CMON_OAUTH_CLIENT_ID` / `CMON_OAUTH_TOKEN_URL` are gone.
+
+### Fixed
+
+- **Rate alerts fire once per window cycle.** `collect --alert` re-notified on every run
+  (every 20 min by default) while the projection stayed above 100%; it now keeps the same
+  per-cycle marker as the lead alert.
+- **`wait` survives network blips.** Transient failures (network, 429/5xx, a Claude Code
+  token awaiting renewal) back off exponentially up to 5 min and keep waiting, with one
+  notice instead of exiting; only unrecoverable ones (no credential, 403) stop it.
+- **A 401 retry no longer costs an attempt.** After a 401 cmon re-reads Claude Code's
+  credential once without spending a retry, so `status` (one attempt) picks up a renewed
+  token instead of reporting offline.
+- **Token burn was counted 2–3× too high.** Claude Code writes one API response as several
+  transcript lines (thinking, text, tool_use) that repeat the same usage, and copies lines
+  into resumed sessions; rows are now keyed per API message (`message.id` + `requestId`).
+  Existing history migrates once: rows from transcripts still on disk are re-read exactly,
+  rows from deleted transcripts are deduplicated heuristically (~4% residual).
+- **`watch` no longer locks out the scheduled `collect`.** It held DuckDB's single-writer
+  connection for its whole session, so `collect --alert`, `burn`, `trends` and `plot` failed
+  while it ran. Each tick now fetches first, then opens, writes and closes; `collect` waits
+  up to 30 s for the lock, and `now --advice` releases it before the slow AI tip.
+- **`status` can no longer hang or traceback.** The cache is written atomically (temp file +
+  `os.replace`, mode 0600), so a concurrent reader never sees a torn file; the DuckDB
+  fallback degrades when another cmon holds the lock; and an expired cache refetches with a
+  5 s timeout, at most once every 2 min while offline (it used to block up to 30 s on every
+  render). `config` and alert state use the same atomic write.
+- **Log scans no longer stall on large batches.** Rows are bulk-loaded through a private
+  temp CSV instead of list parameters (~100 µs/element in DuckDB); a full rescan of 1.5k
+  transcripts went from ~100 s to ~4 s.
+
+### Added
+
+- **Per-account token accounting.** Claude Code sessions run from Claude Desktop under a
+  different account no longer inflate burn, the hourly profile or `plot`; `burn` reports
+  what it excluded and `--all-accounts` brings it back.
+- **`cmon status --json`** — versioned, provider-grouped payload read from the local cache.
+- **cmon Bar refresh schedule is a list of rules** (`refresh` in `~/.cmon/bar.json`):
+  each rule sets `every_s` under optional `reset_within_min` / `usage_above_pct`
+  conditions, the shortest applicable interval wins, and the bar queries the API itself
+  on that schedule (default 10 min, tightening to 59 s in the last hour or above 87%).
+  Replaces `refresh_seconds` and `hot_*`. The menu shows when the next update is due, and
+  an invalid `bar.json` is reported instead of silently ignored.
+- **cmon Bar live countdowns.** In the last minute durations count in seconds ("Resets in
+  42s", "Updated 12s ago"); the open menu and the final minute redraw at 1 Hz, and the new
+  cycle is fetched as soon as the 5h window rolls over.
+- **cmon Bar hot mode and icon.** Above 87% of the 5h window or within its last hour the
+  bar polls the API every 59 s; a watchdog kills a wedged `cmon` child, its stderr shows in
+  the menu, and the timer keeps running while the menu is open. `install.sh` builds aside
+  before replacing the running app and draws the app icon (a two-ring quota gauge).
+- **cmon Bar** (`menubar/`) — native macOS menu bar item with a configurable compact title
+  and a per-window breakdown; installed with `menubar/install.sh`.
+
 ## [0.5.0] — 2026-08-30
 
 ### Fixed
