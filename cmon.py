@@ -151,7 +151,7 @@ PROJ_NOTE_WATCH = {"learned": "projection: profile-weighted",
                    "quiet_hours": "projection: skips quiet hours"}
 
 PROVIDER_ORDER = ("claude", "codex")
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _DATETIME_TYPE = datetime  # stable even when tests/applications inject a clock via cmon.datetime
 
 
@@ -784,6 +784,10 @@ def limits(data: dict) -> list[tuple]:
     return out
 
 
+_SNAPSHOT_COLS = ("provider,observed_at,key,role,label,percent,window_minutes,resets_at,is_active,"
+                  "source_event_id,metadata_json")
+_TOKEN_LOG_COLS = ("provider,source_event_id,observed_at,model,surface,project,session_id,input_tokens,output_tokens,"
+                   "reasoning_tokens,cache_read_tokens,cache_write_tokens,source_version,metadata_json")
 _SCHEMA_TABLES = ("snapshots", "token_log", "scanned", "forecasts", "codex_turns", "meta")
 _MIGRATION_TEST_HOOK = None
 
@@ -808,18 +812,19 @@ def _table_columns(con, table: str) -> set[str]:
 
 
 def _create_token_log(con, name: str = "token_log") -> None:
+    """No unique index, here or on snapshots: on 200k rows the indexes took more space than all
+    the data (72 MB vs 22 MB). cmon is DuckDB's only writer, so inserts dedupe with an anti-join
+    on source_event_id (11 ms) instead. A provider's logical key goes in source_event_id."""
     con.execute(
         f"CREATE TABLE IF NOT EXISTS {name}("
-        "provider TEXT NOT NULL, source_event_id TEXT NOT NULL, "
-        "observed_at TIMESTAMPTZ NOT NULL, ingested_at TIMESTAMPTZ NOT NULL, "
-        "thread_id TEXT NOT NULL, turn_id TEXT NOT NULL, model TEXT NOT NULL, surface TEXT NOT NULL, "
+        "provider TEXT NOT NULL, source_event_id TEXT NOT NULL, observed_at TIMESTAMPTZ NOT NULL, "
+        "model TEXT NOT NULL, surface TEXT NOT NULL, "
         "project TEXT NOT NULL, session_id TEXT NOT NULL, input_tokens BIGINT NOT NULL, "
         "output_tokens BIGINT NOT NULL, reasoning_tokens BIGINT NOT NULL, cache_read_tokens BIGINT NOT NULL, "
         "cache_write_tokens BIGINT NOT NULL, source_version BIGINT NOT NULL, metadata_json TEXT, "
         "CHECK(input_tokens >= 0), CHECK(output_tokens >= 0), CHECK(reasoning_tokens >= 0), "
         "CHECK(cache_read_tokens >= 0), CHECK(cache_write_tokens >= 0), CHECK(source_version >= 0), "
-        "CHECK(reasoning_tokens <= output_tokens), "
-        "PRIMARY KEY(provider, thread_id, turn_id), UNIQUE(provider, source_event_id))"
+        "CHECK(reasoning_tokens <= output_tokens))"
     )
 
 
@@ -837,12 +842,11 @@ def _create_token_terminal(con) -> None:
 def _create_schema_tables(con) -> None:
     con.execute(
         "CREATE TABLE IF NOT EXISTS snapshots("
-        "provider TEXT NOT NULL, observed_at TIMESTAMPTZ NOT NULL, ingested_at TIMESTAMPTZ NOT NULL, "
+        "provider TEXT NOT NULL, observed_at TIMESTAMPTZ NOT NULL, "
         "key TEXT NOT NULL, role TEXT NOT NULL, label TEXT NOT NULL, percent DOUBLE NOT NULL, "
         "window_minutes INTEGER NOT NULL, resets_at TIMESTAMPTZ, is_active BOOL, "
-        "source_event_id TEXT NOT NULL, metadata_json TEXT, "
-        "CHECK(isfinite(percent) AND percent BETWEEN 0 AND 100), CHECK(window_minutes > 0), "
-        "UNIQUE(provider, source_event_id, key))"
+        "source_event_id TEXT, metadata_json TEXT, "
+        "CHECK(isfinite(percent) AND percent BETWEEN 0 AND 100), CHECK(window_minutes > 0))"
     )
     _create_token_log(con)
     con.execute(
@@ -873,9 +877,8 @@ def _create_schema_tables(con) -> None:
 
 def _validate_current_schema(con) -> None:
     required = {
-        "snapshots": {"provider", "observed_at", "ingested_at", "key", "role", "window_minutes",
-                      "source_event_id"},
-        "token_log": {"provider", "source_event_id", "observed_at", "thread_id", "turn_id",
+        "snapshots": {"provider", "observed_at", "key", "role", "window_minutes", "source_event_id"},
+        "token_log": {"provider", "source_event_id", "observed_at",
                       "input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens",
                       "cache_write_tokens", "source_version"},
         "scanned": {"provider", "path", "cursor", "file_identity", "fingerprint", "size", "mtime"},
@@ -889,7 +892,7 @@ def _validate_current_schema(con) -> None:
             raise MigrationError(f"schema v{SCHEMA_VERSION} table {table} is missing {sorted(missing)}")
 
 
-def _migrate_snapshots(con, migrated_at: datetime) -> None:
+def _migrate_snapshots(con) -> None:
     """Set-based, like the other big table: binding rows from Python took ~95 s on a real
     database (88k snapshots, 205k token rows), long enough to trip callers' timeouts."""
     table = "__legacy_snapshots"
@@ -899,19 +902,15 @@ def _migrate_snapshots(con, migrated_at: datetime) -> None:
     if not {"ts", "key", "label", "percent", "resets_at", "is_active"} <= cols:
         raise MigrationError("legacy snapshots schema is not recognized")
     con.execute(
-        "INSERT INTO snapshots(provider,observed_at,ingested_at,key,role,label,percent,window_minutes,"
-        "resets_at,is_active,source_event_id,metadata_json) "
-        "SELECT 'claude', ts, ?, key, "
+        f"INSERT INTO snapshots({_SNAPSHOT_COLS}) "
+        "SELECT 'claude', ts, key, "
         f"CASE WHEN key='session' THEN '{WindowRole.FIVE_HOUR.value}' ELSE '{WindowRole.WEEKLY.value}' END, label, "
-        "percent, CASE WHEN key='session' THEN 300 ELSE 10080 END, resets_at, is_active, "
-        "'legacy-snapshot:' || (row_number() OVER (ORDER BY ts,key,label,percent,resets_at NULLS LAST) - 1) "
-        "|| ':' || md5(concat_ws('|', ts, key, label, percent, resets_at, is_active)), NULL "
-        f"FROM {table}",
-        [migrated_at],
+        "percent, CASE WHEN key='session' THEN 300 ELSE 10080 END, resets_at, is_active, NULL, NULL "
+        f"FROM {table} ORDER BY ts"
     )
 
 
-def _migrate_token_log(con, migrated_at: datetime) -> None:
+def _migrate_token_log(con) -> None:
     table = "__legacy_token_log"
     if not _table_exists(con, table):
         return
@@ -920,15 +919,28 @@ def _migrate_token_log(con, migrated_at: datetime) -> None:
     if not required <= cols:
         raise MigrationError("legacy token_log schema is not recognized")
     entrypoint = "entrypoint" if "entrypoint" in cols else "NULL"
-    session = """coalesce("session", '?')"""
     con.execute(
-        "INSERT INTO token_log(provider,source_event_id,observed_at,ingested_at,thread_id,turn_id,model,"
-        "surface,project,session_id,input_tokens,output_tokens,reasoning_tokens,cache_read_tokens,"
-        "cache_write_tokens,source_version,metadata_json) "
-        f"SELECT 'claude', uuid::TEXT, ts, ?, {session}, uuid::TEXT, coalesce(model, '?'), "
-        f"coalesce({entrypoint}, '?'), coalesce(project, '?'), {session}, coalesce(in_tok, 0), coalesce(out_tok, 0), "
-        f"0, coalesce(cache_read, 0), coalesce(cache_create, 0), 0, NULL FROM {table}",
-        [migrated_at],
+        f"INSERT INTO token_log({_TOKEN_LOG_COLS}) "
+        f"SELECT 'claude', uuid::TEXT, ts, coalesce(model, '?'), coalesce({entrypoint}, '?'), coalesce(project, '?'), "
+        """coalesce("session", '?'), coalesce(in_tok, 0), coalesce(out_tok, 0), 0, coalesce(cache_read, 0), """
+        f"coalesce(cache_create, 0), 0, NULL FROM {table} ORDER BY ts"
+    )
+
+
+def _migrate_v1_tables(con) -> None:
+    """v1 -> v2: same data without the indexes and duplicated columns. Claude's snapshot ids
+    are dropped because nothing reads them; its token keys stay, they are what dedupes."""
+    con.execute(
+        f"INSERT INTO snapshots({_SNAPSHOT_COLS}) "
+        "SELECT provider, observed_at, key, role, label, percent, window_minutes, resets_at, is_active, "
+        "CASE WHEN provider = 'claude' THEN NULL ELSE source_event_id END, metadata_json "
+        "FROM __legacy_snapshots ORDER BY observed_at"
+    )
+    con.execute(
+        f"INSERT INTO token_log({_TOKEN_LOG_COLS}) "
+        "SELECT provider, source_event_id, observed_at, model, surface, project, session_id, input_tokens, "
+        "output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens, source_version, metadata_json "
+        "FROM __legacy_token_log ORDER BY observed_at"
     )
 
 
@@ -1000,8 +1012,9 @@ def _validate_migration_counts(con, legacy_tables: Collection[str]) -> None:
                 raise MigrationError(f"{table} migration count mismatch: {old_count} != {new_count}")
 
 
-def _ensure_schema(con) -> None:
-    """Create or atomically migrate the persistent schema; version is written last."""
+def _ensure_schema(con) -> bool:
+    """Create or atomically migrate the persistent schema; version is written last. True if
+    existing data was rewritten, which leaves free space in the file."""
     version = None
     if _table_exists(con, "meta") and "key" in _table_columns(con, "meta"):
         row = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
@@ -1019,7 +1032,7 @@ def _ensure_schema(con) -> None:
                 _create_schema_tables(con)
                 _validate_current_schema(con)
                 con.execute("COMMIT")
-                return
+                return False
             except Exception as exc:
                 try:
                     con.execute("ROLLBACK")
@@ -1031,15 +1044,29 @@ def _ensure_schema(con) -> None:
 
     existing = {table for table in _SCHEMA_TABLES if _table_exists(con, table)}
     # A current-looking schema that lost only its version marker can be adopted safely.
-    current_unversioned = (
-        "snapshots" in existing
-        and {"provider", "observed_at", "source_event_id"} <= _table_columns(con, "snapshots")
-    )
+    snapshot_cols = _table_columns(con, "snapshots")
+    provider_aware = {"provider", "observed_at", "source_event_id"} <= snapshot_cols
+    current_unversioned = provider_aware and "ingested_at" not in snapshot_cols
+    v1 = provider_aware and "ingested_at" in snapshot_cols
     try:
         con.execute("BEGIN TRANSACTION")
         if current_unversioned:
             _create_schema_tables(con)
             _validate_current_schema(con)
+        elif v1:
+            con.execute("DROP VIEW IF EXISTS token_terminal")
+            rewritten = {"snapshots", "token_log"}
+            for table in sorted(rewritten):
+                con.execute(f"ALTER TABLE {table} RENAME TO __legacy_{table}")
+            _migration_hook("staged")
+            _create_schema_tables(con)
+            _migrate_v1_tables(con)
+            _migration_hook("copied")
+            _validate_migration_counts(con, {f"__legacy_{t}" for t in rewritten})
+            _migration_hook("validated")
+            for table in sorted(rewritten):
+                con.execute(f"DROP TABLE __legacy_{table}")
+            _migration_hook("swapped")
         else:
             con.execute("DROP VIEW IF EXISTS token_terminal")
             for table in sorted(existing):
@@ -1047,13 +1074,13 @@ def _ensure_schema(con) -> None:
             _migration_hook("staged")
             _create_schema_tables(con)
             migrated_at = datetime.now(UTC)
-            _migrate_snapshots(con, migrated_at)
-            _migrate_token_log(con, migrated_at)
+            _migrate_snapshots(con)
+            _migrate_token_log(con)
             _migrate_scanned(con, migrated_at)
             _migrate_forecasts(con, migrated_at)
             _migrate_meta(con)
             _migration_hook("copied")
-            _validate_migration_counts(con, existing)
+            _validate_migration_counts(con, {f"__legacy_{table}" for table in existing})
             _migration_hook("validated")
             for table in sorted(existing):
                 con.execute(f"DROP TABLE __legacy_{table}")
@@ -1066,6 +1093,7 @@ def _ensure_schema(con) -> None:
         )
         _migration_hook("versioned")
         con.execute("COMMIT")
+        return bool(existing) and not current_unversioned and "snapshots" in existing
     except Exception as exc:
         try:
             con.execute("ROLLBACK")
@@ -1074,6 +1102,35 @@ def _ensure_schema(con) -> None:
         if isinstance(exc, MigrationError):
             raise
         raise MigrationError(f"database migration to schema v{SCHEMA_VERSION} failed: {exc}") from exc
+
+
+def _compact(con):
+    """Rewrite the database into a new file and swap it in: DuckDB reuses freed space but never
+    returns it to the disk. Only after a migration. On failure the original stays as it was."""
+    import duckdb
+    tmp = f"{DB}.compact"
+    for leftover in (tmp, f"{tmp}.wal"):
+        if os.path.exists(leftover):
+            os.unlink(leftover)
+    try:
+        name = con.execute("SELECT current_database()").fetchone()[0].replace('"', '""')
+        con.execute("CHECKPOINT")
+        con.execute(f"""ATTACH '{tmp.replace("'", "''")}' AS __compact""")
+        con.execute(f'COPY FROM DATABASE "{name}" TO __compact')
+        con.execute("DETACH __compact")
+        con.close()
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, DB)
+    except Exception:
+        for leftover in (tmp, f"{tmp}.wal"):
+            if os.path.exists(leftover):
+                os.unlink(leftover)
+        try:
+            con.execute("SELECT 1")  # still open: compaction failed before the swap
+            return con
+        except Exception:
+            pass
+    return duckdb.connect(DB)
 
 
 def db(create: bool = True):
@@ -1095,10 +1152,12 @@ def db(create: bool = True):
         except OSError:
             pass
     try:
-        _ensure_schema(con)
+        migrated = _ensure_schema(con)
     except Exception:
         con.close()
         raise
+    if migrated:
+        con = _compact(con)
     return con
 
 
@@ -1205,13 +1264,12 @@ def _recent(con, ts) -> bool:
 
 
 def _claude_snapshot_records(rows, observed_at: datetime) -> list[tuple]:
-    source_event_id = f"claude-api:{observed_at.isoformat()}"
     out = []
     for key, label, percent, resets_at, is_active in rows:
         role = WindowRole.FIVE_HOUR.value if key == "session" else WindowRole.WEEKLY.value
         window_minutes = 300 if role == WindowRole.FIVE_HOUR.value else 10080
-        out.append(("claude", observed_at, observed_at, key, role, label, percent, window_minutes,
-                    resets_at, is_active, source_event_id, None))
+        out.append(("claude", observed_at, key, role, label, percent, window_minutes,
+                    resets_at, is_active, None, None))
     return out
 
 
@@ -1255,8 +1313,7 @@ def _snapshot(con=None):
         c = db() if own else con
         if not _recent(c, ts):
             c.executemany(
-                "INSERT INTO snapshots(provider,observed_at,ingested_at,key,role,label,percent,window_minutes,"
-                "resets_at,is_active,source_event_id,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                f"INSERT INTO snapshots({_SNAPSHOT_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 _claude_snapshot_records(rows, ts),
             )
         if own:
@@ -1279,8 +1336,7 @@ def collect(args):
         return
     rows = limits(fetch())
     con.executemany(
-        "INSERT INTO snapshots(provider,observed_at,ingested_at,key,role,label,percent,window_minutes,"
-        "resets_at,is_active,source_event_id,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        f"INSERT INTO snapshots({_SNAPSHOT_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         _claude_snapshot_records(rows, ts),
     )
     _write_cache(rows, ts)
@@ -1322,17 +1378,14 @@ def import_db(args):
             current = "observed_at" in src_cols("snapshots")
             ts, only = ("observed_at", "WHERE provider='claude'") if current else ("ts", "")
             con.execute(
-                "INSERT INTO snapshots(provider,observed_at,ingested_at,key,role,label,percent,window_minutes,"
-                "resets_at,is_active,source_event_id) "
-                "SELECT 'claude', s.t, ?, s.key, CASE WHEN s.key='session' THEN '5h' ELSE 'weekly' END, s.label, "
-                "s.percent, CASE WHEN s.key='session' THEN 300 ELSE 10080 END, s.resets_at, s.is_active, "
-                "'import:' || md5(concat_ws('|', s.t, s.key, s.percent)) || ':' || s.n FROM ("
-                f"SELECT {ts} t, key, label, percent, resets_at, is_active, row_number() OVER () n "
-                f"FROM {alias}.snapshots {only}) s "
+                f"INSERT INTO snapshots({_SNAPSHOT_COLS}) "
+                "SELECT 'claude', s.t, s.key, CASE WHEN s.key='session' THEN '5h' ELSE 'weekly' END, s.label, "
+                "s.percent, CASE WHEN s.key='session' THEN 300 ELSE 10080 END, s.resets_at, s.is_active, NULL, NULL "
+                f"FROM (SELECT {ts} t, key, label, percent, resets_at, is_active FROM {alias}.snapshots {only}) s "
                 "WHERE isfinite(s.percent) AND s.percent BETWEEN 0 AND 100 AND NOT EXISTS ("
                 "SELECT 1 FROM snapshots t WHERE t.provider='claude' AND t.key = s.key "
                 "AND t.observed_at BETWEEN s.t - to_seconds(?) AND s.t + to_seconds(?))",
-                [imported_at, DEDUP_SECS, DEDUP_SECS])
+                [DEDUP_SECS, DEDUP_SECS])
         if "forecasts" in tables:
             current = "observed_at" in src_cols("forecasts")
             ts, only = ("observed_at", "WHERE provider='claude'") if current else ("ts", "")
@@ -1351,15 +1404,15 @@ def import_db(args):
             n0 = con.execute("SELECT count(*) FROM token_log").fetchone()[0]
             if "source_event_id" in cols:
                 con.execute(f"INSERT INTO token_log({_TOKEN_LOG_COLS}) SELECT {_TOKEN_LOG_COLS} "
-                            f"FROM {alias}.token_log WHERE provider='claude' ON CONFLICT DO NOTHING")
+                            f"FROM {alias}.token_log WHERE provider='claude' AND source_event_id NOT IN "
+                            "(SELECT source_event_id FROM token_log WHERE provider='claude')")
             elif "entrypoint" in cols:
                 con.execute(
                     f"INSERT INTO token_log({_TOKEN_LOG_COLS}) "
-                    "SELECT 'claude', uuid, ts, ?, coalesce(session, '?'), uuid, coalesce(model, '?'), "
-                    "coalesce(entrypoint, '?'), coalesce(project, '?'), coalesce(session, '?'), "
-                    "coalesce(in_tok, 0), coalesce(out_tok, 0), 0, coalesce(cache_read, 0), "
-                    f"coalesce(cache_create, 0), 0, NULL FROM {alias}.token_log ON CONFLICT DO NOTHING",
-                    [imported_at])
+                    "SELECT 'claude', uuid, ts, coalesce(model, '?'), coalesce(entrypoint, '?'), "
+                    "coalesce(project, '?'), coalesce(session, '?'), coalesce(in_tok, 0), coalesce(out_tok, 0), 0, "
+                    f"coalesce(cache_read, 0), coalesce(cache_create, 0), 0, NULL FROM {alias}.token_log "
+                    "WHERE uuid NOT IN (SELECT source_event_id FROM token_log WHERE provider='claude')")
             tokens = con.execute("SELECT count(*) FROM token_log").fetchone()[0] - n0
         con.execute(f"DETACH {alias}")
         added = {t: con.execute(f"SELECT count(*) FROM {t} WHERE provider='claude'").fetchone()[0] - before[t]
@@ -2954,8 +3007,8 @@ def scan_logs(con, since=None, quiet: bool = False) -> None:
             _migrate_token_keys(con)
         else:
             con.execute(
-                f"INSERT INTO token_log({_TOKEN_LOG_COLS}) SELECT {_fresh_as_token_log()} FROM _fresh "
-                "ON CONFLICT DO NOTHING", [datetime.now(UTC)])
+                f"INSERT INTO token_log({_TOKEN_LOG_COLS}) SELECT {_FRESH_AS_TOKEN_LOG} FROM _fresh "
+                "WHERE uuid NOT IN (SELECT source_event_id FROM token_log WHERE provider='claude')")
         con.execute("DROP TABLE _fresh")
     elif migrate:
         _meta_set(con, TOKEN_KEY_META, "v2")
@@ -2976,17 +3029,10 @@ def scan_logs(con, since=None, quiet: bool = False) -> None:
         )
 
 
-_TOKEN_LOG_COLS = ("provider,source_event_id,observed_at,ingested_at,thread_id,turn_id,model,surface,project,"
-                   "session_id,input_tokens,output_tokens,reasoning_tokens,cache_read_tokens,cache_write_tokens,"
-                   "source_version,metadata_json")
-
-
-def _fresh_as_token_log() -> str:
-    """SELECT list mapping a _fresh row onto _TOKEN_LOG_COLS; binds ingested_at as one parameter."""
-    return ("'claude', uuid, ts, ?, coalesce(\"session\", '?'), uuid, coalesce(model, '?'), "
-            "coalesce(entrypoint, '?'), coalesce(project, '?'), coalesce(\"session\", '?'), "
-            "coalesce(in_tok, 0), coalesce(out_tok, 0), 0, coalesce(cache_read, 0), coalesce(cache_create, 0), "
-            "0, NULL")
+# One _fresh row as _TOKEN_LOG_COLS.
+_FRESH_AS_TOKEN_LOG = ("'claude', uuid, ts, coalesce(model, '?'), coalesce(entrypoint, '?'), coalesce(project, '?'), "
+                       "coalesce(\"session\", '?'), coalesce(in_tok, 0), coalesce(out_tok, 0), 0, "
+                       "coalesce(cache_read, 0), coalesce(cache_create, 0), 0, NULL")
 
 
 def _stage_token_rows(con, rows) -> None:
@@ -3033,8 +3079,7 @@ def _migrate_token_keys(con) -> None:
         con.execute("DROP TABLE IF EXISTS token_log_new")
         _create_token_log(con, "token_log_new")
         con.execute(
-            f"INSERT INTO token_log_new({_TOKEN_LOG_COLS}) SELECT {_fresh_as_token_log()} FROM _fresh",
-            [datetime.now(UTC)])
+            f"INSERT INTO token_log_new({_TOKEN_LOG_COLS}) SELECT {_FRESH_AS_TOKEN_LOG} FROM _fresh")
         con.execute(
             f"INSERT INTO token_log_new({_TOKEN_LOG_COLS}) SELECT {_TOKEN_LOG_COLS} FROM token_log "
             "WHERE provider <> 'claude' OR (source_event_id LIKE '%:%' "

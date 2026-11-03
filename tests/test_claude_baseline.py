@@ -23,11 +23,10 @@ def _seed_history() -> None:
     rows = []
     for ordinal, (observed_at, key, label, percent, resets_at, is_active) in enumerate(legacy_rows):
         role, window_minutes = ("5h", 300) if key == "session" else ("weekly", 10080)
-        rows.append(("claude", observed_at, observed_at, key, role, label, percent, window_minutes,
+        rows.append(("claude", observed_at, key, role, label, percent, window_minutes,
                      resets_at, is_active, f"baseline-snapshot-{ordinal}", None))
     con.executemany(
-        "INSERT INTO snapshots(provider,observed_at,ingested_at,key,role,label,percent,window_minutes,"
-        "resets_at,is_active,source_event_id,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        f"INSERT INTO snapshots({cmon._SNAPSHOT_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         rows,
     )
     con.close()

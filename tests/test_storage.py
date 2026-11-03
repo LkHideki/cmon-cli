@@ -102,32 +102,27 @@ def test_new_schema_is_versioned_idempotent_and_multi_provider(tmp_path, monkeyp
     path = tmp_path / "new.duckdb"
     monkeypatch.setattr(cmon, "DB", str(path))
     con = cmon.db()
-    assert con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone() == ("1",)
+    assert con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone() == (str(cmon.SCHEMA_VERSION),)
     columns = {row[1] for row in con.execute("PRAGMA table_info('scanned')").fetchall()}
     assert {"provider", "path", "cursor", "file_identity", "fingerprint", "size", "mtime"} <= columns
     turn_columns = {row[1] for row in con.execute("PRAGMA table_info('codex_turns')").fetchall()}
     assert {"thread_id", "turn_id", "reasoning_effort", "source_version", "reasoning_tokens"} <= turn_columns
-    row = [NOW, NOW, "primary", "5h", "Five hours", 10.0, 300, NOW + timedelta(hours=5), True,
+    row = [NOW, "primary", "5h", "Five hours", 10.0, 300, NOW + timedelta(hours=5), True,
            "same-event", None]
     for provider in ("claude", "codex"):
         con.execute(
-            "INSERT INTO snapshots(provider,observed_at,ingested_at,key,role,label,percent,window_minutes,"
-            "resets_at,is_active,source_event_id,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            f"INSERT INTO snapshots({cmon._SNAPSHOT_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             [provider, *row],
         )
     con.execute(
-        "INSERT INTO snapshots(provider,observed_at,ingested_at,key,role,label,percent,window_minutes,"
-        "resets_at,is_active,source_event_id,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        ["codex", NOW, NOW, "secondary", "weekly", "Weekly", 20.0, 10080, None, True,
+        f"INSERT INTO snapshots({cmon._SNAPSHOT_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        ["codex", NOW, "secondary", "weekly", "Weekly", 20.0, 10080, None, True,
          "same-event", None],
     )
     assert con.execute("SELECT count(*) FROM snapshots").fetchone() == (3,)
-    with pytest.raises(duckdb.ConstraintException):
-        con.execute(
-            "INSERT INTO snapshots(provider,observed_at,ingested_at,key,role,label,percent,window_minutes,"
-            "resets_at,is_active,source_event_id,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            ["codex", *row],
-        )
+    indexes = con.execute("SELECT table_name FROM duckdb_constraints() WHERE constraint_type IN "
+                          "('UNIQUE','PRIMARY KEY') AND table_name IN ('snapshots','token_log')").fetchall()
+    assert indexes == []  # they took more space than the data; see _create_token_log
     con.close()
     con = cmon.db()
     assert con.execute("SELECT count(*) FROM snapshots").fetchone() == (3,)
@@ -181,21 +176,127 @@ def test_legacy_migration_preserves_counts_values_and_namespaces(tmp_path, monke
     monkeypatch.setattr(cmon, "DB", str(path))
     con = cmon.db()
     assert con.execute("SELECT count(*) FROM snapshots").fetchone() == (2,)
-    assert con.execute("SELECT count(DISTINCT source_event_id) FROM snapshots").fetchone() == (2,)
     assert con.execute("SELECT count(*) FROM forecasts").fetchone() == (2,)
     assert con.execute(
-        "SELECT provider,thread_id,turn_id,surface,input_tokens,output_tokens,reasoning_tokens,"
+        "SELECT provider,session_id,source_event_id,surface,input_tokens,output_tokens,reasoning_tokens,"
         "cache_read_tokens,cache_write_tokens FROM token_log"
     ).fetchone() == ("claude", "session-1", "uuid-1", "?", 1, 2, 0, 3, 4)
     assert con.execute("SELECT provider,path,cursor,size FROM scanned").fetchone() == (
         "claude", "/logs/a.jsonl", 123, 123,
     )
     assert con.execute("SELECT value FROM meta WHERE key='claude:model_params'").fetchone() == ('{"blend":0.5}',)
-    assert con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone() == ("1",)
+    assert con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone() == (str(cmon.SCHEMA_VERSION),)
     assert con.execute("SELECT DISTINCT provider,role,window_minutes FROM snapshots").fetchone() == (
         "claude", "5h", 300,
     )
     con.close()
+
+
+V1_SNAPSHOTS = ("CREATE TABLE snapshots(provider TEXT NOT NULL, observed_at TIMESTAMPTZ NOT NULL, "
+                "ingested_at TIMESTAMPTZ NOT NULL, key TEXT NOT NULL, role TEXT NOT NULL, label TEXT NOT NULL, "
+                "percent DOUBLE NOT NULL, window_minutes INTEGER NOT NULL, resets_at TIMESTAMPTZ, is_active BOOL, "
+                "source_event_id TEXT NOT NULL, metadata_json TEXT, UNIQUE(provider, source_event_id, key))")
+V1_TOKENS = ("CREATE TABLE token_log(provider TEXT NOT NULL, source_event_id TEXT NOT NULL, "
+             "observed_at TIMESTAMPTZ NOT NULL, ingested_at TIMESTAMPTZ NOT NULL, thread_id TEXT NOT NULL, "
+             "turn_id TEXT NOT NULL, model TEXT NOT NULL, surface TEXT NOT NULL, project TEXT NOT NULL, "
+             "session_id TEXT NOT NULL, input_tokens BIGINT NOT NULL, output_tokens BIGINT NOT NULL, "
+             "reasoning_tokens BIGINT NOT NULL, cache_read_tokens BIGINT NOT NULL, cache_write_tokens BIGINT NOT NULL, "
+             "source_version BIGINT NOT NULL, metadata_json TEXT, PRIMARY KEY(provider, thread_id, turn_id), "
+             "UNIQUE(provider, source_event_id))")
+
+
+def _create_v1_database(path, rows=3000):
+    con = duckdb.connect(str(path))
+    con.execute(V1_SNAPSHOTS)
+    con.execute(V1_TOKENS)
+    con.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT, ts TEXT)")
+    con.execute("CREATE TABLE session_account(session TEXT PRIMARY KEY, account TEXT)")
+    con.execute("CREATE VIEW token_terminal AS SELECT * FROM token_log WHERE provider = 'claude'")
+    con.execute("INSERT INTO meta VALUES ('schema_version', '1', NULL), ('terminal_account', 'acct', NULL)")
+    con.execute("INSERT INTO session_account VALUES ('s0', 'acct')")
+    con.execute(
+        "INSERT INTO snapshots SELECT 'claude', TIMESTAMPTZ '2026-01-01 00:00:00+00' + INTERVAL (i) MINUTE, now(), "
+        "'session', '5h', 'Current session', (i % 100)::DOUBLE, 300, NULL, true, 'legacy-snapshot:' || md5(i::TEXT), "
+        f"NULL FROM range({rows}) t(i)")
+    con.execute(
+        "INSERT INTO token_log SELECT 'claude', md5(i::TEXT) || ':' || md5((i + 1)::TEXT), "
+        "TIMESTAMPTZ '2026-01-01 00:00:00+00' + INTERVAL (i) MINUTE, now(), 's' || (i % 7), "
+        "md5(i::TEXT) || ':' || md5((i + 1)::TEXT), 'claude-opus', 'cli', 'proj', 's' || (i % 7), "
+        "1, 2, 0, 3, 4, 0, NULL "
+        f"FROM range({rows}) t(i)")
+    con.close()
+
+
+def test_v1_migrates_keeping_all_data_and_shrinks_the_file(tmp_path, monkeypatch):
+    path = tmp_path / "v1.duckdb"
+    _create_v1_database(path)
+    before = path.stat().st_size
+    monkeypatch.setattr(cmon, "DB", str(path))
+    con = cmon.db()
+    assert con.execute("SELECT count(*), sum(percent) FROM snapshots").fetchone() == (3000, 148500.0)
+    assert con.execute("SELECT count(*), sum(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens) "
+                       "FROM token_log").fetchone() == (3000, 30000)
+    assert con.execute("SELECT count(*) FROM token_terminal").fetchone() == (3000,)  # view rebuilt
+    assert con.execute("SELECT value FROM meta WHERE key='terminal_account'").fetchone() == ("acct",)
+    assert con.execute("SELECT count(*) FROM session_account").fetchone() == (1,)
+    assert con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone() == ("2",)
+    assert "ingested_at" not in {r[1] for r in con.execute("PRAGMA table_info('snapshots')").fetchall()}
+    con.close()
+    assert path.stat().st_size < before
+    assert not (tmp_path / "v1.duckdb.compact").exists()
+    assert path.stat().st_mode & 0o077 == 0
+    con = cmon.db()  # idempotent: reopening neither migrates nor compacts again
+    assert con.execute("SELECT count(*) FROM token_log").fetchone() == (3000,)
+    con.close()
+
+
+@pytest.mark.parametrize("phase", ["staged", "copied", "validated", "swapped", "versioned"])
+def test_v1_migration_failure_rolls_back_and_can_retry(tmp_path, monkeypatch, phase):
+    path = tmp_path / f"v1-{phase}.duckdb"
+    _create_v1_database(path, rows=50)
+    monkeypatch.setattr(cmon, "DB", str(path))
+
+    def fail(current):
+        if current == phase:
+            raise RuntimeError(f"boom at {phase}")
+
+    monkeypatch.setattr(cmon, "_MIGRATION_TEST_HOOK", fail)
+    with pytest.raises(cmon.MigrationError, match="migration"):
+        cmon.db()
+    raw = duckdb.connect(str(path))
+    assert raw.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone() == ("1",)
+    assert raw.execute("SELECT count(*) FROM token_terminal").fetchone() == (50,)
+    assert "ingested_at" in {r[1] for r in raw.execute("PRAGMA table_info('token_log')").fetchall()}
+    raw.close()
+    monkeypatch.setattr(cmon, "_MIGRATION_TEST_HOOK", None)
+    con = cmon.db()
+    assert con.execute("SELECT count(*) FROM token_log").fetchone() == (50,)
+    con.close()
+
+
+def test_migration_rejects_a_row_count_mismatch(tmp_path, monkeypatch):
+    path = tmp_path / "mismatch.duckdb"
+    _create_legacy_database(path)
+    monkeypatch.setattr(cmon, "DB", str(path))
+    monkeypatch.setattr(cmon, "_migrate_token_log", lambda _con: None)  # loses every token row
+    with pytest.raises(cmon.MigrationError, match="count mismatch"):
+        cmon.db()
+    raw = duckdb.connect(str(path))
+    assert raw.execute("SELECT count(*) FROM token_log").fetchone() == (1,)
+    raw.close()
+
+
+def test_failed_compaction_keeps_the_database_working(tmp_path, monkeypatch):
+    path = tmp_path / "v1.duckdb"
+    _create_v1_database(path, rows=50)
+    monkeypatch.setattr(cmon, "DB", str(path))
+    real = cmon.os.replace
+    monkeypatch.setattr(cmon.os, "replace", lambda *_a: (_ for _ in ()).throw(OSError("no swap")))
+    con = cmon.db()
+    assert con.execute("SELECT count(*) FROM token_log").fetchone() == (50,)
+    con.close()
+    monkeypatch.setattr(cmon.os, "replace", real)
+    assert not (tmp_path / "v1.duckdb.compact").exists()
 
 
 @pytest.mark.parametrize("phase", ["staged", "copied", "validated", "swapped", "versioned"])

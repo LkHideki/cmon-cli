@@ -44,9 +44,9 @@ def test_one_row_per_api_message_across_lines_and_forked_transcripts(home):
 
 def test_legacy_rows_migrate_exact_when_on_disk_and_heuristic_when_deleted(home):
     con = cmon.db()
-    legacy = lambda uuid, at, out=20: ("claude", uuid, at, T0, "s0", uuid, "claude-opus-4-1", "cli", "proj",  # noqa: E731
+    legacy = lambda uuid, at, out=20: ("claude", uuid, at, "claude-opus-4-1", "cli", "proj",  # noqa: E731
                                        "s0", 10, out, 0, 300, 40, 0, None)
-    con.executemany(f"INSERT INTO token_log({cmon._TOKEN_LOG_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [
+    con.executemany(f"INSERT INTO token_log({cmon._TOKEN_LOG_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [
         # transcript still on disk: three line-keyed rows of one message
         legacy("u0", T0), legacy("u1", T0 + timedelta(seconds=1)), legacy("u2", T0 + timedelta(seconds=2)),
         # transcript already deleted: two lines of one message + a distinct message an hour later
@@ -61,9 +61,7 @@ def test_legacy_rows_migrate_exact_when_on_disk_and_heuristic_when_deleted(home)
     keys = sorted(r[0] for r in con.execute("SELECT source_event_id FROM token_log").fetchall())
     assert keys == ["d0", "d2", "d3", "msg_A:req_A"]
     assert cmon._meta_get(con, cmon.TOKEN_KEY_META)[0] == "v2"
-    pk = con.execute("SELECT count(*) FROM duckdb_constraints() WHERE table_name = 'token_log' "
-                     "AND constraint_type = 'PRIMARY KEY'").fetchone()[0]
-    assert pk == 1
+    assert con.execute("SELECT count(*) FROM token_terminal").fetchone()[0] == 4  # view survives the rebuild
 
 
 def test_import_after_migration_triggers_rededupe(home, tmp_path):

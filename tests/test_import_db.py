@@ -51,10 +51,10 @@ def test_import_reads_a_current_schema_source(home):
     src = home / "current.duckdb"
     cmon_db, cmon.DB = cmon.DB, str(src)
     con = cmon.db()
-    con.executemany("INSERT INTO snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", [
-        ("claude", t0, t0, "session", "5h", "Current session", 10.0, 300, None, True, "e1", None)])
+    con.executemany(f"INSERT INTO snapshots({cmon._SNAPSHOT_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?)", [
+        ("claude", t0, "session", "5h", "Current session", 10.0, 300, None, True, None, None)])
     con.execute(f"INSERT INTO token_log({cmon._TOKEN_LOG_COLS}) VALUES "
-                "('claude','k:1',?,?,'s','k:1','m','cli','p','s',1,2,0,3,4,0,NULL)", [t0, t0])
+                "('claude','k:1',?,'m','cli','p','s',1,2,0,3,4,0,NULL)", [t0])
     con.close()
     cmon.DB = cmon_db
 
