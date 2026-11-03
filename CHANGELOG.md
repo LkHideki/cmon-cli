@@ -24,6 +24,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - The migration's row count check never ran, because it compared names that could not match.
+- The lock file now uses DuckDB 2.0.0, like an installed cmon: files it writes can't be opened by
+  1.5.4, so `uv run cmon` from a clone couldn't read the database.
 
 ## [0.7.0] — 2026-11-03
 
