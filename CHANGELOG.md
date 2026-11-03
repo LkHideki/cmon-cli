@@ -20,6 +20,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   cmon Bar and background collection at user level, and says what to fix if something is off.
 - **cmon Bar title with units** (`2%•44%••91h`), through the new `{5h_pct}` `{wk_pct}`
   `{reset_short}` `{wk_reset_short}` placeholders, plus a legend in the menu and tooltip.
+- **Labelled title layouts**: `hide_empty` in `bar.json` drops blank values with their
+  decoration, and `{5h_bar}` `{wk_bar}` `{5h_dot}` `{wk_dot}` show usage as blocks or a traffic light.
 
 ### Fixed
 

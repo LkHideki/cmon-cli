@@ -43,8 +43,13 @@ struct Settings: Codable {
     /// {reset_short} {wk_reset_short} carry their unit; {5h} {wk} {reset} {reset_hm}
     /// {wk_reset_h} {wk_reset_hm} {age} are bare numbers. The 5h reset ({reset_short},
     /// {reset}, {reset_hm}) is blank unless 5h usage is above `resetAbovePercent` or the
-    /// reset is at most `resetWithinMin` minutes away.
+    /// reset is at most `resetWithinMin` minutes away. {5h_bar} {wk_bar} draw the usage as a
+    /// block, {5h_dot} {wk_dot} as a traffic light.
+    /// With `hideEmpty`, a word holding a blank placeholder is dropped along with its
+    /// decoration (`↻{reset_short}`), and so is a segment left with nothing: for labelled
+    /// layouts, where positions don't carry the meaning.
     var segments = Settings.defaultSegments
+    var hideEmpty = false
     var separator = "•"
     var resetAbovePercent = 85.0
     var resetWithinMin = 100.0
@@ -62,6 +67,7 @@ struct Settings: Codable {
 
     enum CodingKeys: String, CodingKey {
         case segments, separator, refresh, cmon
+        case hideEmpty = "hide_empty"
         case resetAbovePercent = "reset_above_percent"
         case resetWithinMin = "reset_within_min"
         case staleMinutes = "stale_minutes"
@@ -78,6 +84,7 @@ struct Settings: Codable {
         let d = Settings()
         segments = try c.decodeIfPresent([String].self, forKey: .segments) ?? d.segments
         separator = try c.decodeIfPresent(String.self, forKey: .separator) ?? d.separator
+        hideEmpty = try c.decodeIfPresent(Bool.self, forKey: .hideEmpty) ?? d.hideEmpty
         resetAbovePercent = try c.decodeIfPresent(Double.self, forKey: .resetAbovePercent) ?? d.resetAbovePercent
         resetWithinMin = try c.decodeIfPresent(Double.self, forKey: .resetWithinMin) ?? d.resetWithinMin
         let rules = (try c.decodeIfPresent([RefreshRule].self, forKey: .refresh) ?? d.refresh)
@@ -198,6 +205,14 @@ func titleLegend(_ settings: Settings) -> String? {
     settings.segments == Settings.defaultSegments ? "5h • week • 5h reset • week reset" : nil
 }
 
+func usageBar(_ percent: Double) -> String {
+    let blocks = Array("▁▂▃▄▅▆▇█")
+    return String(blocks[min(max(Int(percent / 100 * Double(blocks.count)), 0), blocks.count - 1)])
+}
+
+/// Same thresholds as the menu's progress bars.
+func usageDot(_ percent: Double) -> String { percent >= 95 ? "🔴" : percent >= 80 ? "🟡" : "🟢" }
+
 func renderTitle(_ settings: Settings, _ snap: Snapshot, now: Date) -> String {
     let session = snap.window("session"), weekly = snap.window("weekly_all")
     func pct(_ q: Quota?) -> String { q.map { String(Int($0.percent.rounded())) } ?? "–" }
@@ -210,6 +225,10 @@ func renderTitle(_ settings: Settings, _ snap: Snapshot, now: Date) -> String {
     let values: [String: String] = [
         "5h": pct(session),
         "wk": pct(weekly),
+        "5h_bar": session.map { usageBar($0.percent) } ?? "–",
+        "wk_bar": weekly.map { usageBar($0.percent) } ?? "–",
+        "5h_dot": session.map { usageDot($0.percent) } ?? "–",
+        "wk_dot": weekly.map { usageDot($0.percent) } ?? "–",
         "5h_pct": pctUnit(session),
         "wk_pct": pctUnit(weekly),
         "reset_short": hot ? left(session).map { unitDuration($0, hours: false) } ?? "" : "",
@@ -220,8 +239,18 @@ func renderTitle(_ settings: Settings, _ snap: Snapshot, now: Date) -> String {
         "wk_reset_hm": left(weekly).map(compactDuration) ?? "–",
         "age": snap.observedDate.map { String(Int(now.timeIntervalSince($0) / 60)) } ?? "–",
     ]
+    func fill(_ text: String) -> String {
+        values.reduce(text) { $0.replacingOccurrences(of: "{\($1.key)}", with: $1.value) }
+    }
+    guard settings.hideEmpty else { return settings.segments.map(fill).joined(separator: settings.separator) }
+    let blanks = values.filter { $0.value.isEmpty }.keys.map { "{\($0)}" }
     return settings.segments
-        .map { seg in values.reduce(seg) { $0.replacingOccurrences(of: "{\($1.key)}", with: $1.value) } }
+        .map { seg in
+            seg.split(separator: " ").map(String.init)
+                .filter { word in !blanks.contains { word.contains($0) } }
+                .map(fill).joined(separator: " ")
+        }
+        .filter { !$0.isEmpty }
         .joined(separator: settings.separator)
 }
 

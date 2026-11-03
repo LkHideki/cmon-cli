@@ -40,6 +40,20 @@ check(renderTitle(bare, snapshot(session: 90, resetIn: 75.5 * m), now: now) == "
 check(titleLegend(bare) == nil, "custom layout has no legend")
 check(spacedDuration(12) == "12s" && spacedDuration(3700) == "1h 1m", "durations")
 
+// hide_empty: a blank placeholder takes its word's decoration along; empty segments vanish.
+var labelled = Settings()
+labelled.hideEmpty = true
+labelled.separator = " · "
+labelled.segments = ["5h {5h_pct} {reset_short}", "7d {wk_pct} {wk_reset_short}"]
+check(renderTitle(labelled, snapshot(session: 2, resetIn: 150 * m), now: now) == "5h 2% · 7d 44% 91h", "labelled, reset hidden")
+check(renderTitle(labelled, snapshot(session: 90, resetIn: 75.5 * m), now: now) == "5h 90% 75m · 7d 44% 91h", "labelled, reset shown")
+labelled.segments = ["{5h_pct}", "↻{reset_short}", "{wk_pct}"]
+check(renderTitle(labelled, snapshot(session: 2, resetIn: 150 * m), now: now) == "2% · 44%", "decoration leaves with its value")
+check(usageBar(0) == "▁" && usageBar(50) == "▅" && usageBar(100) == "█", "usage blocks stay in range")
+check(usageDot(79) == "🟢" && usageDot(80) == "🟡" && usageDot(95) == "🔴", "traffic light thresholds")
+let hideOff = try! JSONDecoder().decode(Settings.self, from: Data("{}".utf8))
+check(!hideOff.hideEmpty, "hide_empty is off unless asked")
+
 // Refresh rules: shortest applicable interval wins.
 check(d.refreshInterval(resetLeft: 300 * m, usage: 5) == 600, "default 10 min far from reset")
 check(d.refreshInterval(resetLeft: 120 * m, usage: 5) == 180, "within 120 min -> 3 min")

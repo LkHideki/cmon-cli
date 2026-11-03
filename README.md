@@ -172,8 +172,18 @@ is reported in the menu and defaults are used):
   reset ones are blank unless 5h usage is above `reset_above_percent` (85) or the reset is at most
   `reset_within_min` (100) minutes away; while shown they count down on their own —
   `{wk_reset_h}` (hours)
-  `{wk_reset_hm}` `{age}` (minutes since the data was read). The title dims when the data
-  is older than `stale_minutes`.
+  `{wk_reset_hm}` `{age}` (minutes since the data was read); `{5h_bar}` `{wk_bar}` draw usage
+  as a block and `{5h_dot}` `{wk_dot}` as a traffic light. The title dims when the data is
+  older than `stale_minutes`. With `"hide_empty": true`, a word holding a blank placeholder and
+  any segment left empty disappear, which suits labelled layouts:
+
+  ```json
+  "segments": ["5h {5h_pct} {reset_short}", "7d {wk_pct} {wk_reset_short}"],
+  "separator": " · ",
+  "hide_empty": true
+  ```
+
+  This reads `5h 2% · 7d 44% 91h`, and `5h 90% 75m · 7d 44% 91h` near the reset.
 - **Refresh schedule** — `refresh` is a list of rules for how often the bar queries the
   API (`status --live`, which also refreshes the cache the statusline reads). A rule
   applies when all its conditions hold: `reset_within_min` (the 5h reset is at most that
