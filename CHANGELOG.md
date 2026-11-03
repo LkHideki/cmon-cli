@@ -5,12 +5,14 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.7.0] — 2026-11-03
 
 ### Upgrading
 
-- History moves to a provider-aware schema on first use. Older cmon versions can't read it;
-  `make install` first copies your database to `~/.cmon/usage.before-provider-schema.duckdb`.
+- History moves to a provider-aware schema on first use, in one transaction. **Older cmon versions
+  can't read it**, so keep a copy if you may go back: `make install` makes one at
+  `~/.cmon/usage.before-provider-schema.duckdb`; other installs should copy `~/.cmon/usage.duckdb`
+  first. cmon still tracks Claude only: this prepares the database for Codex, which no command reads yet.
 - A `bar.json` still holding the old default layout switches once to the new one. To go back,
   set `"segments": ["{5h}", "{wk}", "{reset}", "{wk_reset_h}"]` and `"separator": "•"`; it won't
   be changed again.
@@ -20,10 +22,18 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 - **`make install`, `make uninstall`, `make doctor`**: one command sets up the `cmon` command,
   cmon Bar and background collection at user level, and says what to fix if something is off.
 - **cmon Bar title in two groups** (`90% 75'  44% 91`): the 5h window and the weekly limit, each
-  as percent used and time left (plain hours, `'` minutes, `"` seconds), through `{5h_pair}` `{wk_pair}`, with a legend in the menu and
-  tooltip. `{5h_pct}` `{wk_pct}` `{reset_short}` `{wk_reset_short}` are there for other layouts.
+  as percent used and time left (plain hours, `'` minutes, `"` seconds), through `{5h_pair}`
+  `{wk_pair}`, with a legend in the menu and tooltip. `{5h_pct}` `{wk_pct}` `{reset_short}`
+  `{wk_reset_short}` are there for other layouts.
+- **[AGENTS.md](AGENTS.md)**, so an AI assistant can install and operate cmon for a user.
 - **Labelled title layouts**: `hide_empty` in `bar.json` drops blank values with their
   decoration, and `{5h_bar}` `{wk_bar}` `{5h_dot}` `{wk_dot}` show usage as blocks or a traffic light.
+
+### Changed
+
+- DuckDB is now `>=1.1.1,!=1.3.0`: 1.1.0 crashes closing a just-migrated database, and 1.3.0 misses
+  duplicates in `cmon import`.
+- Design plans moved to `docs/plans/`.
 
 ### Fixed
 
