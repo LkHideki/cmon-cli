@@ -12,7 +12,7 @@ jobs:
       matrix:
         include:
           - python-version: "3.11"
-            duckdb: "duckdb==1.1.0"
+            duckdb: "duckdb==1.1.1"
           - python-version: "3.11"
             duckdb: "duckdb"
           - python-version: "3.12"
