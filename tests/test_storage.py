@@ -249,8 +249,11 @@ def test_cache_v1_reads_as_claude_and_v2_merges_providers_and_windows(tmp_path, 
     cmon._write_cache([["primary", "5h", 30.0, None, True]], NOW + timedelta(minutes=1), "codex")
     assert cmon._read_cache("claude") is not None
     assert [row[0] for row in cmon._read_cache("codex")[0]] == ["primary"]
-    cmon._write_cache([["session", "Current session", 11.0, None, True]], NOW + timedelta(minutes=2))
+    cmon._write_cache([["session", "Current session", 11.0, None, True]], NOW + timedelta(minutes=2), partial=True)
     assert {row[0] for row in cmon._read_cache("claude")[0]} == {"session", "weekly_all"}
+    cmon._write_cache([["session", "Current session", 12.0, None, True]], NOW + timedelta(minutes=3))
+    assert {row[0] for row in cmon._read_cache("claude")[0]} == {"session"}  # retired window is gone
+    assert [row[0] for row in cmon._read_cache("codex")[0]] == ["primary"]
     payload = json.loads(cache.read_text(encoding="utf-8"))
     assert payload["version"] == 2
     assert set(payload["providers"]) == {"claude", "codex"}

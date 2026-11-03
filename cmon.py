@@ -2480,8 +2480,10 @@ def _cache_payload() -> dict:
     raise ValueError("unsupported cache format")
 
 
-def _write_cache(rows, ts, provider: str = "claude") -> None:
-    """Atomically merge provider/window observations into the lightweight status cache."""
+def _write_cache(rows, ts, provider: str = "claude", partial: bool = False) -> None:
+    """Atomically store one provider's windows in the lightweight status cache, leaving other
+    providers alone. Rows replace the provider's windows, or a limit the API retired (a model
+    scoped weekly window) would show its last percent forever; partial=True merges instead."""
     temp_path = None
     try:
         provider = _provider_name(provider)
@@ -2492,7 +2494,7 @@ def _write_cache(rows, ts, provider: str = "claude") -> None:
             payload = {"version": CACHE_VERSION, "providers": {}}
         providers = payload.setdefault("providers", {})
         current = providers.get(provider)
-        windows = dict(current.get("windows", {})) if isinstance(current, dict) else {}
+        windows = dict(current.get("windows", {})) if partial and isinstance(current, dict) else {}
         for raw in rows:
             row = list(raw)
             if len(row) < 5 or not isinstance(row[0], str):
@@ -3346,6 +3348,7 @@ def _install_macos(cmd, secs, logdir, dry):
     if dry:
         print(f"[dry-run] would write {plist}:\n{content}[dry-run] launchctl unload/load -w {plist}")
         return
+    os.makedirs(os.path.dirname(plist), exist_ok=True)  # absent on a fresh account
     with open(plist, "w", encoding="utf-8") as f:
         f.write(content)
     subprocess.run(["launchctl", "unload", plist], capture_output=True)
