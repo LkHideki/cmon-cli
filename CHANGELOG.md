@@ -19,8 +19,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 - **`make install`, `make uninstall`, `make doctor`**: one command sets up the `cmon` command,
   cmon Bar and background collection at user level, and says what to fix if something is off.
-- **cmon Bar title in two groups** (`90%/75m  44%/91h`): the 5h window and the weekly limit, each
-  as percent used / time left, through `{5h_pair}` `{wk_pair}`, with a legend in the menu and
+- **cmon Bar title in two groups** (`90% 75'  44% 91`): the 5h window and the weekly limit, each
+  as percent used and time left (plain hours, `'` minutes, `"` seconds), through `{5h_pair}` `{wk_pair}`, with a legend in the menu and
   tooltip. `{5h_pct}` `{wk_pct}` `{reset_short}` `{wk_reset_short}` are there for other layouts.
 - **Labelled title layouts**: `hide_empty` in `bar.json` drops blank values with their
   decoration, and `{5h_bar}` `{wk_bar}` `{5h_dot}` `{wk_dot}` show usage as blocks or a traffic light.

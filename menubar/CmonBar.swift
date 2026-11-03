@@ -39,8 +39,8 @@ struct RefreshRule: Codable, Equatable {
 
 struct Settings: Codable {
     /// Menu bar title: segments joined by `separator`; an empty segment keeps its slot
-    /// so positions never shift. Placeholders: {5h_pair} {wk_pair} are used/left
-    /// (`90%/75m`), always shown; {5h_pct} {wk_pct}
+    /// so positions never shift. Placeholders: {5h_pair} {wk_pair} are used and left
+    /// (`90% 75'`), always shown; {5h_pct} {wk_pct}
     /// {reset_short} {wk_reset_short} carry their unit; {5h} {wk} {reset} {reset_hm}
     /// {wk_reset_h} {wk_reset_hm} {age} are bare numbers. The 5h reset ({reset_short},
     /// {reset}, {reset_hm}) is blank unless 5h usage is above `resetAbovePercent` or the
@@ -204,20 +204,20 @@ func unitDuration(_ seconds: TimeInterval, hours: Bool) -> String {
 
 /// What the title's positions mean, shown in the menu and tooltip; nil for a custom layout.
 func titleLegend(_ settings: Settings) -> String? {
-    settings.segments == Settings.defaultSegments ? "5h used/left   7d used/left" : nil
+    settings.segments == Settings.defaultSegments ? "5h: % used, time left   7d: % used, hours left" : nil
 }
 
-/// Time left in the unit that reads best: hours from 2 h up (91h is exact where 3d isn't),
-/// minutes below that, seconds in the last minute.
+/// Time left in the unit that reads best: bare hours from 2 h up (91 is exact where 3d isn't),
+/// minutes with ' below that, seconds with " in the last minute.
 func pairTime(_ seconds: TimeInterval) -> String {
-    if seconds < 60 { return "\(max(Int(seconds), 0))s" }
-    return seconds >= 7200 ? "\(Int(seconds / 3600))h" : "\(Int(seconds / 60))m"
+    if seconds < 60 { return "\(max(Int(seconds), 0))\"" }
+    return seconds >= 7200 ? "\(Int(seconds / 3600))" : "\(Int(seconds / 60))'"
 }
 
-/// One window as percent used / time left: 90%/75m. Unknown values read as –.
+/// One window as percent used and time left: 90% 75'. Unknown values read as –.
 func usagePair(percent: Double?, left: TimeInterval?) -> String {
     let used = percent.map { "\(Int($0.rounded()))%" } ?? "–"
-    return "\(used)/\(left.map(pairTime) ?? "–")"
+    return "\(used) \(left.map(pairTime) ?? "–")"
 }
 
 func usageBar(_ percent: Double) -> String {

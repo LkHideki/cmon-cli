@@ -21,15 +21,15 @@ func snapshot(session pct: Double, resetIn left: Double) -> Snapshot {
     return try! JSONDecoder().decode(Snapshot.self, from: Data(json.utf8))
 }
 
-// Default title: two used/left pairs, both always visible, each in its best unit.
+// Default title: two used-and-left pairs, both always visible, each in its best unit.
 let d = Settings()
-check(renderTitle(d, snapshot(session: 2, resetIn: 150 * m), now: now) == "2%/2h  44%/91h", "title, hours from 2 h up")
-check(renderTitle(d, snapshot(session: 90, resetIn: 75.5 * m), now: now) == "90%/75m  44%/91h", "title, minutes below 2 h")
-check(pairTime(7200) == "2h" && pairTime(7199) == "119m", "unit changes exactly at 2 h")
-check(pairTime(42) == "42s" && pairTime(60) == "1m", "seconds only in the last minute")
-check(usagePair(percent: 100, left: 600 * 60) == "100%/10h", "three digits")
-check(usagePair(percent: nil, left: nil) == "–/–", "unknown values")
-check(renderTitle(d, snapshot(session: 90, resetIn: -5), now: now).hasPrefix("90%/–"), "reset passed shows no time")
+check(renderTitle(d, snapshot(session: 2, resetIn: 150 * m), now: now) == "2% 2  44% 91", "title, hours from 2 h up")
+check(renderTitle(d, snapshot(session: 90, resetIn: 75.5 * m), now: now) == "90% 75'  44% 91", "title, minutes below 2 h")
+check(pairTime(7200) == "2" && pairTime(7199) == "119'", "unit changes exactly at 2 h")
+check(pairTime(42) == "42\"" && pairTime(60) == "1'", "seconds only in the last minute")
+check(usagePair(percent: 100, left: 600 * 60) == "100% 10", "three digits")
+check(usagePair(percent: nil, left: nil) == "– –", "unknown values")
+check(renderTitle(d, snapshot(session: 90, resetIn: -5), now: now).hasPrefix("90% –"), "reset passed shows no time")
 check(unitDuration(1800, hours: true) == "30m" && unitDuration(7300, hours: true) == "2h", "week reset under 1 h keeps a real unit")
 check(unitDuration(7300, hours: false) == "121m", "5h reset stays in minutes")
 check(titleLegend(d) != nil, "default layout is explained in the menu")

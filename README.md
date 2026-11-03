@@ -22,9 +22,9 @@ make uninstall   # removes all of it, keeps your history in ~/.cmon
 ```
 
 macOS may ask to allow Keychain access when cmon first reads Claude Code's login; choose
-**Always Allow**, or the menu bar can't refresh. The menu bar then reads `90%/75m  44%/91h`:
-the 5h window on the left and the weekly limit on the right, each as percent used / time
-until it resets. Click it for details.
+**Always Allow**, or the menu bar can't refresh. The menu bar then reads `90% 75'  44% 91`:
+the 5h window on the left and the weekly limit on the right, each as percent used and time
+until it resets (plain numbers are hours, `'` minutes). Click it for details.
 
 ## Installation (CLI only, any OS)
 
@@ -150,9 +150,9 @@ it never shows a dead cycle and never blocks a prompt. `--live` always queries t
 ### Menu bar (macOS)
 
 `menubar/` holds **cmon Bar**, a native menu bar item (Swift, no third-party app). The
-title shows the quota as `90%/75m  44%/91h` — 5h window, then weekly limit, each as percent
-used / time until it resets, in hours from 2 h up, minutes below that and seconds in the
-last minute — and a click
+title shows the quota as `90% 75'  44% 91` — 5h window, then weekly limit, each as percent
+used and time until it resets: plain hours from 2 h up, minutes with `'` below that and
+seconds with `"` in the last minute — and a click
 opens a per-window breakdown with progress bars, reset times and when the next update is
 due.
 
@@ -167,7 +167,7 @@ Everything is configured in `~/.cmon/bar.json`, re-read on every refresh (an inv
 is reported in the menu and defaults are used):
 
 - **Title** — `segments` joined by `separator`; an empty segment keeps its slot, so
-  positions never shift. Placeholders: `{5h_pair}` `{wk_pair}` (`90%/75m`, always shown);
+  positions never shift. Placeholders: `{5h_pair}` `{wk_pair}` (`90% 75'`, always shown);
   with their unit: `{5h_pct}` `{wk_pct}` `{reset_short}`
   `{wk_reset_short}`; bare numbers: `{5h}` `{wk}` `{reset}` (minutes) `{reset_hm}` — the 5h
   reset ones are blank unless 5h usage is above `reset_above_percent` (85) or the reset is at most

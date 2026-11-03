@@ -44,7 +44,7 @@ configure_bar() {
         if [ "$current" = "$OLD_LAYOUT" ]; then
             plutil -replace segments -json "$NEW_LAYOUT" "$BAR_JSON"
             plutil -replace separator -string "  " "$BAR_JSON"
-            echo "Menu bar title now reads: 2%/2h  44%/91h"
+            echo "Menu bar title now reads: 2% 2  44% 91"
         fi
     fi
     : > "$LAYOUT_MARK"
@@ -76,9 +76,10 @@ do_install() {
     "$(cmon_path)" status --live || true
     if do_doctor; then printf '\nDone. '; else printf '\nInstalled, but fix the items marked FAIL above, then run: make doctor\n'; fi
     cat <<MSG
-How to read the menu bar: 90%/75m  44%/91h
+How to read the menu bar: 90% 75'  44% 91
   left group:  5h window, 90% used, 75 minutes until it resets
   right group: weekly limit, 44% used, 91 hours until it resets
+  Plain numbers are hours, ' is minutes, " is seconds.
 Click the title for details. Settings: ~/.cmon/bar.json. Remove all: make uninstall
 MSG
 }
