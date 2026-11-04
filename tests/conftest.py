@@ -85,6 +85,8 @@ def isolated_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Isolate
     monkeypatch.setattr(cmon, "CMON_HOME", str(home / ".cmon"))
     monkeypatch.setattr(cmon, "ALERT_STATE", str(home / ".cmon" / "alerts.json"))
     monkeypatch.setattr(cmon, "STATUS_FAIL", str(home / ".cmon" / "status.fail"))
+    monkeypatch.setattr(cmon, "KEEPALIVE_STAMP", str(home / ".cmon" / "keepalive.stamp"))
+    monkeypatch.setattr(cmon, "KEEPALIVE_LOG", str(home / ".cmon" / "keepalive.log"))
     monkeypatch.setattr(cmon, "LEGACY_PURGED", str(home / ".cmon" / ".legacy-chain-purged"))
     monkeypatch.setattr(cmon, "DESKTOP_SESSIONS", str(home / "desktop-sessions"))
 
