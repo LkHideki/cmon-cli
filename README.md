@@ -128,6 +128,25 @@ with Claude Code transcripts available, cmon learns your real quiet hours on its
 [`cmon now`](#cmon-now--current-usage--pacing)). Both preferences are validated on `set`;
 `CMON_QUIET_HOURS` overrides without persisting.
 
+**`keepalive`** starts the next 5h window as soon as the last one ends. Left alone, a window that
+rolls over stays parked at `0% –` until your next request; with this on, cmon sends that request
+itself:
+
+```bash
+cmon config set keepalive on    # off by default
+cmon keepalive                  # send one now
+```
+
+The request is one small Haiku question through the `claude` command (a cosine of a random number,
+different every time), so it needs Claude Code logged in to the account cmon reads, and it counts
+towards your limits like any other, by under 1,000 tokens. cmon notices the rollover at the
+next read: within seconds with cmon Bar running, otherwise at the next `cmon collect`. An attempt
+that doesn't open the window is retried after 30 minutes; attempts are logged to
+`~/.cmon/keepalive.log`. A sleeping computer sends nothing, so the next window starts when it wakes.
+
+Windows then run back to back whether you work or not, so you may sit down with only part of one
+left. The reset comes sooner than if your first request had started it.
+
 ## Usage
 
 The examples use `uv run cmon`, for a clone of this repository. After `make install` or

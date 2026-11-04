@@ -5,6 +5,15 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`cmon config set keepalive on` starts the next 5h window by itself.** When a window rolls over
+  and sits parked at `0% –`, cmon sends one small Haiku request through the `claude` command. Off by
+  default, because it sends requests on your behalf and they count towards your limits.
+  `cmon keepalive` sends one on demand.
+
 ## [0.7.1] — 2026-11-03
 
 ### Upgrading
