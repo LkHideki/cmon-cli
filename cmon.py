@@ -545,7 +545,7 @@ def token_clear(_):
 
 # --- Config: persisted user preferences (~/.cmon/config.json) ---
 CONFIG = os.path.expanduser("~/.cmon/config.json")
-CONFIG_KEYS = {"timezone", "quiet_hours"}  # allowlist; extend here as new preferences are added
+CONFIG_KEYS = {"timezone", "quiet_hours", "keepalive"}  # allowlist; extend here as new preferences are added
 
 
 def _validate_timezone(value: str) -> str:
@@ -606,7 +606,14 @@ def _quiet_hours() -> frozenset[int]:
 
 
 # key -> fn(value) -> normalized value | raises ValueError
-CONFIG_VALIDATORS = {"timezone": _validate_timezone, "quiet_hours": _validate_quiet_hours}
+def _validate_keepalive(value: str) -> str:
+    if value not in ("on", "off"):
+        raise ValueError(f"Invalid keepalive {value!r}. Use 'on' or 'off'.")
+    return value
+
+
+CONFIG_VALIDATORS = {"timezone": _validate_timezone, "quiet_hours": _validate_quiet_hours,
+                     "keepalive": _validate_keepalive}
 
 
 def _read_config() -> dict:
@@ -1334,12 +1341,17 @@ def collect(args):
     if not getattr(args, "force", False) and _recent(con, ts):
         print(f"Snapshot <{DEDUP_SECS}s ago — skipped (use --force to save anyway).")
         return
-    rows = limits(fetch())
+    try:
+        rows = limits(fetch())
+    except FetchError:
+        _keepalive_check_cached()
+        raise
     con.executemany(
         f"INSERT INTO snapshots({_SNAPSHOT_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         _claude_snapshot_records(rows, ts),
     )
     _write_cache(rows, ts)
+    _keepalive_check(rows)
     _log_forecasts(con, rows, _resolve_tz(), ts)  # record predictions; scored by 'cmon backtest'
     _reconcile_forecasts(con)                     # and settle the ones whose horizon just passed
     print(f"{ts:%Y-%m-%d %H:%M} collected:")
@@ -2642,6 +2654,91 @@ def _reset_expired(rows) -> bool:
 STATUS_FAIL = os.path.expanduser("~/.cmon/status.fail")  # mtime = last failed status fetch
 STATUS_RETRY_S = 120   # after a failed fetch, plain 'status' serves the cache this long
 STATUS_TIMEOUT_S = 5   # status runs every minute from a menu bar/statusline: fail fast
+KEEPALIVE_STAMP = os.path.expanduser("~/.cmon/keepalive.stamp")  # mtime = last ping attempt
+KEEPALIVE_LOG = os.path.expanduser("~/.cmon/keepalive.log")
+# Long on purpose: if the ping can't open the window (its account differs from the one cmon reads,
+# say), a shorter wait would repeat a pointless request all day. Also covers the API lagging.
+KEEPALIVE_RETRY_S = 1800
+KEEPALIVE_TIMEOUT_S = 120
+# With either of these set, claude bills the API key and the plan's 5h window never opens.
+KEEPALIVE_DROP_ENV = {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"}
+
+
+def _window_parked(rows) -> bool:
+    """True if the 5h window isn't running: after it rolls over, the API reports 0% and no
+    resets_at until the next request starts a new one."""
+    sess = next((r for r in rows if r[0] == "session"), None)
+    return sess is not None and (not sess[3] or _reset_expired(rows))
+
+
+def _keepalive_check(rows) -> None:
+    """Start a detached 'cmon keepalive' if it's enabled and the window is parked. Detached
+    because the ping takes seconds and status (menu bar) and collect (DB lock) must not wait."""
+    if _read_config().get("keepalive") != "on" or not _window_parked(rows):
+        return
+    try:
+        if 0 <= datetime.now(UTC).timestamp() - os.path.getmtime(KEEPALIVE_STAMP) < KEEPALIVE_RETRY_S:
+            return
+    except OSError:
+        pass
+    try:
+        _private_dir(os.path.dirname(KEEPALIVE_STAMP))
+        with open(KEEPALIVE_STAMP, "w"):
+            pass
+        log = os.open(KEEPALIVE_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            subprocess.Popen([sys.executable, os.path.abspath(__file__), "keepalive"],
+                             stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+        finally:
+            os.close(log)
+    except OSError as e:
+        print(f"cmon: keepalive not started: {e}", file=sys.stderr)
+
+
+def _keepalive_check_cached() -> None:
+    """For a failed fetch. An idle Claude Code lets its token expire, which blinds the fetch, and
+    the ping is also what renews the token: without this the chain never restarts after a sleep."""
+    if got := _read_cache():
+        _keepalive_check(got[0])
+
+
+def _claude_bin() -> str | None:
+    """launchd and cron run with a minimal PATH, so also try the usual install locations."""
+    import shutil
+    if found := shutil.which("claude"):
+        return found
+    for path in ("~/.local/bin/claude", "~/.claude/local/claude", "/opt/homebrew/bin/claude",
+                 "/usr/local/bin/claude"):
+        if os.access(full := os.path.expanduser(path), os.X_OK):
+            return full
+    return None
+
+
+def keepalive(_args):
+    """One small Haiku request through the claude CLI, which opens a new 5h window. Goes through
+    the CLI because the subscription's OAuth token is for Claude Code, not for direct API calls.
+    The settings below keep the request small: no tools, CLAUDE.md, hooks or MCP servers."""
+    import random
+    claude = _claude_bin()
+    if not claude:
+        sys.exit("cmon: keepalive needs the claude command (Claude Code), and it wasn't found.")
+    x = random.uniform(0, 6.283185)
+    env = {k: v for k, v in os.environ.items() if k not in KEEPALIVE_DROP_ENV}
+    env |= {"CLAUDE_CODE_SAFE_MODE": "1", "CLAUDE_CODE_DISABLE_THINKING": "1", "CLAUDE_CODE_EFFORT_LEVEL": "low"}
+    _private_dir(CMON_HOME)
+    try:
+        r = subprocess.run(
+            [claude, "-p", f"cos({x:.6f}) in radians, to 2 decimals. Answer with the number only.",
+             "--model", "haiku", "--tools", "", "--system-prompt", "Answer in one line.",
+             "--no-session-persistence"],
+            cwd=CMON_HOME, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=KEEPALIVE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        sys.exit(f"cmon: keepalive: claude didn't answer in {KEEPALIVE_TIMEOUT_S}s.")
+    stamp = f"{datetime.now(UTC):%Y-%m-%d %H:%M}"
+    if r.returncode != 0:
+        sys.exit(f"{stamp} keepalive failed (exit {r.returncode}): {_safe(r.stderr or r.stdout)}")
+    print(f"{stamp} keepalive: cos({x:.6f}) = {_safe(r.stdout.strip(), 40)}")
 
 
 def _status_fetch():
@@ -2656,6 +2753,7 @@ def _status_fetch():
     try:
         rows = limits(fetch(retries=1, timeout=STATUS_TIMEOUT_S))
     except FetchError:
+        _keepalive_check_cached()
         try:
             _private_dir(os.path.dirname(STATUS_FAIL))
             with open(STATUS_FAIL, "w"):
@@ -2668,6 +2766,7 @@ def _status_fetch():
     except OSError:
         pass
     _write_cache(rows, datetime.now(UTC))
+    _keepalive_check(rows)
     return rows
 
 
@@ -2681,8 +2780,10 @@ def _status_rows(live: bool):
         try:
             rows = limits(fetch(retries=2, timeout=10))  # explicit refresh: bounded, ~20 s worst case
         except FetchError:
+            _keepalive_check_cached()
             return None
         _write_cache(rows, datetime.now(UTC))  # warm the cache so plain 'status' stays fresh
+        _keepalive_check(rows)
         return rows, 0.0
     got = _read_cache() or _rows_from_db()
     if got and not _reset_expired(got[0]):
@@ -3540,6 +3641,8 @@ def main():
     pb.add_argument("--json", action="store_true", help="JSON output")
     pb.add_argument("--all-accounts", action="store_true",
                     help="include Claude Desktop sessions not tied to the terminal's account")
+    sub.add_parser("keepalive", help="send one small Haiku request now, which opens a 5h window if none is running "
+                                     "('cmon config set keepalive on' does this by itself)")
     pc = sub.add_parser("collect", help="save 1 snapshot to database")
     pc.add_argument("--force", action="store_true", help="save even with recent snapshot (bypass dedup)")
     pc.add_argument("--alert", action="store_true",
@@ -3584,7 +3687,8 @@ def main():
 
     pcfg = sub.add_parser("config", help="manage persisted user preferences (~/.cmon/config.json)",
                           description="Currently supports: timezone (used to display timestamps "
-                                      "locally instead of UTC).")
+                                      "locally instead of UTC), quiet_hours (hours projections skip) "
+                                      "and keepalive (on: open a new 5h window when the last one ends).")
     cfa = pcfg.add_subparsers(dest="action", required=True)
     cfset = cfa.add_parser("set", help="set a preference")
     cfset.add_argument("key", choices=sorted(CONFIG_KEYS))
@@ -3611,7 +3715,7 @@ def main():
         {"now": now, "status": status, "trends": trends, "collect": collect,
          "burn": burn, "watch": watch, "wait": wait, "plot": plot,
          "backtest": backtest, "tune": tune, "install": install,
-         "uninstall": uninstall, "import": import_db}[args.cmd](args)
+         "uninstall": uninstall, "import": import_db, "keepalive": keepalive}[args.cmd](args)
     except FetchError as e:
         sys.exit(f"cmon: {e}")
 
