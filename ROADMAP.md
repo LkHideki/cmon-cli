@@ -222,7 +222,7 @@ Effort S for the capture.
 
 `_notify` covers macOS and Linux; on Windows, alerts only reach the stderr of a scheduled task
 nobody reads. A notification through PowerShell closes the gap. Effort S, but CI has no Windows
-machine beyond what the smoke test needs, so it needs someone who can test it on Windows.
+job, so it needs someone who can test it on a Windows machine.
 
 ### G6. Shell completion
 
