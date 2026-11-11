@@ -1378,7 +1378,7 @@ def collect(args):
     _refresh_client_share(con, rows, ts)
     if getattr(args, "alert", False):
         _fire_rate_alerts(rows, con)  # rate-based: at current pace hits 100% before reset
-        _fire_lead_alert(rows)  # time-based: 5h window resets in <= CMON_ALERT_LEAD min (+ hook)
+        _fire_lead_alert(rows)  # time-based: 5h window resets in <= CMON_ALERT_LEAD min
 
 
 def _collect_sync(con) -> None:
@@ -2358,16 +2358,30 @@ def _notify(title: str, body: str) -> None:
         pass
 
 
-def _run_hook(msg: str) -> None:
-    """Run the user's CMON_HOOK command on an alert (best-effort), with the alert text in the
-    CMON_ALERT_MSG env var. Shell command, so it can be anything. Never raises — a broken hook
-    must not break collection."""
+def _hook_env(msg: str, kind: str, key: str, percent=None, resets_at=None) -> dict:
+    """The alert as CMON_ALERT_* strings. Every variable is always set, empty when unknown, so
+    a hook under `set -u` doesn't die on a missing one. resets_at (ISO string or aware
+    datetime) is normalized to ISO UTC, so hooks never parse the API's own offsets."""
+    reset = ""
+    if resets_at:
+        dt = datetime.fromisoformat(resets_at) if isinstance(resets_at, str) else resets_at
+        reset = dt.astimezone(UTC).isoformat(timespec="seconds")
+    return {"CMON_ALERT_MSG": msg, "CMON_ALERT_KIND": kind, "CMON_ALERT_KEY": key,
+            "CMON_ALERT_PERCENT": "" if percent is None else f"{round(float(percent), 1):g}",
+            "CMON_ALERT_RESETS_AT": reset}
+
+
+def _run_hook(msg: str, *, kind: str, key: str, percent=None, resets_at=None) -> None:
+    """Run the user's CMON_HOOK command for an alert that fired (best-effort; callers dedup
+    first, so a hook never sees a repeat). The alert travels in the environment (_hook_env):
+    kind is the alert's family (lead, rate) and a new family only passes its own name. Shell
+    command, so it can be anything. Never raises — a broken hook must not break collection."""
     hook = os.environ.get("CMON_HOOK")
     if not hook:
         return
     try:
-        subprocess.run(hook, shell=True, timeout=30,
-                       env=_child_env(CMON_ALERT_MSG=msg), capture_output=True)
+        env = _child_env(**_hook_env(msg, kind, key, percent, resets_at))
+        subprocess.run(hook, shell=True, timeout=30, env=env, capture_output=True)
     except Exception:
         pass
 
@@ -2420,26 +2434,30 @@ def _fire_lead_alert(rows) -> None:
     native desktop notification + CMON_HOOK. Deduped per window on its own reset bucketed to the
     nearest minute — the API's resets_at jitters ~1s between calls, so an exact-string marker
     would re-fire every collect."""
+    pct = {r[0]: r[2] for r in rows}
     for key, reset, msg in _lead_alerts(rows):
         marker = round(reset.timestamp() / 60)  # nearest-minute bucket, robust to ~1s API jitter
         if _alert_fired(f"lead_{key}", marker):
             continue
         print(f"⚠ {msg}", file=sys.stderr)
         _notify(f"cmon — {LEAD_LABEL_BY_KEY.get(key, key)}", msg)
-        _run_hook(msg)
+        _run_hook(msg, kind="lead", key=key, percent=pct.get(key), resets_at=reset)
         _mark_alert(f"lead_{key}", marker)
 
 
 def _fire_rate_alerts(rows, con) -> None:
-    """Notify once per window cycle that the pace will exhaust it before reset. Without the
-    dedup, every scheduled collect (default 20 min) re-notified for as long as the projection
-    stayed above 100%. Same per-cycle marker as the lead alert (reset to the nearest minute)."""
+    """Notify once per window cycle that the pace will exhaust it before reset: desktop
+    notification + CMON_HOOK. Without the dedup, every scheduled collect (default 20 min)
+    re-notified for as long as the projection stayed above 100%. Same per-cycle marker as the
+    lead alert (reset to the nearest minute). stderr still gets every collect's warning."""
+    pct = {r[0]: r[2] for r in rows}
     for key, reset, msg in _rate_alerts(rows, con):
         marker = round(datetime.fromisoformat(reset).timestamp() / 60)
         print(f"⚠ {msg}", file=sys.stderr)
         if _alert_fired(f"rate_{key}", marker):
             continue
         _notify("cmon — Claude limit", msg)
+        _run_hook(msg, kind="rate", key=key, percent=pct.get(key), resets_at=reset)
         _mark_alert(f"rate_{key}", marker)
 
 

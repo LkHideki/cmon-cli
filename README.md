@@ -453,9 +453,21 @@ native notification (macOS/Linux):
   minutes** (default 60) and the **weekly window in ≤ `CMON_ALERT_LEAD_WEEKLY` minutes** (default
   180). Each fires once per cycle (deduped on its own reset), as a desktop notification.
 
-Set **`CMON_HOOK`** to run your own command on the time-based alert: cmon executes it via the
-shell with the message in `$CMON_ALERT_MSG` (best-effort — a broken hook never breaks
-collection). Pipe it into a bell, a webhook, `tmux display-message`, etc.
+Set **`CMON_HOOK`** to run your own command on every alert, of both kinds: cmon executes it via
+the shell when the alert fires, so once per window cycle and never on the deduplicated repeats
+(best-effort, with a 30s timeout: a broken hook never breaks collection). The alert reaches the
+command in environment variables, which are always set and empty when unknown:
+
+| Variable | Value |
+|---|---|
+| `CMON_ALERT_MSG` | The alert text, as shown on stderr |
+| `CMON_ALERT_KIND` | `rate` (pace hits 100% before reset) or `lead` (reset is near) |
+| `CMON_ALERT_KEY` | The window: `session` (5h) or `weekly_all` |
+| `CMON_ALERT_PERCENT` | Percent of the window used, e.g. `87` or `87.5` |
+| `CMON_ALERT_RESETS_AT` | When the window resets, ISO 8601 in UTC, e.g. `2026-11-04T02:00:00+00:00` |
+
+The hook doesn't see cmon's `CLAUDE_OAUTH_TOKEN`. Pipe it into a bell, a webhook,
+`tmux display-message`, etc.
 
 ```cron
 */20 * * * * cd ~/cmon && /path/to/uv run cmon collect --alert
@@ -464,7 +476,22 @@ collection). Pipe it into a bell, a webhook, `tmux display-message`, etc.
 ```bash
 export CMON_ALERT_LEAD=30                                        # alert 30min before the 5h reset
 export CMON_ALERT_LEAD_WEEKLY=180                               # alert 3h before the weekly reset
-export CMON_HOOK='tmux display-message "cmon: $CMON_ALERT_MSG"'  # run on that alert
+export CMON_HOOK='tmux display-message "cmon: $CMON_ALERT_MSG"'  # run on every alert
+```
+
+A push to your phone through [ntfy.sh](https://ntfy.sh) (pick a topic name nobody will guess;
+anyone who knows it can read it):
+
+```bash
+export CMON_HOOK='curl -fsS -m 10 -H "Title: cmon $CMON_ALERT_KIND $CMON_ALERT_KEY" \
+  -d "$CMON_ALERT_MSG" https://ntfy.sh/my-cmon-topic-7f3k'
+```
+
+Any JSON webhook. It leaves out `CMON_ALERT_MSG`, which may hold quotes; the other variables
+never do, so they are safe to splice into JSON:
+
+```bash
+export CMON_HOOK='curl -fsS -m 10 -H "Content-Type: application/json" -d "{\"kind\":\"$CMON_ALERT_KIND\",\"window\":\"$CMON_ALERT_KEY\",\"percent\":${CMON_ALERT_PERCENT:-null},\"resets_at\":\"$CMON_ALERT_RESETS_AT\"}" https://example.com/hooks/cmon'
 ```
 
 ### `cmon now` — current usage & pacing
@@ -619,7 +646,7 @@ CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs ruff + CLI smok
 on Python 3.11–3.13. PRs welcome: keep `ruff` green and the file style lean. Useful
 environment variables: `CMON_DB` (database path), `CMON_RETRIES`, `CMON_DEDUP_SECS`,
 `CMON_ALERT_LEAD` / `CMON_ALERT_LEAD_WEEKLY` (minutes before the 5h / weekly reset to alert),
-`CMON_HOOK` (command run on that alert),
+`CMON_HOOK` (command run on every alert; see [Alerts](#alerts)),
 `CMON_OAUTH_CLIENT_ID` / `CMON_OAUTH_TOKEN_URL` (OAuth refresh overrides; URL allowlisted to
 `*.anthropic.com`), `CMON_ALLOW_PLAINTEXT_KEYRING` (permit saving to a cleartext keyring backend),
 `CMON_TZ` (display timezone override; see [Config](#config)).

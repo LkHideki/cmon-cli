@@ -15,6 +15,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   invalid file is ignored with one warning, and the built-in prices apply.
 - **`burn --json` reports `unpriced_models`**: at the top of the `--plan` object, and on each group
   that has tokens of a model with no price.
+- **The alert hook gets the alert as data.** Besides `CMON_ALERT_MSG`, `CMON_HOOK` now sees
+  `CMON_ALERT_KIND` (`rate` or `lead`), `CMON_ALERT_KEY` (the window), `CMON_ALERT_PERCENT` and
+  `CMON_ALERT_RESETS_AT` (ISO 8601, UTC), so a hook can feed ntfy or a JSON webhook without
+  parsing the message. The README's Alerts section has both recipes.
+
+### Changed
+
+- **`CMON_HOOK` also runs on rate alerts**, the warning that the pace will hit 100% before the
+  reset. It used to run only when a reset was near, so a hook wired to a webhook missed the alert
+  that matters most. If you use a hook, expect up to one more call per window cycle; it still
+  never runs on the deduplicated repeats of an alert.
 
 ### Fixed
 

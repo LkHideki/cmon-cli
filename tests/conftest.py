@@ -70,6 +70,7 @@ def isolated_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Isolate
     for key in (
         "CLAUDE_OAUTH_TOKEN",
         "CMON_DB",
+        "CMON_HOOK",  # alert tests would otherwise run the developer's own hook
         "CMON_TZ",
         "CMON_QUIET_HOURS",
         "HTTP_PROXY",
