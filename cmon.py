@@ -1374,9 +1374,28 @@ def collect(args):
     print(f"{ts:%Y-%m-%d %H:%M} collected:")
     for _k, lbl, pct, reset, _a in rows:
         print(f"  {lbl:16} {pct:4.0f}%  reset {reset[:16] if reset else '-'}")
+    _collect_sync(con)
     if getattr(args, "alert", False):
         _fire_rate_alerts(rows, con)  # rate-based: at current pace hits 100% before reset
         _fire_lead_alert(rows)  # time-based: 5h window resets in <= CMON_ALERT_LEAD min (+ hook)
+
+
+def _collect_sync(con) -> None:
+    """With sync_dir set, exchange rows with the other devices after each collection.
+    Best-effort: a missing folder or a bad file is reported, never fails the collection."""
+    sync_dir = _read_config().get("sync_dir")
+    if not sync_dir:
+        return
+    try:
+        scan_logs(con, quiet=True)
+        got = sync_devices(con, _validate_sync_dir(sync_dir))
+    except Exception as e:
+        print(f"cmon: sync skipped: {e}", file=sys.stderr)
+        return
+    for name, n in got["imported"].items():
+        print(f"  synced {n} new rows from {name}")
+    for e in got["errors"]:
+        print(f"cmon: sync could not read {e}", file=sys.stderr)
 
 
 def import_db(args):

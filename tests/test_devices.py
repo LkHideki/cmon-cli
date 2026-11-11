@@ -149,3 +149,29 @@ def test_sync_command_needs_a_folder(home, cli):
     assert result.exit_code == 1 and "not an existing folder" in result.stderr
     result = cli("config", "set", "device_name", "bad/name")
     assert result.exit_code == 1 and "Invalid device_name" in result.stderr
+
+
+LIMITS = {"limits": [{"kind": "weekly_all", "percent": 3, "resets_at": None, "is_active": True}]}
+
+
+def test_collect_syncs_when_configured(pair, folder, monkeypatch, capsys):
+    laptop, desktop = pair
+    laptop.sync(folder)
+    desktop.use()
+    monkeypatch.setattr(cmon, "fetch", lambda: LIMITS)
+    cmon.collect(Namespace(force=True, alert=False))  # no sync_dir yet: nothing exchanged
+    assert "synced" not in capsys.readouterr().out
+    cmon._write_config({"device_name": "desktop", "sync_dir": str(folder)})
+    cmon.collect(Namespace(force=True, alert=False))
+    assert "synced 3 new rows from laptop" in capsys.readouterr().out
+    assert len(list(folder.glob("*.parquet"))) == 2
+
+
+def test_collect_survives_a_broken_sync(pair, folder, monkeypatch, capsys):
+    _laptop, desktop = pair
+    desktop.use()
+    cmon._write_config({"sync_dir": str(folder / "gone")})
+    monkeypatch.setattr(cmon, "fetch", lambda: LIMITS)
+    cmon.collect(Namespace(force=True, alert=False))
+    out = capsys.readouterr()
+    assert "collected" in out.out and "sync skipped" in out.err
