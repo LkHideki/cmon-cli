@@ -4880,6 +4880,393 @@ def uninstall(args):
         sys.exit(f"OS not supported: {sys.platform}")
 
 
+# --- doctor: what's wrong with this installation, and the fix for each item ---
+DOCTOR_VERSION = 1  # schema of 'doctor --json'; additive changes keep it
+DOCTOR_LOCK_WAIT_S = 2.0  # a scheduled collect holds the lock ~1 s: wait that out before calling it held
+DOCTOR_TAGS = {"ok": "ok", "warn": "warn", "fail": "FAIL", "skip": "skip"}  # same columns as make doctor
+UPDATE_FIX = "update cmon: uv tool upgrade cmon-cli, or make install in a fresh clone"
+
+
+def _check(key: str, name: str, status: str, detail: str = "", fix: str | None = None) -> dict:
+    return {"key": key, "name": name, "status": status, "detail": detail, "fix": fix}
+
+
+def _doctor_token() -> dict:
+    """Same resolution as 'token status'. The token itself never reaches the report, not even
+    masked: assistants read this output, and the source is what tells them what to fix."""
+    import time
+    name = "token source found"
+    try:
+        src, tok, exp = _resolve_token()
+    except Exception as e:
+        return _check("token", name, "fail", f"token lookup failed: {_safe(e)}", "cmon token status")
+    if not tok:
+        return _check("token", name, "fail", "no token in CLAUDE_OAUTH_TOKEN, the OS vault or Claude Code's login",
+                      "log in to Claude Code, or run: cmon token set")
+    detail = src
+    if exp is not None:
+        left = exp / 1000 - time.time()
+        if left <= 0:
+            return _check("token", name, "warn", f"{src}: the access token has expired",
+                          "run any prompt in Claude Code; it renews its own login")
+        detail += f", expires in {_fmt_until(timedelta(seconds=left))}"
+    if src.startswith("env "):
+        detail += ", which scheduled collection doesn't inherit: cmon token set covers that"
+    return _check("token", name, "ok", detail)
+
+
+def _doctor_api(offline: bool) -> dict:
+    """One fetch with the budget of 'status --live', which make doctor used before. Nothing is
+    stored: a diagnosis shouldn't write history or the cache."""
+    name = "usage API reachable and logged in"
+    if offline:
+        return _check("api", name, "skip", "--offline")
+    try:
+        rows = limits(fetch(retries=2, timeout=10))
+    except FetchError as e:
+        msg = str(e)
+        if msg.startswith("403"):
+            fix = f"{UPDATE_FIX} (the private endpoint may have changed)"
+        elif msg.startswith(("401", "no token")) or "expired" in msg:
+            fix = "run Claude Code once to log in, then: cmon token status"
+        else:
+            fix = "check the network connection, then run: cmon doctor"
+        return _check("api", name, "fail", msg, fix)
+    except Exception as e:  # a reply limits() can't read: the endpoint changed shape
+        return _check("api", name, "fail", f"unexpected reply: {_safe(e)}", UPDATE_FIX)
+    detail = ", ".join(f"{label} {pct:.0f}%" for _k, label, pct, _r, _a in rows)
+    return _check("api", name, "ok", detail or "logged in; no limits in the reply")
+
+
+def _doctor_run(cmd: list[str]):
+    """CompletedProcess, or None when the tool is missing or hangs."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _sched_issue(argv: list[str]) -> tuple[str, str] | None:
+    """(status, detail) when the scheduled command can't run or feeds another database, else
+    None. A clone deleted after 'uv run cmon install' leaves a job pointing at nothing."""
+    if len(argv) < 2:
+        return "fail", "the scheduled command is empty"
+    for path in argv[:2]:
+        if os.path.isabs(path) and not os.path.exists(path):
+            return "fail", f"the scheduled command points to a missing file: {path}"
+    if "--db" in argv[:-1]:
+        target = os.path.abspath(argv[argv.index("--db") + 1])
+        if target != os.path.abspath(DB):
+            return "warn", f"it collects into {target}, but this cmon reads {os.path.abspath(DB)}"
+    return None
+
+
+def _doctor_schedule_macos(name: str) -> dict:
+    import plistlib
+    plist = os.path.expanduser(f"~/Library/LaunchAgents/{AGENT}.plist")
+    if not os.path.exists(plist):
+        return _check("schedule", name, "warn", "not scheduled", "cmon install")
+    try:
+        with open(plist, "rb") as f:
+            data = plistlib.load(f)
+        argv = [str(a) for a in data.get("ProgramArguments") or []]
+    except Exception as e:
+        return _check("schedule", name, "fail", f"unreadable {plist}: {_safe(e)}", "cmon install")
+    r = _doctor_run(["launchctl", "print", f"gui/{os.getuid()}/{AGENT}"])
+    if r is None:
+        return _check("schedule", name, "warn", "could not run launchctl to check the LaunchAgent")
+    if r.returncode != 0:
+        return _check("schedule", name, "warn", f"{plist} exists but isn't loaded", "cmon install")
+    if issue := _sched_issue(argv):
+        return _check("schedule", name, *issue, fix="cmon install")
+    every = data.get("StartInterval")
+    return _check("schedule", name, "ok", f"LaunchAgent {AGENT}" +
+                  (f", every {every // 60} min" if isinstance(every, int) and every >= 60 else ""))
+
+
+def _doctor_schedule_linux(name: str) -> dict:
+    import shlex
+    import shutil
+    timer = os.path.expanduser("~/.config/systemd/user/cmon-collect.timer")
+    if shutil.which("systemctl") and os.path.exists(timer):
+        r = _doctor_run(["systemctl", "--user", "is-active", "cmon-collect.timer"])
+        if r is None or r.stdout.strip() != "active":
+            return _check("schedule", name, "warn", "the systemd timer exists but isn't active", "cmon install")
+        try:
+            with open(timer.removesuffix(".timer") + ".service", encoding="utf-8") as f:
+                line = next((ln for ln in f if ln.startswith("ExecStart=")), "")
+            argv = shlex.split(line.removeprefix("ExecStart="))
+        except (OSError, ValueError) as e:
+            return _check("schedule", name, "fail", f"unreadable cmon-collect.service: {_safe(e)}", "cmon install")
+        if issue := _sched_issue(argv):
+            return _check("schedule", name, *issue, fix="cmon install")
+        return _check("schedule", name, "ok", "systemd timer cmon-collect.timer")
+    r = _doctor_run(["crontab", "-l"])
+    lines = r.stdout.splitlines() if r is not None and r.returncode == 0 else []
+    if line := next((ln for ln in lines if "# cmon-collect" in ln), None):
+        fields = line.split("# cmon-collect")[0].split(None, 5)
+        try:
+            argv = shlex.split(fields[5]) if len(fields) == 6 else []
+        except ValueError:
+            argv = []
+        if issue := _sched_issue(argv):
+            return _check("schedule", name, *issue, fix="cmon install")
+        return _check("schedule", name, "ok", "crontab entry # cmon-collect")
+    return _check("schedule", name, "warn", "not scheduled", "cmon install")
+
+
+def _doctor_schedule(platform: str | None = None) -> dict:
+    """Looks where 'cmon install' puts the job on each OS. Not scheduled is a warning, not a
+    failure: background collection is optional for the CLI alone."""
+    name = "background collection scheduled"
+    platform = platform or sys.platform
+    if platform == "darwin":
+        return _doctor_schedule_macos(name)
+    if platform.startswith("linux"):
+        return _doctor_schedule_linux(name)
+    if platform.startswith("win"):
+        r = _doctor_run(["schtasks", "/query", "/tn", "cmon-collect"])
+        if r is None:
+            return _check("schedule", name, "warn", "could not run schtasks to check the task")
+        if r.returncode != 0:
+            return _check("schedule", name, "warn", "not scheduled", "cmon install")
+        return _check("schedule", name, "ok", "Task Scheduler task cmon-collect")
+    return _check("schedule", name, "skip", f"no scheduler support on {platform}")
+
+
+def _doctor_schema(con) -> dict:
+    name = "database schema is current"
+    keep = f"nothing to do; if you may go back to an older cmon, copy {os.path.abspath(DB)} first"
+    try:
+        version = None
+        if _table_exists(con, "meta") and "key" in _table_columns(con, "meta"):
+            row = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+            version = row[0] if row else None
+        if version is None:
+            if not any(_table_exists(con, t) for t in _SCHEMA_TABLES):
+                return _check("schema", name, "warn", "empty database; the next collect creates the tables",
+                              "cmon collect")
+            return _check("schema", name, "warn", f"no schema version; the next write migrates it to "
+                          f"v{SCHEMA_VERSION}", keep)
+        try:
+            v = int(version)
+        except (TypeError, ValueError):
+            return _check("schema", name, "fail", f"invalid schema version {version!r}",
+                          "restore a copy of the database, or move it aside to start a new one")
+        if v > SCHEMA_VERSION:
+            return _check("schema", name, "fail", f"schema v{v} is newer than this cmon reads "
+                          f"(v{SCHEMA_VERSION})", UPDATE_FIX)
+        if v < SCHEMA_VERSION:
+            return _check("schema", name, "warn", f"schema v{v}; the next write migrates it to "
+                          f"v{SCHEMA_VERSION}", keep)
+        _validate_current_schema(con)
+        return _check("schema", name, "ok", f"v{v}")
+    except Exception as e:
+        return _check("schema", name, "fail", _safe(e, 300),
+                      "restore a copy of the database, or move it aside to start a new one")
+
+
+def _doctor_snapshot(con) -> dict:
+    name = "last snapshot is recent"
+    fix = "cmon collect (prints the error, if any)" + (
+        f"; background logs: {CMON_HOME}/collect.err.log" if sys.platform == "darwin" else "")
+    try:
+        last = con.execute("SELECT max(observed_at) FROM snapshots WHERE provider='claude'").fetchone()[0]
+    except Exception:
+        return _check("snapshot", name, "skip", "not checked: the schema predates this cmon")
+    if last is None:
+        return _check("snapshot", name, "warn", "no snapshots yet", fix)
+    age = datetime.now(UTC) - last
+    detail = f"{_fmt_until(age)} ago"
+    if age > timedelta(minutes=GUARD_STALE_MIN):  # three missed 20-min collections, as guard reads it
+        return _check("snapshot", name, "warn", detail, fix)
+    return _check("snapshot", name, "ok", detail)
+
+
+def _doctor_db() -> list[dict]:
+    """Lock, schema and last snapshot, through one read-only connection: doctor never creates,
+    migrates or writes the database, so it's safe on a file an older cmon still uses."""
+    import re
+    import time
+
+    import duckdb
+    lock, schema, snap = "database not locked", "database schema is current", "last snapshot is recent"
+    path = os.path.abspath(DB)
+    if not os.path.exists(path):
+        return [_check("lock", lock, "skip", "no database yet"),
+                _check("schema", schema, "skip", "no database yet"),
+                _check("snapshot", snap, "warn", f"no database yet at {path}",
+                       "cmon collect (cmon install schedules it)")]
+    deadline = time.monotonic() + DOCTOR_LOCK_WAIT_S
+    while True:
+        try:
+            con = duckdb.connect(path, read_only=True)
+            break
+        except Exception as e:
+            msg = str(e)
+            if not re.search(r"\block\b", msg, re.IGNORECASE):  # a word, so "block" isn't a lock
+                return [_check("lock", lock, "skip", "not checked: the database doesn't open"),
+                        _check("schema", schema, "fail", f"can't open {path}: {_safe(msg, 300)}",
+                               f"if a newer cmon wrote it, {UPDATE_FIX}; else restore a copy of the file"),
+                        _check("snapshot", snap, "skip", "not checked: the database doesn't open")]
+            if time.monotonic() >= deadline:
+                pid = re.search(r"PID (\d+)", msg)
+                who = f"PID {pid.group(1)}" if pid else "another process"
+                return [_check("lock", lock, "warn", f"held by {who}",
+                               "read commands still work; it frees when that cmon watch or collect ends"),
+                        _check("schema", schema, "skip", "not checked: the database is locked"),
+                        _check("snapshot", snap, "skip", "not checked: the database is locked")]
+            time.sleep(0.25)
+    try:
+        return [_check("lock", lock, "ok", "free"), _doctor_schema(con), _doctor_snapshot(con)]
+    finally:
+        con.close()
+
+
+def _doctor_sync_dir(cfg: dict) -> dict:
+    name = "sync_dir reachable"
+    raw = cfg.get("sync_dir")
+    if not raw:
+        return _check("sync_dir", name, "skip", "not set")
+    unset = "reconnect the synced folder, or: cmon config clear sync_dir"
+    if not isinstance(raw, str):
+        return _check("sync_dir", name, "fail", f"not a path: {raw!r}", unset)
+    path = os.path.abspath(os.path.expanduser(raw))
+    if not os.path.isdir(path):
+        return _check("sync_dir", name, "fail", f"{path} is not an existing folder", unset)
+    if not os.access(path, os.W_OK | os.X_OK):
+        return _check("sync_dir", name, "fail", f"{path} is not writable", unset)
+    return _check("sync_dir", name, "ok", path)
+
+
+def _doctor_read_json(path: str) -> tuple[bool, object, str | None]:
+    """(present, data, error) for a hand-edited JSON file. NaN and Infinity are refused, as
+    the menu bar's decoder refuses them."""
+    def refuse(token):
+        raise ValueError(f"{token} is not valid JSON")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return True, json.load(f, parse_constant=refuse), None
+    except FileNotFoundError:
+        return False, None, None
+    except json.JSONDecodeError as e:
+        return True, None, f"not valid JSON: {e.msg} at line {e.lineno}, column {e.colno}"
+    except (OSError, UnicodeDecodeError, ValueError) as e:
+        return True, None, f"unreadable: {_safe(e)}"
+
+
+def _doctor_config() -> dict:
+    """cmon reads a broken config.json as empty, in silence: every preference falls back to its
+    default. Values are held to what 'config set' accepts."""
+    name = "config.json is valid"
+    present, data, err = _doctor_read_json(CONFIG)
+    if not present:
+        return _check("config", name, "ok", "not present; defaults apply")
+    if err or not isinstance(data, dict):
+        return _check("config", name, "fail", err or "not a JSON object",
+                      f"fix {CONFIG}, or delete it to get the defaults")
+    problems, unknown = [], sorted(k for k in data if k not in CONFIG_KEYS)
+    for key in sorted(k for k in data if k in CONFIG_KEYS):
+        value = data[key]
+        if not isinstance(value, str) or not value:
+            problems.append(f"{key}: {value!r} is not a non-empty string")
+        elif key != "sync_dir":  # whether the folder exists is the sync_dir check's job
+            try:
+                CONFIG_VALIDATORS[key](value)
+            except ValueError as e:
+                problems.append(str(e))
+    if problems:
+        if unknown:
+            problems.append(f"unknown keys, ignored: {', '.join(unknown)}")
+        return _check("config", name, "fail", "; ".join(p.rstrip(".") for p in problems),
+                      "cmon config set <key> <value>, or: cmon config clear <key>")
+    if unknown:
+        return _check("config", name, "warn", f"unknown keys, ignored: {', '.join(unknown)}",
+                      f"remove them from {CONFIG}")
+    return _check("config", name, "ok", f"{len(data)} preference(s)")
+
+
+def _is_number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _is_whole(v) -> bool:
+    """What Swift decodes as Int: 30 and 30.0 pass, 30.5 and anything past Int64 don't."""
+    if isinstance(v, float) and not (math.isfinite(v) and v.is_integer()):
+        return False
+    return _is_number(v) and -2 ** 63 <= v < 2 ** 63
+
+
+def _is_rule(v) -> bool:
+    return (isinstance(v, dict) and _is_number(v.get("every_s"))
+            and all(v.get(k) is None or _is_number(v[k]) for k in ("reset_within_min", "usage_above_pct")))
+
+
+BAR_FIELDS = {  # key -> (test, what it must be), as cmon Bar's Settings decoder reads them
+    "segments": (lambda v: isinstance(v, list) and all(isinstance(s, str) for s in v), "a list of strings"),
+    "separator": (lambda v: isinstance(v, str), "a string"),
+    "hide_empty": (lambda v: isinstance(v, bool), "true or false"),
+    "reset_above_percent": (_is_number, "a number"),
+    "reset_within_min": (_is_number, "a number"),
+    "refresh": (lambda v: isinstance(v, list) and all(_is_rule(r) for r in v),
+                "a list of rules, each with a number every_s"),
+    "stale_minutes": (_is_whole, "a whole number"),
+    "cmon": (lambda v: isinstance(v, str), "a string"),
+    "watch_command": (lambda v: isinstance(v, str), "a string"),
+}
+
+
+def _doctor_bar() -> dict:
+    """Held to cmon Bar's decoder, not just JSON syntax: a wrong type makes the app drop the
+    whole file for its defaults. null and unknown keys are fine there, so they are here."""
+    name = "bar.json is valid"
+    path = os.path.join(CMON_HOME, "bar.json")
+    fix = f"fix {path}, or delete it to get the defaults"
+    present, data, err = _doctor_read_json(path)
+    if not present:
+        return _check("bar", name, "ok", "not present; cmon Bar writes the defaults on first run")
+    if err or not isinstance(data, dict):
+        return _check("bar", name, "fail", err or "not a JSON object", fix)
+    problems = [f"{key} must be {want}" for key, (test, want) in BAR_FIELDS.items()
+                if data.get(key) is not None and not test(data[key])]
+    if problems:
+        return _check("bar", name, "fail", "; ".join(problems), fix)
+    return _check("bar", name, "ok")
+
+
+def _doctor_lines(c: dict) -> list[str]:
+    head = f"  {DOCTOR_TAGS[c['status']]:<6}{c['name']}"
+    if c["status"] in ("ok", "skip"):
+        return [f"{head} ({c['detail']})" if c["detail"] else head]
+    lines = [head]
+    if c["detail"]:
+        lines.append(f"        {c['detail']}")
+    if c["fix"]:
+        lines.append(f"        -> {c['fix']}")
+    return lines
+
+
+def doctor(args):
+    """Every check runs, then exit 1 if any failed. A warning is something to know about that
+    doesn't stop cmon from working (no schedule, a stale snapshot, a held lock)."""
+    checks = [_doctor_token(), _doctor_api(args.offline), _doctor_schedule(), *_doctor_db(),
+              _doctor_sync_dir(_read_config()), _doctor_config(), _doctor_bar()]
+    failed = sum(c["status"] == "fail" for c in checks)
+    warned = sum(c["status"] == "warn" for c in checks)
+    if args.json:
+        print(json.dumps({"version": DOCTOR_VERSION, "ok": not failed, "checks": checks}, indent=2))
+    else:
+        for c in checks:
+            print("\n".join(_doctor_lines(c)))
+        notes = f"{warned} warning(s)" if warned else ""
+        if failed:
+            print(f"\n{failed} problem(s) found" + (f", {notes}." if notes else "."))
+        else:
+            print(f"\nNo problems, {notes}." if notes else "\nAll good.")
+    if failed:
+        sys.exit(1)
+
+
 def main():
     p = argparse.ArgumentParser(
         prog="cmon", description=__doc__.splitlines()[0],
@@ -4968,7 +5355,11 @@ def main():
     pin.add_argument("-i", "--interval", type=int, default=20, help="minutes between collections (default 20)")
     pin.add_argument("--dry-run", action="store_true", help="show what it would do, don't install")
     sub.add_parser("uninstall", help="remove scheduling created by install")
-    pim = sub.add_parser("import", help="merge history from other cmon databases (e.g. old ./usage.duckdb)")
+    pdr = sub.add_parser("doctor", help="check token, API, background collection, database, sync_dir and "
+                                        "settings files; each problem comes with its fix (exit 1 if any fails)")
+    pdr.add_argument("--offline", action="store_true", help="skip the one API call")
+    pdr.add_argument("--json", action="store_true", help="{version, ok, checks[]} for assistants and scripts")
+    pim =sub.add_parser("import", help="merge history from other cmon databases (e.g. old ./usage.duckdb)")
     pim.add_argument("paths", nargs="+", metavar="PATH", help="source .duckdb files (opened read-only)")
     pp = sub.add_parser("plot", help="generate charts -> PNG (trajectory, pace-vs-target, burn)")
     pp.add_argument("-o", "--out", default=None,
@@ -5018,7 +5409,8 @@ def main():
          "collect": collect,
          "burn": burn, "watch": watch, "wait": wait, "plot": plot,
          "backtest": backtest, "tune": tune, "install": install,
-         "uninstall": uninstall, "import": import_db, "keepalive": keepalive, "sync": sync}[args.cmd](args)
+         "uninstall": uninstall, "import": import_db, "keepalive": keepalive, "sync": sync,
+         "doctor": doctor}[args.cmd](args)
     except FetchError as e:
         sys.exit(f"cmon: {e}")
 

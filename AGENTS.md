@@ -29,10 +29,17 @@ Each failing check prints its fix:
 
 | Check | What to do |
 |---|---|
-| `usage API reachable and logged in` | The user must log in to Claude Code, or run `cmon token set`. Don't try to do this for them. |
+| `usage API reachable and logged in`, `token source found` | The user must log in to Claude Code, or run `cmon token set`. Don't try to do this for them. |
 | `cmon Bar running` | `open ~/Applications/"cmon Bar.app"` |
 | `bar.json is valid` | Fix `~/.cmon/bar.json`, or delete it to get the defaults |
+| `config.json is valid` | The detail names the key: `cmon config set <key> <value>` or `cmon config clear <key>`, after asking the user |
+| `sync_dir reachable` | The synced folder is gone or read-only. Ask the user: reconnect it, or `cmon config clear sync_dir` |
+| `database schema is current` | A newer cmon wrote the database, or the file is damaged. Update cmon; never edit or delete the file |
 | Anything else | `make install` again; it is safe to repeat |
+
+From `token source found` on, the checks come from `cmon doctor`, which `make doctor`
+runs after its own checks of the app. Lines marked `warn` (nothing scheduled, a stale snapshot, a
+lock held by `cmon watch`) don't fail `make doctor`; mention them only if they matter to the user.
 
 ### Linux, Windows, or the CLI alone
 
@@ -40,6 +47,7 @@ Each failing check prints its fix:
 uv tool install git+https://github.com/LkHideki/cmon-cli
 cmon now       # check that it reads the usage
 cmon install   # optional: background collection (--dry-run shows what it would do)
+cmon doctor    # exit 0 means no check failed; each problem prints its fix
 ```
 
 cmon Bar is macOS only. cmon isn't on PyPI; the PyPI package named `cmon` is an unrelated project.
@@ -89,6 +97,13 @@ minutes old.
 
 `offline: true` means no data is available, and `providers` is then empty. `status` exits 0 even
 when offline, so check that field rather than the exit code.
+
+To diagnose an install, use `cmon doctor --json` (`--offline` skips its one API call):
+`{"version": 1, "ok": true, "checks": [{"key", "name", "status", "detail", "fix"}]}`, with `status`
+one of `ok`, `warn`, `fail`, `skip`, and `fix` the command or step to take, or `null`. `ok` is
+false, and the exit code 1, only when a check has `fail`. The keys are `token`, `api`, `schedule`,
+`lock`, `schema`, `snapshot`, `sync_dir`, `config`, `bar`. It never shows the token and never
+writes the database.
 
 To gate a script or hook on the limit, use `cmon guard --window session --max 90`: exit 0 under
 the percent, 1 at or above it, 3 when there's no fresh data (no cache, window missing, or older

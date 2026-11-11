@@ -73,6 +73,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   session id over each window's current cycle, so they lag by up to one collection. It never calls
   the API or opens the database and always exits 0; missing or invalid stdin prints the plan
   alone. `cmon status` is unchanged.
+- **`cmon doctor`: the installation check on any OS.** Until now only `make doctor` existed, and
+  only for a macOS clone. It checks the token source (named, never printed), one call to the usage
+  API (`--offline` skips it), the background job where `cmon install` puts it on each OS, the
+  database lock, schema version and age of the last snapshot, `sync_dir` when set, and
+  `config.json` and `bar.json` when present. Each line is `ok`, `warn`, `FAIL` or `skip`, and each
+  problem prints its fix. It exits 1 only when a check fails; nothing scheduled, a stale snapshot
+  or a held lock are warnings. `--json` prints `{version, ok, checks[]}` for assistants. It opens
+  the database read-only and never migrates or writes it.
 
 ### Changed
 
@@ -80,6 +88,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   reset. It used to run only when a reset was near, so a hook wired to a webhook missed the alert
   that matters most. If you use a hook, expect up to one more call per window cycle; it still
   never runs on the deduplicated repeats of an alert.
+- **`make doctor` runs `cmon doctor`** after its checks of cmon Bar, so it now also reports the
+  token, background collection, the database, `sync_dir` and `config.json`. Its exit code still
+  means the same: 1 when any check fails, and warnings don't count. `bar.json is valid` now holds
+  the file to the types cmon Bar decodes, not just JSON syntax: a file that parsed but had, say, a
+  number in `segments` passed before, while the app ignored the whole file. A `cmon` command too old
+  to have `doctor` fails `cmon command is up to date`; `make install` fixes it.
 
 ### Fixed
 

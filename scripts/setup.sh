@@ -105,12 +105,20 @@ do_doctor() {
     else bad "cmon Bar starts at login" "make install"; fi
     if pgrep -f "$APP/Contents/MacOS/CmonBar" >/dev/null; then ok "cmon Bar running"
     else bad "cmon Bar running" "open \"$APP\""; fi
-    # -convert, not -lint: -lint rejects valid JSON.
-    if [ ! -f "$BAR_JSON" ] || plutil -convert xml1 -o /dev/null "$BAR_JSON" >/dev/null 2>&1; then ok "bar.json is valid"
-    else bad "bar.json is valid" "fix $BAR_JSON, or delete it to get the defaults"; fi
+    # The checks that aren't about the app (token, usage API, background collection, database,
+    # sync_dir, config.json, bar.json) live in 'cmon doctor', for every platform. Its FAIL lines
+    # count as problems here; its warnings don't, as before.
     if [ -x "$bin" ]; then
-        if "$bin" status --json --live 2>/dev/null | grep -q '"offline": false'; then ok "usage API reachable and logged in"
-        else bad "usage API reachable and logged in" "run Claude Code once to log in, then: cmon token status"; fi
+        if "$bin" doctor --help >/dev/null 2>&1; then
+            rc=0
+            report="$("$bin" doctor)" || rc=$?
+            printf '%s\n' "$report" | grep '^  ' || true
+            fails="$(printf '%s\n' "$report" | grep -c '^  FAIL' || true)"
+            if [ "$rc" -ne 0 ] && [ "$fails" -eq 0 ]; then bad "cmon doctor finished" "run: $bin doctor"; fi
+            problems=$((problems + fails))
+        else
+            bad "cmon command is up to date" "make install"
+        fi
     fi
     if [ "$problems" -eq 0 ]; then printf '\nAll good.\n'; return 0; fi
     printf '\n%s problem(s) found.\n' "$problems"

@@ -57,6 +57,7 @@ package named `cmon` is an unrelated project, so install from this repository:
 ```bash
 uv tool install git+https://github.com/LkHideki/cmon-cli
 cmon now
+cmon doctor   # checks the token, the API, background collection and the database
 ```
 
 To work on the code instead, clone it and run `uv sync`; commands then run as `uv run cmon …`.
@@ -177,6 +178,7 @@ uv run cmon plot      # charts -> usage.png
 uv run cmon backtest  # how accurate past projections were (--replay scores existing history)
 uv run cmon tune      # fit the projection's parameters to your own history
 uv run cmon install   # schedule background collection in OS scheduler
+uv run cmon doctor    # what's wrong and how to fix it (--json for assistants)
 ```
 
 History lives in `~/.cmon/usage.duckdb` whatever directory you run from. Global option
@@ -831,6 +833,56 @@ the data used to choose them. It **refuses to save anything** unless the winner 
 parameters on that unseen slice, and unless there are at least 200 scoreable predictions; a grid
 search over a few dozen points fits noise, not your routine. The result is four numbers stored as
 a single small JSON row in the database, next to the history they were fitted on.
+
+### `cmon doctor` — what's wrong and how to fix it
+
+```bash
+cmon doctor            # every check, and the fix for each problem
+cmon doctor --offline  # the same without its one API call
+cmon doctor --json     # for assistants and scripts
+```
+
+It works on any OS and after any kind of install, so `uv tool install` users get the checks that
+`make doctor` runs on a macOS clone. In order:
+
+| Check | Fails or warns when |
+|---|---|
+| `token source found` | No token in `CLAUDE_OAUTH_TOKEN`, the OS vault or Claude Code's login (fail), or Claude Code's access token has expired (warn). Same lookup as `cmon token status`; doctor names the source and never prints the token, not even masked |
+| `usage API reachable and logged in` | The one call to the usage endpoint fails; the fix depends on the cause (log in, network, update cmon). Nothing is saved |
+| `background collection scheduled` | Nothing where `cmon install` puts it: the LaunchAgent on macOS, the systemd timer or the crontab line on Linux, the Task Scheduler task on Windows (warn). It fails when the job points at a file that's gone, such as a deleted clone, and warns when it collects into another database |
+| `database not locked` | Another process holds DuckDB's write lock for more than 2 s; the detail names its PID (warn) |
+| `database schema is current` | The schema is newer than this cmon reads, or the file isn't a usable database (fail); older, so the next write migrates it (warn) |
+| `last snapshot is recent` | No snapshot yet, or the last one is over 60 minutes old (warn) |
+| `sync_dir reachable` | `sync_dir` is set and the folder is gone or read-only (fail). Skipped when unset |
+| `config.json is valid` | `~/.cmon/config.json` isn't JSON, or holds a value `cmon config set` would refuse (fail), or keys cmon doesn't know (warn). cmon itself reads a broken file as empty, in silence |
+| `bar.json is valid` | `~/.cmon/bar.json` isn't JSON or has a value of the wrong type for cmon Bar, which then ignores the whole file (fail). `null` and unknown keys are fine, as in the app |
+
+```text
+  ok    token source found (Claude Code credentials, expires in 5h 12m)
+  ok    usage API reachable and logged in (Current session 12%, All models 40%)
+  warn  background collection scheduled
+        not scheduled
+        -> cmon install
+  ok    database not locked (free)
+  ok    database schema is current (v2)
+  warn  last snapshot is recent
+        3h 5m ago
+        -> cmon collect (prints the error, if any)
+  skip  sync_dir reachable (not set)
+  ok    config.json is valid (2 preference(s))
+  ok    bar.json is valid (not present; cmon Bar writes the defaults on first run)
+
+No problems, 2 warning(s).
+```
+
+It exits 1 when any check fails and 0 otherwise: a warning is worth knowing about but doesn't stop
+cmon from working. The database is opened read-only, so doctor never creates, migrates or writes
+it, and it doesn't touch the status cache either. `--json` prints
+`{"version": 1, "ok": …, "checks": [{"key", "name", "status", "detail", "fix"}, …]}`, with
+`status` one of `ok`, `warn`, `fail`, `skip`, `fix` `null` when there's nothing to do, and these
+keys in this order: `token`, `api`, `schedule`, `lock`, `schema`, `snapshot`, `sync_dir`,
+`config`, `bar`. `make doctor` checks cmon Bar (installed, starts at login, running), then runs
+`cmon doctor` and counts its failures as its own.
 
 ## Continuous collection
 
