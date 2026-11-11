@@ -5,7 +5,15 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.9.0] — 2026-11-11
+
+### Upgrading
+
+- Run `git pull && make install`: `make doctor` now calls `cmon doctor`, and an installed `cmon`
+  older than 0.9.0 fails its `cmon command is up to date` check until reinstalled.
+- The database is unchanged, so 0.8.0 can still read it. The new caches, `projection.json` and
+  `sessions.json` in `~/.cmon`, appear after the next `collect`.
+- If you set `CMON_HOOK`, it now also runs on rate alerts (see Changed).
 
 ### Added
 
