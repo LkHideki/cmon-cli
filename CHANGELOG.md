@@ -7,6 +7,36 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.1] — 2026-11-11
+
+The project is ready for outside contributions. The `cmon` command and the database are unchanged
+from 0.9.0.
+
+### Upgrading
+
+- Nothing to do. `git pull && make install` only updates the version number.
+
+### Added
+
+- **A contributing guide**, [CONTRIBUTING.md](CONTRIBUTING.md): where to start, the project
+  layout, how to reproduce the DuckDB 1.1.1 CI job locally, what a change needs (a test, a
+  changelog entry, docs, JSON that only gains fields, migrations, no secrets) and how releases are
+  cut.
+- **A security policy**, [SECURITY.md](SECURITY.md): vulnerabilities go to private GitHub
+  advisories, and it says which parts of cmon a security bug would touch: the token, Claude
+  Code's login, usage data and the commands cmon runs.
+- **A Code of Conduct** (Contributor Covenant 2.1), and issue forms for bugs, features and
+  questions. The bug form asks for `cmon doctor --json --offline`, which never shows the token,
+  and warns that it prints your home and `sync_dir` paths.
+- **[ROADMAP.md](ROADMAP.md), now in English**: the candidate features still open, each with its
+  effort, the code it builds on and its risks, plus what 0.9.0 shipped.
+
+### Fixed
+
+- README's Development section listed `CMON_OAUTH_CLIENT_ID` and `CMON_OAUTH_TOKEN_URL`, which
+  were removed in 0.6, and said CI ran only ruff and a smoke test. It also runs pytest, including
+  on DuckDB 1.1.1, and builds and tests cmon Bar on macOS.
+
 ## [0.9.0] — 2026-11-11
 
 ### Upgrading
