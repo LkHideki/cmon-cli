@@ -3254,6 +3254,92 @@ def _burn_summary(rows):
     return tok, cost, mix
 
 
+def _cost(model, i, o, r, c) -> float:
+    """API-equivalent US$ of one token tuple."""
+    p = _price(model)
+    return (i * p[0] + o * p[1] + r * p[2] + c * p[3]) / 1e6
+
+
+CYCLE_JITTER_S = 3600  # resets_at moves by milliseconds between reads; more than this = new cycle
+_REST = "\x00rest"  # group of the rows a plan-share filter leaves out
+
+
+def _plan_share(con, key, since=None, until=None, col="surface", src="token_terminal",
+                where="", params=()):
+    """Split the official percent of window `key` across groups of `col`, by the API-equivalent
+    cost each group logged while the percent rose. Snapshot pairs whose percent didn't move
+    (it's an integer) carry their cost into the next pair that did, so a tick isn't charged to
+    whoever happened to be active in its last minutes. A rise with no logged cost goes to
+    'other': claude.ai chat, other devices, cloud sessions. A new cycle (resets_at moved)
+    contributes its whole first reading, split by the cost logged since the cycle began.
+    Cost left over after the last tick of a cycle is dropped: it hasn't moved the percent yet.
+    `where`/`params` select the rows to group (callers build them from fixed choices); the
+    rows they leave out still take their part of each rise, reported as 'rest', so a filter
+    narrows the view without inflating what's left.
+    Returns {'groups': {grp: pp}, 'rest': pp, 'other': pp, 'total': pp, 'cycles': n} or None
+    without snapshots in the period."""
+    scoped = key.split(":", 1)[1].lower() if ":" in key else None
+    tok_where = "provider='claude'" + (" AND lower(model) LIKE ?" if scoped else "")
+    grp = f"CASE WHEN true{where} THEN {col} ELSE '{_REST}' END" if where else col
+    tok_params = [*params, f"%{scoped}%"] if scoped else list(params)
+    bounds, bparams = "", []
+    if since:
+        bounds += " AND ts > ?"
+        bparams.append(since)
+    if until:
+        bounds += " AND ts <= ?"
+        bparams.append(until)
+    rows = con.execute(
+        "WITH s AS (SELECT observed_at ts, percent p, resets_at r, window_minutes w, "
+        "  lag(observed_at) OVER o pts, lag(percent) OVER o pp, lag(resets_at) OVER o pr "
+        "  FROM snapshots WHERE provider='claude' AND key=? WINDOW o AS (ORDER BY observed_at)), "
+        "c AS (SELECT *, pts IS NULL OR (r IS DISTINCT FROM pr AND (r IS NULL OR pr IS NULL "
+        "  OR abs(epoch(r) - epoch(pr)) > ?)) AS new_cycle, r - INTERVAL 1 MINUTE * w cs FROM s), "
+        "iv AS (SELECT ts, new_cycle, CASE WHEN new_cycle THEN p ELSE p - pp END d, "
+        "  CASE WHEN NOT new_cycle THEN pts WHEN cs IS NULL THEN coalesce(pts, ts) "
+        "       WHEN pts IS NULL OR cs > pts THEN cs ELSE pts END st "
+        f"  FROM c WHERE true{bounds}), "
+        f"t AS (SELECT {grp} grp, model, observed_at, input_tokens i, output_tokens o, "
+        f"  cache_read_tokens cr, cache_write_tokens cw FROM {src} WHERE {tok_where}) "
+        "SELECT iv.ts, iv.new_cycle, iv.d, t.grp, t.model, sum(t.i), sum(t.o), sum(t.cr), sum(t.cw) "
+        "FROM iv LEFT JOIN t ON t.observed_at > iv.st AND t.observed_at <= iv.ts "
+        "GROUP BY ALL ORDER BY iv.ts",
+        [key, CYCLE_JITTER_S, *bparams, *tok_params]).fetchall()
+    if not rows:
+        return None
+    groups, other, cycles = {}, 0.0, 0
+    pending = {}  # grp -> cost logged since the last tick
+    cur, cur_cost = None, {}
+
+    def settle(new_cycle, d, costs):
+        nonlocal other, cycles, pending
+        if new_cycle or not cycles:  # a period starting mid-cycle still covers that cycle
+            pending = {}  # cost of the previous cycle that never ticked: not this cycle's
+            cycles += 1
+        for g, v in costs.items():
+            pending[g] = pending.get(g, 0.0) + v
+        if d <= 0:
+            return
+        total = sum(pending.values())
+        if total <= 0:
+            other += d
+        else:
+            for g, v in pending.items():
+                groups[g] = groups.get(g, 0.0) + d * v / total
+        pending = {}
+    for ts, new_cycle, d, grp, model, i, o, cr, cw in rows:
+        if cur is None or ts != cur[0]:
+            if cur is not None:
+                settle(cur[1], cur[2], cur_cost)
+            cur, cur_cost = (ts, new_cycle, d), {}
+        if grp is not None:
+            cur_cost[grp] = cur_cost.get(grp, 0.0) + _cost(model, i or 0, o or 0, cr or 0, cw or 0)
+    settle(cur[1], cur[2], cur_cost)
+    rest = groups.pop(_REST, 0.0)
+    return {"groups": groups, "rest": rest, "other": other, "total": sum(groups.values()) + rest + other,
+            "cycles": cycles}
+
+
 def burn(args):
     """Report tokens & estimated US$ from local Claude Code logs."""
     con = db()
