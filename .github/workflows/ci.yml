@@ -31,8 +31,8 @@ jobs:
           - python-version: "3.13"
             duckdb: "duckdb"
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           python-version: ${{ matrix.python-version }}
       - run: uv sync
@@ -48,6 +48,6 @@ jobs:
   menubar:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build and test cmon Bar (Swift)
         run: menubar/test.sh
