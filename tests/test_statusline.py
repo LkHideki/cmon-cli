@@ -308,19 +308,38 @@ def test_cache_hit_is_fast(clock, cli, stdin, no_backend):
 
 def test_fresh_process_never_imports_duckdb_or_requests(home, tmp_path):
     """A statusLine command is a new process per redraw: prove the whole run stays off DuckDB
-    (no lock wait) and off the network stack."""
+    (no lock wait), off the network stack and off every credential store. conftest's blocks
+    don't reach a child, and the macOS Keychain is the real one whatever HOME says, so the
+    child stubs the credential readers and the sockets itself and reports any call."""
     reset = datetime.now(UTC) + 2 * H + timedelta(minutes=1)
     cmon._write_cache([("session", "Current session", 42.0, reset.isoformat(), True)], datetime.now(UTC))
-    code = (f"import sys; sys.path.insert(0, {ROOT!r}); import cmon; sys.argv = ['cmon', 'statusline']; "
-            "cmon.main(); print(sorted(m for m in sys.modules if m.split('.')[0] in ('duckdb', 'requests')), "
-            "file=sys.stderr)")
-    env = {k: v for k, v in os.environ.items() if not k.startswith("CMON_")}
+    code = f"""
+import json, socket, sys
+sys.path.insert(0, {ROOT!r})
+import cmon
+calls = []
+def stub(name):
+    def refuse(*_a, **_k):
+        calls.append(name)
+        raise RuntimeError("statusline must not reach " + name)
+    return refuse
+for name in ("_resolve_token", "_keyring", "_claude_code_cred", "_purge_legacy_chain", "_session", "fetch"):
+    setattr(cmon, name, stub(name))
+socket.create_connection = stub("socket.create_connection")
+socket.socket.connect = stub("socket.connect")
+sys.argv = ["cmon", "statusline"]
+cmon.main()
+print(json.dumps({{"calls": calls, "modules": sorted(m for m in sys.modules
+                                                    if m.split(".")[0] in ("duckdb", "requests", "keyring"))}}),
+      file=sys.stderr)
+"""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CMON_") and k != "CLAUDE_OAUTH_TOKEN"}
     env.update(HOME=str(home), CMON_DB=str(tmp_path / "usage.duckdb"))
     out = subprocess.run([sys.executable, "-c", code], cwd=tmp_path, env=env, capture_output=True, text=True,
                          input=json.dumps({"session_id": "x", "cost": {"total_cost_usd": 1.5}}), timeout=30)
     assert out.returncode == 0, out.stderr
     assert out.stdout == "5h 42% 2h0m · session $1.50\n"
-    assert out.stderr.strip() == "[]"
+    assert json.loads(out.stderr) == {"calls": [], "modules": []}
     assert not (tmp_path / "usage.duckdb").exists()
 
 

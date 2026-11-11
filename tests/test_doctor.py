@@ -83,6 +83,8 @@ def test_any_fail_exits_1_and_prints_the_fix(doctor_env, cli, paths):
     assert lines[i + 1].startswith("        not valid JSON")
     assert lines[i + 2].startswith("        -> fix ") and "delete it to get the defaults" in lines[i + 2]
     assert lines[-1] == "1 problem(s) found, 2 warning(s)."
+    js = cli("doctor", "--offline", "--json")  # the field AGENTS.md tells assistants to read
+    assert js.exit_code == 1 and json.loads(js.stdout)["ok"] is False
 
 
 def test_warnings_alone_exit_0(doctor_env, cli):
@@ -372,6 +374,24 @@ def test_locked_database_warns_with_the_holder(paths, monkeypatch):
         holder.wait()
     assert lock["status"] == "warn" and f"PID {holder.pid}" in lock["detail"]
     assert (schema["status"], snap["status"]) == ("skip", "skip")
+
+
+def test_doctor_opens_read_only_beside_another_reader_and_writes_nothing(paths, monkeypatch):
+    # A read-only holder shares its lock only with other read-only opens: a writing connection
+    # would report the lock as held. The older schema is one a writing cmon would migrate.
+    _set_version("1")
+    monkeypatch.setattr(cmon, "DOCTOR_LOCK_WAIT_S", 0.2)
+    before = paths.db.read_bytes()
+    reader = HOLD.replace("duckdb.connect(sys.argv[1])", "duckdb.connect(sys.argv[1], read_only=True)")
+    holder = subprocess.Popen([sys.executable, "-c", reader, str(paths.db), "5"], stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "locked"
+        checks = _by_key(cmon._doctor_db())
+    finally:
+        holder.kill()
+        holder.wait()
+    assert (checks["lock"]["status"], checks["schema"]["status"]) == ("ok", "warn")
+    assert paths.db.read_bytes() == before
 
 
 # --- sync_dir ---
