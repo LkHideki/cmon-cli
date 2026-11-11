@@ -147,6 +147,9 @@ that doesn't open the window is retried after 30 minutes; attempts are logged to
 Windows then run back to back whether you work or not, so you may sit down with only part of one
 left. The reset comes sooner than if your first request had started it.
 
+**`sync_dir`** and **`device_name`** share usage between your machines; see
+[`cmon sync`](#cmon-sync--usage-by-device).
+
 ## Usage
 
 The examples use `uv run cmon`, for a clone of this repository. After `make install` or
@@ -160,6 +163,7 @@ uv run cmon wait      # block until 5h window resets, then notify
 uv run cmon collect   # save 1 snapshot to database (with UTC timestamp)
 uv run cmon trends    # consumption history: per-label summary + per-cycle peaks/anomaly
 uv run cmon burn      # tokens & estimated US$ (from local Claude Code logs)
+uv run cmon sync      # share usage with your other devices through a synced folder
 uv run cmon plot      # charts -> usage.png
 uv run cmon backtest  # how accurate past projections were (--replay scores existing history)
 uv run cmon tune      # fit the projection's parameters to your own history
@@ -199,7 +203,10 @@ title shows the quota as `90% 75'  44% 91` — 5h window, then weekly limit, eac
 used and time until it resets: plain hours from 2 h up, minutes with `'` below that and
 seconds with `"` in the last minute — and a click
 opens a per-window breakdown with progress bars, reset times and when the next update is
-due.
+due. Under **By client**, one bar per window shows who used this cycle's percent — VS Code,
+Terminal, Desktop app, SDK — and how much of it nothing on this Mac logged (*claude.ai &
+elsewhere*). The split comes from the background `cmon collect` (see
+[`--plan`](#cmon-burn--tokens--cost-from-logs)), so it appears once collection is installed.
 
 ```sh
 make install                  # everything, including the cmon command this app needs
@@ -219,7 +226,8 @@ is reported in the menu and defaults are used):
   `reset_within_min` (100) minutes away; while shown they count down on their own —
   `{wk_reset_h}` (hours)
   `{wk_reset_hm}` `{age}` (minutes since the data was read); `{5h_bar}` `{wk_bar}` draw usage
-  as a block and `{5h_dot}` `{wk_dot}` as a traffic light. The title dims when the data is
+  as a block and `{5h_dot}` `{wk_dot}` as a traffic light; `{top_client}` `{5h_top_client}` name
+  the client that used the most of the week or the 5h window (`VS Code 57%`). The title dims when the data is
   older than `stale_minutes`. With `"hide_empty": true`, a word holding a blank placeholder and
   any segment left empty disappear, which suits labelled layouts:
 
@@ -291,6 +299,9 @@ the endpoint doesn't expose: **tokens and estimated US$ by model, day, project, 
 ```bash
 uv run cmon burn                    # by model, last 30 days (default)
 uv run cmon burn --by surface       # by client: terminal / vscode / app / sdk (-p)
+uv run cmon burn --by surface --plan   # who spent this week's percent (see below)
+uv run cmon burn --by project --surface vscode   # only some clients (comma-separated)
+uv run cmon burn --by device        # by machine, once 'cmon sync' is set up
 uv run cmon burn --by project       # attribution by project (where your plan went)
 uv run cmon burn --since 7d         # smaller window (24h, 7d, ISO date…)
 uv run cmon burn --since all        # full history (but Claude Code only keeps ~30d)
@@ -313,7 +324,33 @@ available, or `--since 7d`/`24h`/ISO date for smaller windows.
 
 `--by surface` separates by where you used it (the `entrypoint` field in logs). Only
 Claude Code, though — different accounts (by email) **are not** separable: transcripts
-don't record the account, and claude.ai chat doesn't write logs.
+don't record the account, and claude.ai chat doesn't write logs. A client cmon doesn't know yet
+shows up under its raw entrypoint.
+
+**Share of the plan: `--plan`.** US$ is what the API would charge; what runs out on a subscription
+is the percent. `--plan` splits the official percent across the groups of any `--by`:
+
+```text
+$ cmon burn --by surface --plan
+Consumption by surface since 2026-11-04 10:59 -03 (API equivalent):
+  vscode                  1108.3M tok   US$    839.39     44.7 pp   59%
+  terminal                 832.4M tok   US$    522.88     26.5 pp   35%
+  sdk (-p/agent)            90.4M tok   US$     82.25      4.7 pp    6%
+  other (no local log)                                     0.0 pp    0%
+  TOTAL                   2031.1M tok   US$   1444.51     76.0 pp  100%
+```
+
+Each rise of the percent between two snapshots is charged to the groups in proportion to the
+API-equivalent cost they logged meanwhile; cost rather than tokens, because the limit weighs models
+differently and cache reads are cheap. The percent is an integer, so snapshots where it didn't move
+pass their cost on to the next one that did. A rise with nothing logged is **other**: claude.ai
+chat, other devices, cloud sessions. It needs snapshot history (`cmon install`, `watch`), it's an
+estimate, and it gets better the closer together the snapshots are.
+
+Without `--since` it covers the window's current cycle. `--plan` takes `weekly` (default), `5h` or a
+scoped model such as `fable`. With `--surface` or `--device`, the clients filtered out keep their
+points as *rest (filtered out)*, so what's left isn't inflated. `--json` with `--plan` prints an
+object with `window`, `since`, `cycles`, `total_pp`, `other_pp` and `groups`, each with `plan_pp`.
 
 Scanning is incremental (caches by `mtime`+size, deduplicates by `uuid`): the
 first run reads everything (~tens of seconds on large bases), subsequent runs take
@@ -340,6 +377,28 @@ the API — interrupts (`[Request interrupted by user]`), injected notices, abor
 Their `usage` block is all zeros, so they cost nothing and don't move your totals; they
 appear only because `cmon` mines every transcript line carrying a `usage` field. Safe to
 ignore — real consumption is under `Opus`/`Sonnet`/`Haiku`/`Fable`.
+
+### `cmon sync` — usage by device
+
+Each machine only sees its own transcripts. To put them together, point every machine at a folder
+they already sync (iCloud Drive, Dropbox, Syncthing, a network share):
+
+```bash
+cmon config set sync_dir ~/Library/Mobile\ Documents/com~apple~CloudDocs/cmon
+cmon config set device_name work-mbp   # optional; defaults to the short hostname
+cmon sync                              # once now; 'collect' does it after every collection
+cmon burn --by device --plan
+```
+
+Each machine writes its own rows to `<sync_dir>/<device id>.parquet` and imports the other
+machines' files. It exports only what it read from its own transcripts, so nothing echoes back,
+and only the terminal account's sessions. Each file records its account, and a file from another
+Claude account is skipped, since its usage doesn't count against this plan. Imports are keyed by
+message, so running it twice, or a conflict copy made by the sync tool, adds nothing. Renaming a
+device relabels its history on the next sync.
+
+The files carry project names and session ids, never prompts or code. They stay in your folder,
+readable only by your user. There's no server.
 
 ### `cmon watch` — live TUI
 

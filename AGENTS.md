@@ -62,6 +62,8 @@ cmon Bar is macOS only. cmon isn't on PyPI; the PyPI package named `cmon` is an 
 - Don't edit `~/.cmon/usage.duckdb` by hand. Newer cmon versions migrate it on first use, in one
   transaction, and older versions can't read the result: if the user may go back, copy it first.
 - `cmon watch` and `cmon collect` hold DuckDB's write lock. Read commands degrade rather than fail.
+- Ask before setting `sync_dir`: it makes cmon write project names and session ids into that folder
+  every 20 minutes, and the folder is usually synced to a cloud service.
 
 ## Reading the data
 
@@ -76,8 +78,17 @@ Prefer `cmon status --json`, the stable contract (`--live` forces an API call):
     "resets_at": "2026-11-04T14:00:00+00:00", "active": true}]}}}
 ```
 
+A window may also carry `by_client` (`clients[]` with `key`, `label`, `share` as a fraction of
+what the window used, plus `other`), written by `cmon collect` for the current cycle; it's absent
+until collection has run.
+
 `offline: true` means no data is available, and `providers` is then empty. `status` exits 0 even
 when offline, so check that field rather than the exit code.
+
+For where the percent went, use `cmon burn --by surface --plan --json` (also `--by project`,
+`model`, `day`, `device`): `groups[].plan_pp` is each group's points of the window's percent over
+the current cycle, and `other_pp` is what rose with nothing logged on this machine (claude.ai chat,
+other devices). It's an estimate built from snapshots and local transcripts.
 
 ## Explaining the menu bar
 

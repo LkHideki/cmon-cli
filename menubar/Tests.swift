@@ -82,6 +82,29 @@ let both = try! JSONDecoder().decode(Settings.self, from: Data("""
 check(both.refreshInterval(resetLeft: 30 * m, usage: 40) == 600, "conditions combine with AND (one fails)")
 check(both.refreshInterval(resetLeft: 30 * m, usage: 60) == 45, "conditions combine with AND (both hold)")
 
+// By client: optional in the JSON, drives {top_client} and the menu legend.
+let splitJSON = """
+{"version":1,"offline":false,"observed_at":"\(iso(-12))","age_s":12,"providers":{"claude":{"windows":[
+{"key":"session","label":"Current session","percent":10,"resets_at":"\(iso(3600))","active":true},
+{"key":"weekly_all","label":"All models","percent":80,"resets_at":"\(iso(86400))","active":true,
+ "by_client":{"computed_at":"\(iso(-600))","other":0.1,"clients":[
+  {"key":"cli","label":"Terminal","share":0.3},{"key":"claude-vscode","label":"VS Code","share":0.6}]}}]}}}
+"""
+let split = try! JSONDecoder().decode(Snapshot.self, from: Data(splitJSON.utf8))
+let week = split.window("weekly_all")!
+check(topClient(week) == "VS Code 60%", "top client of the week")
+check(topClient(split.window("session")) == "" && clientLines(split.window("session")!).isEmpty,
+      "no split, nothing shown")
+let lines = clientLines(week)
+check(lines.map(\.label) == ["VS Code", "Terminal", "claude.ai & elsewhere"], "legend order, other last")
+check(abs(lines[0].points - 48) < 1e-9 && abs(lines[2].points - 8) < 1e-9, "points of the limit")
+check(splitCaption(week, now: now) == "80% used · split 10 min ago", "caption says how old the split is")
+var topTitle = Settings()
+topTitle.hideEmpty = true
+topTitle.segments = ["{wk_pct}", "{5h_top_client}", "{top_client}"]
+check(renderTitle(topTitle, split, now: now) == "80%  VS Code 60%", "top client placeholder, blank one hidden")
+check(snapshot(session: 2, resetIn: 150 * m).window("weekly_all")?.byClient == nil, "older JSON still decodes")
+
 if failures > 0 {
     print("\(failures) failed")
     exit(1)

@@ -545,7 +545,8 @@ def token_clear(_):
 
 # --- Config: persisted user preferences (~/.cmon/config.json) ---
 CONFIG = os.path.expanduser("~/.cmon/config.json")
-CONFIG_KEYS = {"timezone", "quiet_hours", "keepalive"}  # allowlist; extend here as new preferences are added
+# allowlist; extend here as new preferences are added
+CONFIG_KEYS = {"timezone", "quiet_hours", "keepalive", "sync_dir", "device_name"}
 
 
 def _validate_timezone(value: str) -> str:
@@ -612,8 +613,24 @@ def _validate_keepalive(value: str) -> str:
     return value
 
 
+def _validate_sync_dir(value: str) -> str:
+    path = os.path.abspath(os.path.expanduser(value))
+    if not os.path.isdir(path):
+        raise ValueError(f"Invalid sync_dir {value!r}: not an existing folder. Use one your devices already "
+                         "sync (iCloud Drive, Dropbox, Syncthing…).")
+    return path
+
+
+def _validate_device_name(value: str) -> str:
+    name = value.strip()
+    if not (0 < len(name) <= 40) or not all(c.isalnum() or c in " ._-" for c in name):
+        raise ValueError(f"Invalid device_name {value!r}. Use up to 40 letters, digits, spaces, '.', '_' or '-'.")
+    return name
+
+
 CONFIG_VALIDATORS = {"timezone": _validate_timezone, "quiet_hours": _validate_quiet_hours,
-                     "keepalive": _validate_keepalive}
+                     "keepalive": _validate_keepalive, "sync_dir": _validate_sync_dir,
+                     "device_name": _validate_device_name}
 
 
 def _read_config() -> dict:
@@ -1357,9 +1374,29 @@ def collect(args):
     print(f"{ts:%Y-%m-%d %H:%M} collected:")
     for _k, lbl, pct, reset, _a in rows:
         print(f"  {lbl:16} {pct:4.0f}%  reset {reset[:16] if reset else '-'}")
+    _collect_sync(con)
+    _refresh_client_share(con, rows, ts)
     if getattr(args, "alert", False):
         _fire_rate_alerts(rows, con)  # rate-based: at current pace hits 100% before reset
         _fire_lead_alert(rows)  # time-based: 5h window resets in <= CMON_ALERT_LEAD min (+ hook)
+
+
+def _collect_sync(con) -> None:
+    """With sync_dir set, exchange rows with the other devices after each collection.
+    Best-effort: a missing folder or a bad file is reported, never fails the collection."""
+    sync_dir = _read_config().get("sync_dir")
+    if not sync_dir:
+        return
+    try:
+        scan_logs(con, quiet=True)
+        got = sync_devices(con, _validate_sync_dir(sync_dir))
+    except Exception as e:
+        print(f"cmon: sync skipped: {e}", file=sys.stderr)
+        return
+    for name, n in got["imported"].items():
+        print(f"  synced {n} new rows from {name}")
+    for e in got["errors"]:
+        print(f"cmon: sync could not read {e}", file=sys.stderr)
 
 
 def import_db(args):
@@ -2801,10 +2838,62 @@ def _status_json(got) -> dict:
         return {"version": 1, "offline": True, "observed_at": None, "age_s": None, "providers": {}}
     rows, age = got
     observed = datetime.now(UTC) - timedelta(seconds=age)
-    windows = [{"key": key, "label": label, "percent": percent, "resets_at": resets_at,
-                "active": bool(active)} for key, label, percent, resets_at, active in rows]
+    windows = []
+    for key, label, percent, resets_at, active in rows:
+        w = {"key": key, "label": label, "percent": percent, "resets_at": resets_at, "active": bool(active)}
+        if resets_at and (split := _client_share_for(key, resets_at)):
+            w["by_client"] = split  # optional, from the last 'collect'
+        windows.append(w)
     return {"version": 1, "offline": False, "observed_at": observed.isoformat(),
             "age_s": round(age), "providers": {"claude": {"windows": windows}}}
+
+
+CLIENT_NAMES = {"cli": "Terminal", "claude-vscode": "VS Code", "claude-desktop": "Desktop app",
+                "sdk-cli": "SDK"}
+SHARE_WINDOWS = {"session": 300, "weekly_all": 10080}
+
+
+def _clients_cache() -> str:
+    return os.path.join(CMON_HOME, "clients.json")
+
+
+def _refresh_client_share(con, rows, now_utc) -> None:
+    """Cache each window's split by client over its current cycle, for 'status --json' and
+    cmon Bar: status must stay a file read, and the split needs the database. Best-effort."""
+    try:
+        cycles = {}
+        for key, _lbl, _pct, reset, _a in rows:
+            if key in SHARE_WINDOWS and reset:
+                cycles[key] = (reset, datetime.fromisoformat(reset) - timedelta(minutes=SHARE_WINDOWS[key]))
+        if not cycles:
+            return
+        scan_logs(con, since=min(start for _r, start in cycles.values()), quiet=True)
+        windows = {}
+        for key, (reset, start) in cycles.items():
+            got = _plan_share(con, key, since=start)
+            if not got or got["total"] <= 0:
+                continue
+            total = got["total"]
+            clients = [{"key": g, "label": CLIENT_NAMES.get(g, g), "share": round(v / total, 4)}
+                       for g, v in sorted(got["groups"].items(), key=lambda kv: -kv[1]) if v / total >= 0.005]
+            windows[key] = {"resets_at": reset, "clients": clients, "other": round(got["other"] / total, 4)}
+        _atomic_write_json(_clients_cache(), {"version": 1, "computed_at": now_utc.isoformat(), "windows": windows})
+    except Exception as e:
+        print(f"cmon: client split skipped: {e}", file=sys.stderr)
+
+
+def _client_share_for(key, resets_at):
+    """Cached split of `key` if it was computed for the same cycle, else None."""
+    try:
+        with open(_clients_cache(), encoding="utf-8") as f:
+            data = json.load(f)
+        w = data["windows"][key]
+        if abs((datetime.fromisoformat(w["resets_at"]) - datetime.fromisoformat(resets_at)).total_seconds()) \
+                > CYCLE_JITTER_S:
+            return None  # a new cycle began since: the old split would be wrong
+        return {"computed_at": data["computed_at"], "clients": w["clients"], "other": w["other"]}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
 
 
 def status(args):
@@ -3217,6 +3306,138 @@ def _parse_many(paths: list) -> list:
         return [_parse_jsonl(p) for p in paths]
 
 
+# --- Devices: each machine shares its own rows through a folder the user already syncs ---
+def _device_name() -> str:
+    """This machine's label: config device_name, else the short hostname."""
+    import socket
+    name = _read_config().get("device_name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    host = socket.gethostname().split(".")[0]
+    return "".join(c for c in host if c.isalnum() or c in " ._-")[:40] or "this device"
+
+
+def _device_id(con) -> str:
+    """Random id of this database, made once. Names the machine's file in sync_dir."""
+    got = _meta_get(con, "device_id")
+    if got and got[0]:
+        return got[0]
+    import uuid
+    dev = uuid.uuid4().hex[:16]
+    _meta_set(con, "device_id", dev)
+    return dev
+
+
+def _sql_str(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _device_col() -> str:
+    """SQL for a token row's device. Rows read here have no metadata and belong to this machine;
+    imported rows carry their device id, named by the latest name that device exported."""
+    dev = "json_extract_string(metadata_json, '$.device_id')"
+    return (f"coalesce((SELECT value FROM meta WHERE key = 'device:' || {dev}), {dev}, "
+            f"{_sql_str(_device_name())})")
+
+
+SYNC_COLS = ("source_event_id, observed_at, model, surface, project, session_id, input_tokens, output_tokens, "
+             "reasoning_tokens, cache_read_tokens, cache_write_tokens")
+
+
+def sync_devices(con, sync_dir: str) -> dict:
+    """Write this machine's rows to <sync_dir>/<device id>.parquet and import the other
+    machines' files. Exports only rows read from this machine's own transcripts (never
+    imported ones, so nothing echoes back) and only the terminal account's (token_terminal).
+    A file from another account is skipped: it would charge someone else's usage to this
+    plan. Imports are idempotent (same message keys), so a copy made by the sync tool is
+    harmless. Imported Desktop sessions are mapped to the terminal account, which their
+    exporter already checked, so token_terminal keeps them."""
+    import glob
+    account = _terminal_account()
+    if not account:
+        raise RuntimeError("the terminal's Claude Code account is unknown (log in to Claude Code first)")
+    _meta_set(con, "terminal_account", account)
+    dev, name = _device_id(con), _device_name()
+    _meta_set(con, f"device:{dev}", name)
+    out = {"device": name, "exported": None, "imported": {}, "other_account": [], "errors": []}
+    local = "FROM token_terminal WHERE metadata_json IS NULL"
+    count, last = con.execute(f"SELECT count(*), max(observed_at) {local}").fetchone()
+    target = os.path.join(sync_dir, f"{dev}.parquet")
+    sig = f"{count}|{last}|{name}"
+    if (_meta_get(con, "sync_export") or ("",))[0] != sig or not os.path.exists(target):
+        tmp = os.path.join(sync_dir, f".{dev}.parquet.tmp")
+        con.execute(f"COPY (SELECT {SYNC_COLS}, {_sql_str(account)} account, {_sql_str(dev)} device_id, "
+                    f"{_sql_str(name)} device {local}) TO {_sql_str(tmp)} (FORMAT parquet, COMPRESSION zstd)")
+        os.chmod(tmp, 0o600)  # project names and session ids
+        os.replace(tmp, target)
+        _meta_set(con, "sync_export", sig)
+        out["exported"] = count
+    for path in sorted(glob.glob(os.path.join(sync_dir, "*.parquet"))):
+        try:
+            st = os.stat(path)
+            seen_key, seen = f"sync_seen:{os.path.basename(path)}", f"{st.st_mtime_ns}:{st.st_size}"
+            if (_meta_get(con, seen_key) or ("",))[0] == seen:
+                continue
+            acct, other, other_name = con.execute(
+                "SELECT any_value(account), any_value(device_id), arg_max(device, observed_at) "
+                "FROM read_parquet(?)", [path]).fetchone()
+            if other == dev or other is None:
+                continue  # this machine's own file (or an empty one)
+            if acct != account:
+                out["other_account"].append(other_name)
+                continue
+            con.execute("BEGIN")
+            try:
+                before = con.execute("SELECT count(*) FROM token_log").fetchone()[0]
+                con.execute(
+                    f"INSERT INTO token_log({_TOKEN_LOG_COLS}) SELECT 'claude', {SYNC_COLS}, 0, "
+                    "json_object('device_id', device_id) FROM read_parquet(?) WHERE source_event_id NOT IN "
+                    "(SELECT source_event_id FROM token_log WHERE provider = 'claude')", [path])
+                con.execute(
+                    "INSERT INTO session_account SELECT DISTINCT session_id, ? FROM read_parquet(?) "
+                    "WHERE surface = 'claude-desktop' AND session_id NOT IN (SELECT session FROM session_account)",
+                    [account, path])
+                added = con.execute("SELECT count(*) FROM token_log").fetchone()[0] - before
+                con.execute("COMMIT")
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
+            _meta_set(con, f"device:{other}", other_name)
+            _meta_set(con, seen_key, seen)
+            out["imported"][other_name] = out["imported"].get(other_name, 0) + added
+        except Exception as e:  # a file the sync tool is still writing, or not cmon's
+            out["errors"].append(f"{os.path.basename(path)}: {e}")
+    return out
+
+
+def sync(args):
+    """Exchange usage rows with the other devices through sync_dir."""
+    sync_dir = getattr(args, "dir", None) or _read_config().get("sync_dir")
+    if not sync_dir:
+        sys.exit("No sync folder: run 'cmon config set sync_dir <folder your devices sync>' "
+                 "(iCloud Drive, Dropbox, Syncthing…).")
+    try:
+        sync_dir = _validate_sync_dir(sync_dir)
+    except ValueError as e:
+        sys.exit(str(e))
+    con = _db_retry(30)
+    if con is None:
+        sys.exit("cmon: database locked by another cmon process for 30s — try again")
+    scan_logs(con)
+    try:
+        got = sync_devices(con, sync_dir)
+    except RuntimeError as e:
+        sys.exit(f"cmon sync: {e}")
+    exported = "unchanged" if got["exported"] is None else f"{got['exported']} rows"
+    print(f"{got['device']}: exported {exported} to {sync_dir}")
+    for name, n in got["imported"].items():
+        print(f"  imported {n} new rows from {name}")
+    if got["other_account"]:
+        print(f"  skipped (another Claude account): {', '.join(got['other_account'])}")
+    for e in got["errors"]:
+        print(f"  could not read {e}", file=sys.stderr)
+
+
 def _session_window_start(rows, now_utc):
     """Start of the CURRENT 5h rate-limit window (session resets_at − 5h), not a rolling
     now−5h — so burn/model-mix reflect only what you spent in this cycle. Falls back to
@@ -3254,24 +3475,156 @@ def _burn_summary(rows):
     return tok, cost, mix
 
 
+def _cost(model, i, o, r, c) -> float:
+    """API-equivalent US$ of one token tuple."""
+    p = _price(model)
+    return (i * p[0] + o * p[1] + r * p[2] + c * p[3]) / 1e6
+
+
+CYCLE_JITTER_S = 3600  # resets_at moves by milliseconds between reads; more than this = new cycle
+_REST = "\x00rest"  # group of the rows a plan-share filter leaves out
+
+
+def _plan_share(con, key, since=None, until=None, col="surface", src="token_terminal",
+                where="", params=()):
+    """Split the official percent of window `key` across groups of `col`, by the API-equivalent
+    cost each group logged while the percent rose. Snapshot pairs whose percent didn't move
+    (it's an integer) carry their cost into the next pair that did, so a tick isn't charged to
+    whoever happened to be active in its last minutes. A rise with no logged cost goes to
+    'other': claude.ai chat, other devices, cloud sessions. A new cycle (resets_at moved)
+    contributes its whole first reading, split by the cost logged since the cycle began.
+    Cost left over after the last tick of a cycle is dropped: it hasn't moved the percent yet.
+    `where`/`params` select the rows to group (callers build them from fixed choices); the
+    rows they leave out still take their part of each rise, reported as 'rest', so a filter
+    narrows the view without inflating what's left.
+    Returns {'groups': {grp: pp}, 'rest': pp, 'other': pp, 'total': pp, 'cycles': n} or None
+    without snapshots in the period."""
+    scoped = key.split(":", 1)[1].lower() if ":" in key else None
+    tok_where = "provider='claude'" + (" AND lower(model) LIKE ?" if scoped else "")
+    grp = f"CASE WHEN true{where} THEN {col} ELSE '{_REST}' END" if where else col
+    tok_params = [*params, f"%{scoped}%"] if scoped else list(params)
+    bounds, bparams = "", []
+    if since:
+        bounds += " AND ts > ?"
+        bparams.append(since)
+    if until:
+        bounds += " AND ts <= ?"
+        bparams.append(until)
+    rows = con.execute(
+        "WITH s AS (SELECT observed_at ts, percent p, resets_at r, window_minutes w, "
+        "  lag(observed_at) OVER o pts, lag(percent) OVER o pp, lag(resets_at) OVER o pr "
+        "  FROM snapshots WHERE provider='claude' AND key=? WINDOW o AS (ORDER BY observed_at)), "
+        "c AS (SELECT *, pts IS NULL OR (r IS DISTINCT FROM pr AND (r IS NULL OR pr IS NULL "
+        "  OR abs(epoch(r) - epoch(pr)) > ?)) AS new_cycle, r - INTERVAL 1 MINUTE * w cs FROM s), "
+        "iv AS (SELECT ts, new_cycle, CASE WHEN new_cycle THEN p ELSE p - pp END d, "
+        "  CASE WHEN NOT new_cycle THEN pts WHEN cs IS NULL THEN coalesce(pts, ts) "
+        "       WHEN pts IS NULL OR cs > pts THEN cs ELSE pts END st "
+        f"  FROM c WHERE true{bounds}), "
+        f"t AS (SELECT {grp} grp, model, observed_at, input_tokens i, output_tokens o, "
+        f"  cache_read_tokens cr, cache_write_tokens cw FROM {src} WHERE {tok_where}) "
+        "SELECT iv.ts, iv.new_cycle, iv.d, t.grp, t.model, sum(t.i), sum(t.o), sum(t.cr), sum(t.cw) "
+        "FROM iv LEFT JOIN t ON t.observed_at > iv.st AND t.observed_at <= iv.ts "
+        "GROUP BY ALL ORDER BY iv.ts",
+        [key, CYCLE_JITTER_S, *bparams, *tok_params]).fetchall()
+    if not rows:
+        return None
+    groups, other, cycles = {}, 0.0, 0
+    pending = {}  # grp -> cost logged since the last tick
+    cur, cur_cost = None, {}
+
+    def settle(new_cycle, d, costs):
+        nonlocal other, cycles, pending
+        if new_cycle or not cycles:  # a period starting mid-cycle still covers that cycle
+            pending = {}  # cost of the previous cycle that never ticked: not this cycle's
+            cycles += 1
+        for g, v in costs.items():
+            pending[g] = pending.get(g, 0.0) + v
+        if d <= 0:
+            return
+        total = sum(pending.values())
+        if total <= 0:
+            other += d
+        else:
+            for g, v in pending.items():
+                groups[g] = groups.get(g, 0.0) + d * v / total
+        pending = {}
+    for ts, new_cycle, d, grp, model, i, o, cr, cw in rows:
+        if cur is None or ts != cur[0]:
+            if cur is not None:
+                settle(cur[1], cur[2], cur_cost)
+            cur, cur_cost = (ts, new_cycle, d), {}
+        if grp is not None:
+            cur_cost[grp] = cur_cost.get(grp, 0.0) + _cost(model, i or 0, o or 0, cr or 0, cw or 0)
+    settle(cur[1], cur[2], cur_cost)
+    rest = groups.pop(_REST, 0.0)
+    return {"groups": groups, "rest": rest, "other": other, "total": sum(groups.values()) + rest + other,
+            "cycles": cycles}
+
+
+PLAN_ALIASES = {"weekly": "weekly_all", "week": "weekly_all", "5h": "session"}
+SURFACE_ALIASES = {"terminal": "cli", "vscode": "claude-vscode", "app": "claude-desktop",
+                   "desktop": "claude-desktop", "sdk": "sdk-cli"}
+
+
+def _burn_filters(args) -> tuple[str, list, list[str]]:
+    """(' AND …' SQL, params, description) for burn's --surface/--device. Values come from the user, so
+    they only ever travel as parameters."""
+    sql, params, desc = "", [], []
+    if getattr(args, "surface", None):
+        names = [n.strip() for n in args.surface.split(",") if n.strip()]
+        params += [SURFACE_ALIASES.get(n.lower(), n) for n in names]
+        sql += f" AND surface IN ({', '.join('?' * len(names))})"
+        desc.append(f"{', '.join(_surface(v) for v in params[-len(names):])} only")
+    if getattr(args, "device", None):
+        names = [n.strip() for n in args.device.split(",") if n.strip()]
+        params += names
+        sql += f" AND {_device_col()} IN ({', '.join('?' * len(names))})"
+        desc.append(f"{', '.join(names)} only")
+    return sql, params, desc
+
+
+def _plan_window(con, name: str):
+    """(key, label, start of its latest cycle or None) for 'burn --plan NAME'. NAME is a snapshot
+    key, an alias (weekly, 5h) or a scoped model (fable for weekly_scoped:Fable)."""
+    known = con.execute(
+        "SELECT key, arg_max(label, observed_at), "
+        "arg_max(resets_at - INTERVAL 1 MINUTE * window_minutes, observed_at) FILTER (WHERE resets_at IS NOT NULL) "
+        "FROM snapshots WHERE provider='claude' GROUP BY key ORDER BY key").fetchall()
+    if not known:
+        sys.exit("--plan needs usage snapshots: run 'cmon collect', or 'cmon install' to collect them.")
+    want = PLAN_ALIASES.get(name.lower(), name).lower()
+    for key, label, start in known:
+        if want in (key.lower(), key.lower().rsplit(":", 1)[-1]):
+            return key, label, start
+    sys.exit(f"No snapshots for window {name!r}. Known: {', '.join(k for k, _l, _s in known)}.")
+
+
 def burn(args):
-    """Report tokens & estimated US$ from local Claude Code logs."""
+    """Report tokens & estimated US$ from local Claude Code logs; with --plan, also each
+    group's share of the official percent."""
     con = db()
-    since = _parse_since(getattr(args, "since", None))
+    raw_since = getattr(args, "since", None)
+    plan = _plan_window(con, args.plan) if getattr(args, "plan", None) else None
+    if raw_since is None:  # default: the window's current cycle with --plan, else 30 days
+        since = plan[2] if plan and plan[2] else _parse_since("30d")
+    else:
+        since = _parse_since(raw_since)
     scan_logs(con, since)
     col = {"model": "model", "surface": "surface", "day": "CAST(observed_at AS DATE)",
-           "project": "project", "session": "session_id"}[args.by]
-    where = "WHERE provider='claude'" + (" AND observed_at >= ?" if since else "")
+           "project": "project", "session": "session_id", "device": _device_col()}[args.by]
+    filt, fparams, fdesc = _burn_filters(args)
+    where = "WHERE provider='claude'" + (" AND observed_at >= ?" if since else "") + filt
+    wparams = ([since] if since else []) + fparams
     src = "token_log" if getattr(args, "all_accounts", False) else "token_terminal"
     rows = con.execute(
         f"SELECT {col} grp,model,sum(input_tokens),sum(output_tokens),sum(cache_read_tokens),"
         f"sum(cache_write_tokens) "
-        f"FROM {src} {where} GROUP BY grp, model", [since] if since else []).fetchall()
+        f"FROM {src} {where} GROUP BY grp, model", wparams).fetchall()
     excluded = 0 if src == "token_log" else con.execute(
         "SELECT coalesce(sum(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens), 0) "
         f"FROM token_log {where}",
-        [since] if since else []).fetchone()[0] - sum(i + o + r + c for _g, _m, i, o, r, c in rows)
-    if not rows:
+        wparams).fetchone()[0] - sum(i + o + r + c for _g, _m, i, o, r, c in rows)
+    if not rows and not plan:
         sys.exit("No Claude Code log data in period.")
     # Per-group tokens+cost, and per-component totals — cost needs the per-model price map,
     # so it's computed here in Python rather than in SQL.
@@ -3292,25 +3645,52 @@ def burn(args):
         ccost["output"] += o * p[1] / 1e6
         ccost["cache read"] += r * p[2] / 1e6
         ccost["cache write"] += c * p[3] / 1e6
-    ordered = sorted(agg.items(), key=lambda kv: -kv[1][1])  # by cost desc
+    share = _plan_share(con, plan[0], since=since, col=col, src=src, where=filt, params=fparams) if plan else None
+    if plan and share is None:
+        sys.exit(f"No '{plan[0]}' snapshots in period: run 'cmon collect', or 'cmon install' to collect them.")
+    pp = share["groups"] if share else {}
+    for g in pp:
+        agg.setdefault(g, [0, 0.0])  # a period starting mid-cycle can charge a group outside it
+    ordered = sorted(agg.items(), key=lambda kv: (-pp.get(kv[0], 0.0), -kv[1][1]))  # share, then cost
     if getattr(args, "json", False):
-        print(json.dumps([{"grp": g.isoformat() if hasattr(g, "isoformat") else g,
-                            "tok": int(v[0]), "custo": v[1]} for g, v in ordered],
-                         ensure_ascii=False))
+        items = [{"grp": g.isoformat() if hasattr(g, "isoformat") else g, "tok": int(v[0]), "custo": v[1],
+                  **({"plan_pp": pp.get(g, 0.0)} if share else {})} for g, v in ordered]
+        if share:
+            print(json.dumps({"window": plan[0], "since": since.isoformat() if since else None,
+                              "cycles": share["cycles"], "total_pp": share["total"],
+                              "other_pp": share["other"], **({"rest_pp": share["rest"]} if filt else {}),
+                              "groups": items}, ensure_ascii=False))
+        else:
+            print(json.dumps(items, ensure_ascii=False))
         return
     per = {"model": "model", "surface": "surface", "day": "day",
-           "project": "project", "session": "session"}[args.by]
+           "project": "project", "session": "session", "device": "device"}[args.by]
     since_local = since.astimezone(_resolve_tz()) if since else None
     window = f" since {since_local:%Y-%m-%d %H:%M %Z}" if since_local else ""
-    print(f"Consumption by {per}{window} (API equivalent):")
-    lines = [(_surface(g) if args.by == "surface" else str(g), v[0] / 1e6, v[1])
+    only = "".join(f" · {d}" for d in fdesc)
+    print(f"Consumption by {per}{window}{only} (API equivalent):")
+    lines = [(_surface(g) if args.by == "surface" else str(g), v[0] / 1e6, v[1], pp.get(g, 0.0))
              for g, v in ordered]
-    w = max([len(lbl) for lbl, _, _ in lines] + [len("TOTAL")])  # widest label incl. long model ids
-    for lbl, tok_m, cost in lines:
-        print(f"  {lbl:<{w}} {tok_m:9.1f}M tok   US$ {cost:9.2f}")
+    other_lbl, rest_lbl = "other (no local log)", "rest (filtered out)"
+    w = max([len(lbl) for lbl, *_ in lines] + [len(other_lbl) if share else len("TOTAL")])
+    total_pp = share["total"] if share else 0.0
+
+    def pp_col(v):
+        return f"   {v:6.1f} pp  {v / total_pp * 100 if total_pp else 0:3.0f}%" if share else ""
+    for lbl, tok_m, cost, gpp in lines:
+        print(f"  {lbl:<{w}} {tok_m:9.1f}M tok   US$ {cost:9.2f}{pp_col(gpp)}")
+    if share:
+        if filt:
+            print(f"  {rest_lbl:<{w}} {'':30}{pp_col(share['rest'])}")
+        print(f"  {other_lbl:<{w}} {'':30}{pp_col(share['other'])}")
     total_c = sum(v[1] for _, v in ordered)
     total_tok = sum(v[0] for _, v in ordered)
-    print(f"  {'TOTAL':<{w}} {total_tok / 1e6:9.1f}M tok   US$ {total_c:9.2f}")
+    print(f"  {'TOTAL':<{w}} {total_tok / 1e6:9.1f}M tok   US$ {total_c:9.2f}{pp_col(total_pp)}")
+    if share:
+        cyc = "this cycle" if share["cycles"] == 1 else f"{share['cycles']} cycles"
+        print(f"\npp = points of {plan[1]} ({plan[0]}) over {cyc}, split by the API-equivalent cost logged\n"
+              "while it rose. 'other' rose with nothing logged here: claude.ai chat, other devices, cloud\n"
+              "sessions. Estimate.")
 
     # Breakdown by component: cache read usually dominates (context re-reading).
     print("\nBy component:")
@@ -3634,13 +4014,24 @@ def main():
     ptr.add_argument("--since", help="filter the summary from '24h', '7d' or ISO date")
     ptr.add_argument("--json", action="store_true", help="JSON output of the summary")
     pb = sub.add_parser("burn", help="tokens & estimated US$ from local Claude Code logs")
-    pb.add_argument("--by", choices=["model", "surface", "day", "project", "session"], default="model",
-                    help="group by model (default), surface (terminal/vscode/app/sdk), day, project or session")
-    pb.add_argument("--since", default="30d",
-                    help="window: '24h', '7d', '30d' (default), ISO date, or 'all' for everything")
+    pb.add_argument("--by", choices=["model", "surface", "day", "project", "session", "device"], default="model",
+                    help="group by model (default), surface (terminal/vscode/app/sdk), day, project, session or "
+                         "device (see 'cmon sync')")
+    pb.add_argument("--since",
+                    help="window: '24h', '7d', '30d' (default; with --plan, the current cycle), ISO date, "
+                         "or 'all' for everything")
+    pb.add_argument("--surface", metavar="CLIENT",
+                    help="only these clients, comma-separated: terminal, vscode, app, sdk or a raw entrypoint")
+    pb.add_argument("--device", metavar="NAME", help="only these devices, comma-separated (see 'cmon sync')")
+    pb.add_argument("--plan", nargs="?", const="weekly_all", metavar="WINDOW",
+                    help="also split the official percent of WINDOW across groups: weekly (default), 5h, "
+                         "or a scoped model such as fable")
     pb.add_argument("--json", action="store_true", help="JSON output")
     pb.add_argument("--all-accounts", action="store_true",
                     help="include Claude Desktop sessions not tied to the terminal's account")
+    psy = sub.add_parser("sync", help="exchange usage rows with your other devices through a synced folder "
+                                      "('cmon config set sync_dir …'); 'collect' does it by itself once set")
+    psy.add_argument("--dir", help="sync folder for this run (default: config sync_dir)")
     sub.add_parser("keepalive", help="send one small Haiku request now, which opens a 5h window if none is running "
                                      "('cmon config set keepalive on' does this by itself)")
     pc = sub.add_parser("collect", help="save 1 snapshot to database")
@@ -3687,8 +4078,10 @@ def main():
 
     pcfg = sub.add_parser("config", help="manage persisted user preferences (~/.cmon/config.json)",
                           description="Currently supports: timezone (used to display timestamps "
-                                      "locally instead of UTC), quiet_hours (hours projections skip) "
-                                      "and keepalive (on: open a new 5h window when the last one ends).")
+                                      "locally instead of UTC), quiet_hours (hours projections skip), "
+                                      "keepalive (on: open a new 5h window when the last one ends), "
+                                      "sync_dir (folder shared with your other devices) and device_name "
+                                      "(this machine's label there).")
     cfa = pcfg.add_subparsers(dest="action", required=True)
     cfset = cfa.add_parser("set", help="set a preference")
     cfset.add_argument("key", choices=sorted(CONFIG_KEYS))
@@ -3715,7 +4108,7 @@ def main():
         {"now": now, "status": status, "trends": trends, "collect": collect,
          "burn": burn, "watch": watch, "wait": wait, "plot": plot,
          "backtest": backtest, "tune": tune, "install": install,
-         "uninstall": uninstall, "import": import_db, "keepalive": keepalive}[args.cmd](args)
+         "uninstall": uninstall, "import": import_db, "keepalive": keepalive, "sync": sync}[args.cmd](args)
     except FetchError as e:
         sys.exit(f"cmon: {e}")
 
