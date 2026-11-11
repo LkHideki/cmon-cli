@@ -1296,6 +1296,12 @@ def now(args):
         _advice(rows, _read_db(), no_ai=getattr(args, "no_ai", False))
         return
 
+    con = None
+    if any(r[0] == "weekly_all" and r[3] for r in rows):  # daily budget of the weekly limit
+        con = _read_db()
+        if line := _day_budget_line(con, rows, _ts, _resolve_tz()):
+            print(f"\n{line}")
+
     sess = next((r for r in rows if r[0] == "session"), None)
     if not sess:
         return
@@ -1304,7 +1310,8 @@ def now(args):
 
     if not reset:
         return
-    con = _read_db()  # lazy: only import/open DuckDB once we know the projection is needed (F10)
+    if con is None:
+        con = _read_db()  # lazy: only import/open DuckDB once we know the projection is needed (F10)
     if con is None:
         return
     end = datetime.fromisoformat(reset)
@@ -2090,6 +2097,141 @@ def _project(con, pct, rate, rem_h, now_utc, tz, key=None, replay=False) -> tupl
         if eta is None and pct < 100 and pct + acc >= 100:
             eta = t
     return pct + acc, eta, src
+
+
+def _day_budget(base_pct: float, base_at: datetime, reset_at: datetime, tz, intensity=None) -> float:
+    """Points of the weekly limit the local day of base_at may spend: what was left at base_at
+    (100 - base_pct), split over the time from base_at to reset_at, summed over the slices that
+    still fall on that local day. intensity(local datetime) weighs each slice (the learned
+    profile: hour shape × weekday multiplier); without it every hour counts the same, so the day
+    of the reset counts only up to the reset and a day already under way only from base_at.
+    Slices are cut at local midnight and measured in UTC, so a 23h or 25h DST day keeps its real
+    length. Pure: no clock, no database."""
+    remaining = max(100.0 - base_pct, 0.0)
+    start, end = base_at.astimezone(UTC), reset_at.astimezone(UTC)
+    if end <= start or remaining <= 0:
+        return remaining
+    local = start.astimezone(tz)
+    midnight = (local.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).astimezone(UTC)
+    today = total = 0.0
+    t = start
+    while t < end:  # 15-min slices: a week is ~700 of them
+        nxt = min(t + timedelta(minutes=15), end)
+        if t < midnight < nxt:
+            nxt = midnight
+        w = (nxt - t).total_seconds()
+        if intensity is not None:
+            w *= intensity((t + (nxt - t) / 2).astimezone(tz))
+        total += w
+        if nxt <= midnight:
+            today += w
+        t = nxt
+    if total <= 0:  # a profile that is zero everywhere can't split anything: fall back to hours
+        return _day_budget(base_pct, base_at, reset_at, tz)
+    return remaining * today / total
+
+
+def _day_baseline(readings, day_start, cycle_start, now_utc, pct_now, max_gap_h=None):
+    """(at, percent, kind): the reading today's use of the weekly limit is counted from.
+    readings are this cycle's (observed_at UTC, percent) before now; the cycle stood at 0 at
+    cycle_start (None when unknown) and pct_now is the live value. kind is
+      'day'   — local midnight, interpolated between the readings either side of it (exact
+                when the percent didn't move between them);
+      'reset' — the cycle began today, at 0;
+      'first' — the readings around midnight are more than max_gap_h apart and the percent
+                moved, so nothing says how much of that rise was today's: count from the first
+                reading today instead (same reasoning as PROFILE_PAIR_MAX_H);
+      'none'  — no reading today before the live one, so today's use can't be measured."""
+    gap_s = (PROFILE_PAIR_MAX_H if max_gap_h is None else max_gap_h) * 3600
+    if cycle_start is not None and cycle_start >= day_start:
+        return cycle_start, 0.0, "reset"
+    pts = sorted(((t, p) for t, p in readings
+                  if t < now_utc and (cycle_start is None or t >= cycle_start)), key=lambda x: x[0])
+    pts = ([(cycle_start, 0.0)] if cycle_start is not None else []) + pts + [(now_utc, pct_now)]
+    before = [x for x in pts if x[0] <= day_start]
+    after = [x for x in pts if x[0] > day_start]
+    if not after:  # now is exactly local midnight
+        return day_start, pct_now, "day"
+    t1, p1 = after[0]
+    later = "none" if t1 >= now_utc else "first"
+    if not before:
+        return t1, p1, later
+    t0, p0 = before[-1]
+    if p1 <= p0:
+        return day_start, p1, "day"
+    if (t1 - t0).total_seconds() <= gap_s:
+        return day_start, p0 + (p1 - p0) * ((day_start - t0) / (t1 - t0)), "day"
+    return t1, p1, later
+
+
+def _fmt_until(td: timedelta) -> str:
+    """'3d 22h', '5h 10m' or '40m'."""
+    mins = max(int(td.total_seconds() // 60), 0)
+    d, rem = divmod(mins, 1440)
+    h, m = divmod(rem, 60)
+    return f"{d}d {h}h" if d else (f"{h}h {m}m" if h else f"{m}m")
+
+
+def _day_budget_line(con, rows, now_utc, tz) -> str | None:
+    """The 'Today: …' line of cmon now: points of the weekly limit used today against today's
+    share of what was left at the start of the day, or None without a weekly window that has a
+    reset ahead. con may be None (no or busy database): the line then has no reading to count
+    from and gives only the budget."""
+    row = next((r for r in rows if r[0] == "weekly_all"), None)
+    if row is None or not row[3]:
+        return None
+    pct = float(row[2])
+    reset_at = datetime.fromisoformat(row[3]).astimezone(UTC)
+    if reset_at <= now_utc:
+        return None
+    eta = _fmt_until(reset_at - now_utc)
+    if pct >= 100:
+        return f"Today: weekly limit used up — resets in {eta}."
+    local = now_utc.astimezone(tz)
+    midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_start = midnight.astimezone(UTC)
+    day_end = (midnight + timedelta(days=1)).astimezone(UTC)
+    cycle_start = reset_at - timedelta(minutes=10080)  # same cycle start as _plan_share
+    if cycle_start > now_utc:  # a reset more than a week out: the cycle's start is unknown
+        cycle_start = None
+    readings, prof = [], None
+    if con is not None:
+        try:
+            got = con.execute(
+                "SELECT observed_at, percent, resets_at FROM snapshots WHERE provider='claude' "
+                "AND key='weekly_all' AND observed_at < ? AND observed_at >= ? AND resets_at IS NOT NULL",
+                [now_utc, cycle_start or now_utc - timedelta(minutes=10080)]).fetchall()
+            # resets_at jitters by milliseconds between reads; a different value is another cycle
+            readings = [(t.astimezone(UTC), float(p)) for t, p, r in got
+                        if abs((r - reset_at).total_seconds()) <= CYCLE_JITTER_S]
+        except Exception:
+            readings = []
+    try:
+        prof = _hour_profile(con, tz)
+    except Exception:
+        prof = None
+    at, base, kind = _day_baseline(readings, day_start, cycle_start, now_utc, pct)
+    intensity = None
+    weighted = prof is not None and prof[3] == "learned"
+    if weighted:
+        hour_rate, dow = prof[0], prof[1]
+
+        def intensity(t_local):
+            return hour_rate[t_local.hour] * dow[t_local.weekday()]
+    budget = round(_day_budget(base, at, reset_at, tz, intensity))
+    if reset_at <= day_end:
+        note = " (all that's left)"
+    else:
+        note = PROJ_NOTE_SHORT["learned"] if weighted else " (equal split)"
+    tail = f"week at {pct:.0f}%, resets in {eta}."
+    if kind == "none":
+        return f"Today: ~{budget} pp budget for the rest of the day{note}, no earlier reading to measure use — {tail}"
+    lead = {"day": "Today", "reset": f"Today since the {at.astimezone(tz):%H:%M} reset",
+            "first": f"Today since {at.astimezone(tz):%H:%M}"}[kind]
+    used = round(max(pct - base, 0.0))
+    left = budget - used
+    state = f"{left} pp left" if left > 0 else (f"{-left} pp over" if left < 0 else "budget reached")
+    return f"{lead}: {used} pp used of ~{budget} pp budget{note}, {state} — {tail}"
 
 
 def _log_forecasts(con, rows, tz, now_utc=None) -> None:

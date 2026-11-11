@@ -597,9 +597,30 @@ Current usage:
   All models       ████████··········  41%    resets in 3d 22h
   Fable only       ████████··········  43%    resets in 3d 22h  ←active
 
+Today: 9 pp used of ~14 pp budget (profile-weighted), 5 pp left — week at 41%, resets in 3d 22h.
+
 5h window: 7% used — expires in 4h 25min.
 Rate: 2.1%/h → projection at reset: 16%.
 ```
+
+The **Today** line answers "how much can I spend today without running short before the weekly
+reset". The budget is what was left of the weekly limit at the start of your local day (the
+`timezone` setting), spread over the time until the reset, so the reset day counts only up to the
+reset. When the learned usage profile passes its coverage gate (the same one the projection uses)
+each day is weighted by your weekday multiplier and hourly shape and the line says
+*profile-weighted*; otherwise every hour counts the same and it says *equal split*. The budget is a
+share, not a forecast: it doesn't shrink as the day goes by, and using less today leaves more for
+the days after.
+
+Today's starting point comes from the snapshots either side of local midnight, interpolated when
+they're at most `CMON_PROFILE_PAIR_MAX_H` (1.5 h) apart, or taken as is when the percent didn't
+move between them. When they're further apart and the percent moved, as after a night with the
+laptop asleep, nothing says how much of that rise was today's, so the count starts at the first
+reading of the day (`Today since 08:10: …`) and the budget covers the rest of the day. A weekly
+cycle that began today counts from its reset, at 0%. A reset later today makes everything left
+today's budget (*all that's left*). With no reading today before the current one there's nothing
+to measure today's use against, and the line gives only the budget. A used-up limit says so, and
+there's no line without a weekly window. `--advice` keeps its own pacing view and doesn't print it.
 
 Add **`--advice`** for the full pacing view — the goal being to spend close to **100% of the
 weekly limit** by reset, without exhausting early and without hitting the **5h window** (which

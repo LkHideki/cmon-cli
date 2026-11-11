@@ -33,6 +33,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   already reset counts as 0%. It reads only the status cache, never the API or the database, so a
   hook doesn't wait on the network or on a running `collect`. `--quiet` drops the stderr line and
   `--json` prints `{window, percent, max, resets_at, age_s, result}`. `status` keeps exiting 0.
+- **A daily budget of the weekly limit in `cmon now`.** A new `Today:` line puts the points used
+  since local midnight against today's share of what was left of the week at that moment, spread
+  until the weekly reset. The days are weighted by the learned weekday and hourly profile when it
+  passes its coverage gate (*profile-weighted*), and split evenly otherwise (*equal split*). A
+  cycle that began today counts from its reset, a reset later today makes all that's left today's,
+  a gap in the readings around midnight moves the count to the first reading of the day, and with
+  no earlier reading today the line shows only the budget. No line without a weekly window.
 
 ### Changed
 

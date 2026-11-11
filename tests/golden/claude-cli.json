@@ -1,7 +1,7 @@
 {
   "now": {
     "exit_code": 0,
-    "stdout": "Current usage:\n  Current session  ████················   24%   resets in     2h 0m\n  All models       ████████············   41%   resets in    96h 0m\n\n5h window: 24% used — expires in 2h 0m.\nRate: no measurable consumption in this window.\n",
+    "stdout": "Current usage:\n  Current session  ████················   24%   resets in     2h 0m\n  All models       ████████············   41%   resets in    96h 0m\n\nToday: ~11 pp budget for the rest of the day (equal split), no earlier reading to measure use — week at 41%, resets in 4d 0h.\n\n5h window: 24% used — expires in 2h 0m.\nRate: no measurable consumption in this window.\n",
     "stderr": ""
   },
   "status": {
