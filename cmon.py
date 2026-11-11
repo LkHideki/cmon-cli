@@ -1428,6 +1428,7 @@ def collect(args):
         print(f"  {lbl:16} {pct:4.0f}%  reset {reset[:16] if reset else '-'}")
     _collect_sync(con)
     _refresh_client_share(con, rows, ts)
+    _refresh_session_cost(con, rows, ts)
     _refresh_projection(con, rows, ts)
     if getattr(args, "alert", False):
         _fire_rate_alerts(rows, con)  # rate-based: at current pace hits 100% before reset
@@ -3296,6 +3297,190 @@ def guard(args):
     sys.exit(GUARD_EXIT.get(out["result"], 3))
 
 
+SESSIONS_KEEP = 300  # sessions in sessions.json: the most recently active of the weekly cycle
+STATUSLINE_STALE_S = 1800  # cache older than this: 'status' adds "Nm ago"; statusline prefers stdin
+STATUSLINE_STDIN_MAX = 1 << 20  # Claude Code's payload is a few KB; never buffer an unbounded pipe
+
+
+def _sessions_cache() -> str:
+    return os.path.join(CMON_HOME, "sessions.json")
+
+
+def _refresh_session_cost(con, rows, now_utc) -> None:
+    """Cache, per session_id, the cost of each recently active session and its points of each
+    window's current cycle, for 'statusline'. Claude Code runs that command on every redraw, so
+    it can't scan transcripts or wait on DuckDB's lock: like the client split, the numbers are
+    computed here and read from a file there. Cost covers the whole session (it may have begun
+    in an earlier cycle); points cover only the current cycle. Best-effort."""
+    try:
+        cycles = {}
+        for key, _lbl, _pct, reset, _a in rows:
+            if key in SHARE_WINDOWS and reset:
+                cycles[key] = (reset, datetime.fromisoformat(reset) - timedelta(minutes=SHARE_WINDOWS[key]))
+        if not cycles:
+            return
+        since = min(start for _r, start in cycles.values())
+        scan_logs(con, since=since, quiet=True)
+        sessions = {}
+        for sid, model, i, o, r, c, last in con.execute(
+                "SELECT session_id, model, sum(input_tokens), sum(output_tokens), sum(cache_read_tokens), "
+                "sum(cache_write_tokens), max(observed_at) FROM token_terminal WHERE session_id IN "
+                "(SELECT session_id FROM token_terminal WHERE observed_at >= ?) GROUP BY ALL",
+                [since]).fetchall():
+            if sid == "?":  # transcript lines without a sessionId: no statusline can ask for them
+                continue
+            s = sessions.setdefault(sid, {"cost": 0.0, "last": last, "pp": {}})
+            s["cost"] += _cost(model, i, o, r, c)
+            s["last"] = max(s["last"], last)
+        for key, (_reset, start) in cycles.items():
+            got = _plan_share(con, key, since=start, col="session_id")
+            for sid, v in (got["groups"] if got else {}).items():
+                if sid in sessions and v > 0:
+                    sessions[sid]["pp"][key] = round(v, 2)
+        recent = sorted(sessions.items(), key=lambda kv: kv[1]["last"], reverse=True)[:SESSIONS_KEEP]
+        _atomic_write_json(_sessions_cache(), {
+            "version": 1, "computed_at": now_utc.isoformat(),
+            "windows": {key: {"resets_at": reset} for key, (reset, _s) in cycles.items()},
+            "sessions": {sid: {"cost_usd": round(s["cost"], 4), "pp": s["pp"], "last_at": s["last"].isoformat()}
+                         for sid, s in recent}})
+    except Exception as e:
+        print(f"cmon: session cost skipped: {e}", file=sys.stderr)
+
+
+def _finite(value) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int | float) and math.isfinite(value)
+
+
+def _statusline_input() -> dict:
+    """Claude Code's statusLine JSON from stdin, or {} when there's none (a terminal, an empty or
+    closed pipe) or it isn't a JSON object: then only the plan part prints.
+    Format checked on 2026-11-11 against https://code.claude.com/docs/en/statusline: an object
+    with `session_id`, `cost.total_cost_usd` (Claude Code's own list-price estimate, reset by
+    /clear along with the session id) and, for Pro/Max subscribers after the session's first API
+    response only, `rate_limits.five_hour` / `rate_limits.seven_day`, each optional, with
+    `used_percentage` (0-100) and `resets_at` (Unix epoch seconds). Every field is treated as
+    optional and type-checked where it's read."""
+    try:
+        stdin = sys.stdin
+        if stdin is None or stdin.isatty():
+            return {}  # run by hand: don't wait for input that won't come
+        raw = stdin.buffer.read(STATUSLINE_STDIN_MAX) if hasattr(stdin, "buffer") else stdin.read(STATUSLINE_STDIN_MAX)
+        data = json.loads(raw) if raw.strip() else {}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _stdin_windows(data: dict, now_utc) -> dict:
+    """Rows by key from the stdin's rate_limits (five_hour -> session, seven_day -> weekly_all),
+    the same tuples the status cache holds. A window without a usable percent, or whose reset
+    already passed, is left out."""
+    limits_in = data.get("rate_limits")
+    if not isinstance(limits_in, dict):
+        return {}
+    out = {}
+    for name, key in (("five_hour", "session"), ("seven_day", "weekly_all")):
+        w = limits_in.get(name)
+        if not isinstance(w, dict) or not _finite(pct := w.get("used_percentage")):
+            continue
+        reset = None
+        if _finite(at := w.get("resets_at")):
+            try:
+                when = datetime.fromtimestamp(at, UTC)
+            except (OverflowError, OSError, ValueError):
+                continue
+            if when <= now_utc:
+                continue
+            reset = when.isoformat()
+        out[key] = (key, LABELS.get(key, key), float(pct), reset, True)
+    return out
+
+
+def _reset_time(value):
+    """A row's resets_at as an aware datetime, or None when absent or unparseable."""
+    try:
+        when = datetime.fromisoformat(value) if isinstance(value, str) and value else None
+    except ValueError:
+        return None
+    return when if when is not None and when.tzinfo is not None else None
+
+
+def _session_usage(sid: str, windows: dict) -> tuple[float | None, dict]:
+    """(cost_usd, {window key: pp}) of session `sid` from the last collect's sessions.json, or
+    (None, {}). Points are kept only for a window whose shown cycle is the one they were
+    computed for: after a reset the old cycle's points would be read as this one's."""
+    try:
+        with open(_sessions_cache(), encoding="utf-8") as f:
+            data = json.load(f)
+        s = data["sessions"][sid]
+        cost = s.get("cost_usd")
+        pp = {}
+        for key, value in s.get("pp", {}).items():
+            shown = _reset_time(windows[key][3]) if key in windows else None
+            computed = _reset_time(data["windows"].get(key, {}).get("resets_at"))
+            if shown and computed and _finite(value) and value >= 0 \
+                    and abs((shown - computed).total_seconds()) <= CYCLE_JITTER_S:
+                pp[key] = float(value)
+        return (float(cost) if _finite(cost) and cost >= 0 else None), pp
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None, {}
+
+
+def _statusline_text(data: dict, now_utc) -> str:
+    got = _read_cache()
+    age = got[1] if got else None
+    fresh = age is not None and age <= STATUSLINE_STALE_S
+    cached = {r[0]: r for r in got[0] if len(r) >= 5 and isinstance(r[0], str) and _finite(r[2])} if got else {}
+    live = _stdin_windows(data, now_utc)
+    windows, from_cache = {}, False
+    for key in ("session", "weekly_all"):
+        row = cached.get(key)
+        reset = _reset_time(row[3]) if row else None
+        ended = reset is not None and reset <= now_utc
+        if key in live and (row is None or ended or not fresh):
+            windows[key] = live[key]  # fresher than a missing, stale or rolled-over cache row
+        elif row is not None:
+            # A cycle that already reset counts as 0%, as in 'guard': nothing used in the new one yet.
+            windows[key] = (key, row[1], 0.0, None, row[4]) if ended else row
+            from_cache = True
+    parts = []
+    for key, short in (("session", "5h"), ("weekly_all", "wk")):
+        if row := windows.get(key):
+            text = f"{short} {row[2]:.0f}%"
+            if key == "session" and (reset := _reset_time(row[3])) and reset > now_utc:
+                text += " " + _fmt_until(reset - now_utc).replace(" ", "")
+            parts.append(text)
+    if from_cache and not fresh:
+        parts.append(f"{age / 60:.0f}m ago")
+    sid = data.get("session_id")
+    cost, pp = _session_usage(sid, windows) if isinstance(sid, str) and sid else (None, {})
+    cost_in = data.get("cost")
+    if isinstance(cost_in, dict) and _finite(live_cost := cost_in.get("total_cost_usd")) and live_cost >= 0:
+        cost = float(live_cost)  # Claude Code's own running total: no collect lag
+    points = ", ".join(f"{short} {round(pp[key], 1):g}pp" for key, short in (("session", "5h"), ("weekly_all", "wk"))
+                       if key in pp)
+    if cost is not None:
+        parts.append(f"session ${cost:.2f}" + (f" ({points})" if points else ""))
+    elif points:
+        parts.append(f"session {points}")
+    return " · ".join(parts) or "cmon offline"
+
+
+def statusline(_args):
+    """One line for Claude Code's statusLine command: the plan from the status cache and what this
+    session cost and took of each window. Never calls the API or opens DuckDB, and always exits 0:
+    Claude Code blanks the status row when the command fails, and cancels it when a new redraw
+    comes first. The session's points come from the last collect, so they lag by up to one
+    collection interval; the cost is Claude Code's live figure when stdin carries it."""
+    data = _statusline_input()
+    try:
+        line = _statusline_text(data, datetime.now(UTC))
+    except Exception as e:  # a bug here must not blank the row with a traceback
+        print(f"cmon: statusline: {e}", file=sys.stderr)
+        line = "cmon error"
+    print(line)
+
+
 def wait(args):
     """Block until window resets (default) or hits --at N%, then notify.
     Ctrl-C cancels. Poll every --interval s; in reset mode sleep until resets_at."""
@@ -4722,6 +4907,8 @@ def main():
     pg.add_argument("-q", "--quiet", action="store_true", help="no explanation on stderr")
     pg.add_argument("--json", action="store_true",
                     help="print {window, percent, max, resets_at, age_s, result} on stdout")
+    sub.add_parser("statusline", help="line for Claude Code's statusLine: plan from the local cache plus this "
+                                      "session's cost and points (reads its JSON on stdin; never the API or DB)")
     ptr = sub.add_parser("trends", help="consumption history: per-label summary + per-cycle peaks/anomaly")
     ptr.add_argument("--since", help="filter the summary from '24h', '7d' or ISO date")
     ptr.add_argument("--json", action="store_true", help="JSON output of the summary")
@@ -4827,7 +5014,8 @@ def main():
          "clear": config_clear}[args.action](args)
         return
     try:
-        {"now": now, "status": status, "guard": guard, "trends": trends, "collect": collect,
+        {"now": now, "status": status, "guard": guard, "statusline": statusline, "trends": trends,
+         "collect": collect,
          "burn": burn, "watch": watch, "wait": wait, "plot": plot,
          "backtest": backtest, "tune": tune, "install": install,
          "uninstall": uninstall, "import": import_db, "keepalive": keepalive, "sync": sync}[args.cmd](args)

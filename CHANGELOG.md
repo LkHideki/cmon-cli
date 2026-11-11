@@ -64,6 +64,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   100%, blank while the projection stays under 100%), and each menu row adds a projection line,
   orange past 100%, with its age once it's minutes old. Until now the projection appeared only in
   `now --advice` and `watch`, so the bar showed where usage was but not where it was going.
+- **`cmon statusline`: a `statusLine` command for Claude Code.** It reads the JSON Claude Code
+  sends on stdin and prints the plan with what this session cost and how many points of each
+  window it took: `5h 62% 1h40m · wk 44% · session $3.10 (5h 2pp, wk 0.4pp)`. The plan comes from
+  the status cache, with the `rate_limits` on stdin filling in a window the cache lacks, has seen
+  reset, or holds for more than 30 minutes. The cost is Claude Code's own `cost.total_cost_usd`
+  when present. The points come from the new `~/.cmon/sessions.json`, which `collect` writes per
+  session id over each window's current cycle, so they lag by up to one collection. It never calls
+  the API or opens the database and always exits 0; missing or invalid stdin prints the plan
+  alone. `cmon status` is unchanged.
 
 ### Changed
 

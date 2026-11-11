@@ -165,6 +165,7 @@ The examples use `uv run cmon`, for a clone of this repository. After `make inst
 ```bash
 uv run cmon now       # current usage + reset + rate/projection (--advice adds pacing tips)
 uv run cmon status    # one-liner for statusline/tmux/prompt
+uv run cmon statusline  # Claude Code's statusLine: the plan plus this session's cost and points
 uv run cmon guard --max 90  # exit 1 when the 5h window is at 90% or more (scripts, hooks)
 uv run cmon watch     # live TUI, self-updating (Ctrl-C exits)
 uv run cmon wait      # block until 5h window resets, then notify
@@ -221,6 +222,48 @@ after `cmon install`), `watch` or `now`, not from the reading it prints. It is l
 of them has run in the current cycle, while there's no rate to project (fewer than two readings
 in the cycle, or no rise), and once a window is at 100%. Near the end of a window a projection
 that is 20 minutes old can be well off: check `projection_at` before acting on it.
+
+### `cmon statusline` — Claude Code's status line
+
+`status` prints the plan alone. `statusline` is made for Claude Code's `statusLine` setting: it
+reads the JSON Claude Code sends on stdin and adds what the current session cost and how many
+points of each window it took:
+
+```
+5h 62% 1h40m · wk 44% · session $3.10 (5h 2pp, wk 0.4pp)
+```
+
+Add it to `~/.claude/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "cmon statusline"
+  }
+}
+```
+
+Claude Code runs the command after each assistant message (debounced at 300 ms) and blanks the
+row when it fails, so `statusline` never calls the API, never opens the database and always exits
+0. With the cache in place it takes about 35 ms, most of it Python starting. Each part has its own
+source:
+
+| Part | Source |
+|---|---|
+| `5h 62% 1h40m · wk 44%` | The status cache that `collect`, `status`, `now` and `watch` write. When the cache is missing, older than 30 minutes, or one of its windows has already reset, the `rate_limits` that Claude Code sends (Pro and Max plans, after the session's first response) fill in that window. A cached window that already reset with nothing to replace it shows 0%, as in `guard`, and `45m ago` marks a stale cache. |
+| `session $3.10` | Claude Code's own estimate (`cost.total_cost_usd`) when stdin carries it, else cmon's from the last `collect`. |
+| `(5h 2pp, wk 0.4pp)` | `~/.cmon/sessions.json`, which each `cmon collect` rewrites: this session's points of each window's current cycle, split as `burn --plan` splits them, by the API-equivalent cost logged while the percent rose. |
+
+The points lag by up to one collection (20 minutes after `cmon install`), are absent until a
+`collect` has seen the session, and drop out for a window once its cycle resets. The file holds
+the session ids, costs and points of the 300 most recently active sessions of the weekly cycle.
+
+Run by hand without input, or given input that isn't a JSON object, it prints the plan part only;
+`cmon offline` means there's nothing at all to show. If Claude Code doesn't find `cmon` on its
+`PATH`, give the full path (`uv tool dir --bin` prints the folder). Prefer the installed command
+to `python cmon.py statusline`, which compiles the whole script on every run and takes about twice
+as long.
 
 ### `cmon guard` — exit code for scripts and hooks
 
