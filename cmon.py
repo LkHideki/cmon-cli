@@ -3077,7 +3077,8 @@ def _status_json(got) -> dict:
         w = {"key": key, "label": label, "percent": percent, "resets_at": resets_at, "active": bool(active)}
         if resets_at and (split := _client_share_for(key, resets_at)):
             w["by_client"] = split  # optional, from the last 'collect'
-        if resets_at and (proj := _projection_for(key, resets_at)):
+        exhausted = _is_number(percent) and percent >= 100  # a cached projection predates reaching it
+        if resets_at and not exhausted and (proj := _projection_for(key, resets_at)):
             w.update(proj)  # optional: projected_percent, exhausts_at, projection_at
         windows.append(w)
     return {"version": 1, "offline": False, "observed_at": observed.isoformat(),
@@ -3546,16 +3547,22 @@ def wait(args):
         print("\ncanceled.")
 
 
-def _cycles(con, key: str) -> list:
+def _cycles(con, key: str, by_reset: bool = False) -> list:
     """Segment snapshots for a window into cycles, cutting at each reset
-    (percent drop). Returns a list of Cycle(ts, percent) named tuples."""
+    (percent drop). Returns a list of Cycle(ts, percent) named tuples.
+    by_reset also cuts where resets_at moves by more than CYCLE_JITTER_S, so a reset the
+    readings never saw drop (machine off across it, new cycle already higher) still splits."""
     if con is None:
         return []
-    rows = con.execute("SELECT observed_at,percent FROM snapshots "
+    rows = con.execute("SELECT observed_at,percent,resets_at FROM snapshots "
                        "WHERE provider='claude' AND key=? ORDER BY observed_at", [key]).fetchall()
     if not rows:
         return []
-    cuts = [i for i in range(1, len(rows)) if rows[i][1] - rows[i - 1][1] < 0]  # reset boundaries
+
+    def moved(a, b):
+        return by_reset and a is not None and b is not None and abs((b - a).total_seconds()) > CYCLE_JITTER_S
+    cuts = [i for i in range(1, len(rows))  # reset boundaries
+            if rows[i][1] - rows[i - 1][1] < 0 or moved(rows[i - 1][2], rows[i][2])]
     bounds = [0, *cuts, len(rows)]
     segs = []
     for a, b in zip(bounds, bounds[1:], strict=False):
@@ -3578,8 +3585,10 @@ def _scoreboard(con, now: datetime) -> list[dict]:
     it only sees what the collection interval sees: the stretch before the first 100% reading
     and after the last one is not counted, and a 5h cycle with one 100% reading counts as a hit
     with no hours. A gap longer than the 5h window hides a reset and is left out. The last
-    cycle is in progress unless its latest reading says it already reset."""
-    weeks = _cycles(con, "weekly_all")[-SCOREBOARD_CYCLES:]
+    cycle is in progress unless its latest reading says it already reset. Weekly cycles also
+    split where resets_at moves: a light week can start at or above the last week's final
+    reading, with no drop to cut at."""
+    weeks = _cycles(con, "weekly_all", by_reset=True)[-SCOREBOARD_CYCLES:]
     if not weeks:
         return []
     window = timedelta(minutes=300)
@@ -4294,7 +4303,7 @@ def _plan_window(con, name: str):
 CACHE_TTL_S = 3600  # assumed prompt-cache TTL: Claude Code's 1h, the one PRICES charges (2x input)
 COMPACT_MIN_TURNS = 10  # shorter sessions aren't /compact candidates: little left to save
 COMPACT_MIN_CONTEXT = 50_000  # floor under the top tier, so a base of small sessions flags none
-COMPACT_TIER = 0.9  # /compact candidates: average context at or above this quantile
+COMPACT_TIER = 0.9  # /compact candidates: the sessions above this share, the top 10% by average context
 CACHE_TOP = 10  # sessions listed per table, and projects in the text form
 
 
@@ -4364,9 +4373,10 @@ def _cache_report(con, since, src: str, filt: str, fparams: list):
     ctx = {k: (v["input"] + v["cache_read"] + v["cache_write"]) / v["turns"]
            for k, v in sessions.items() if v["turns"] >= COMPACT_MIN_TURNS}
     threshold = None
-    if ctx:  # nearest-rank quantile: with few sessions the tier is the largest one(s)
-        ranked = sorted(ctx.values())
-        threshold = max(ranked[math.ceil(COMPACT_TIER * len(ranked)) - 1], COMPACT_MIN_CONTEXT)
+    if ctx:  # the top (1 - tier) of sessions, at least one; ties at the cutoff are kept
+        ranked = sorted(ctx.values(), reverse=True)
+        top = max(1, math.ceil(round((1 - COMPACT_TIER) * len(ranked), 9)))  # round: (1 - 0.9) * 10 is 0.99..
+        threshold = max(ranked[top - 1], COMPACT_MIN_CONTEXT)
     compact = [{"session": k, "project": main_project(sessions[k]), "turns": sessions[k]["turns"],
                 "avg_context_tok": c, "cost_usd": sessions[k]["cost"]}
                for k, c in ctx.items() if c >= threshold]

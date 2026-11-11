@@ -116,10 +116,29 @@ def test_compact_candidates_are_the_top_tier_of_long_sessions(con, capsys):
     got = burn(capsys)
     cp = got["compact"]
     assert cp["min_turns"] == 10 and cp["min_context_tok"] == 50_000
-    assert cp["threshold_tok"] == pytest.approx(140_000)  # nearest-rank 90th percentile of 10
-    assert [(s["session"], s["turns"]) for s in cp["sessions"]] == [("long9", 10), ("long8", 10)]
+    assert cp["threshold_tok"] == pytest.approx(150_000)  # the top 10% of 10 is one session
+    assert [(s["session"], s["turns"]) for s in cp["sessions"]] == [("long9", 10)]
     assert cp["sessions"][0]["avg_context_tok"] == pytest.approx(150_000)
     assert cp["sessions"][0]["cost_usd"] == pytest.approx(10 * 150_000 * 0.5 / 1e6)
+
+
+@pytest.mark.parametrize(("n", "flagged"), [(5, 1), (19, 2), (20, 2), (21, 3)])
+def test_compact_tier_is_the_top_tenth_rounded_up(con, capsys, n, flagged):
+    # Was the nearest-rank 90th percentile and everything at or above it: 2 of 10, 3 of 20.
+    for k in range(n):
+        for t in range(10):
+            turn(con, T0 + t * MIN, session=f"s{k:02d}", r=60_000 + k * 10_000)
+    con.close()
+    cp = burn(capsys)["compact"]
+    assert [s["session"] for s in cp["sessions"]] == [f"s{k:02d}" for k in range(n - 1, n - 1 - flagged, -1)]
+
+
+def test_compact_tier_keeps_sessions_tied_at_the_cutoff(con, capsys):
+    for k in range(10):
+        for t in range(10):
+            turn(con, T0 + t * MIN, session=f"s{k}", r=200_000 if k >= 8 else 60_000)
+    con.close()
+    assert sorted(s["session"] for s in burn(capsys)["compact"]["sessions"]) == ["s8", "s9"]
 
 
 def test_small_sessions_are_never_compact_candidates(con, capsys):

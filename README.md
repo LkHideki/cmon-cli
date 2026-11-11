@@ -446,7 +446,9 @@ and how many 5h cycles reached 100%. The current cycle is marked *in progress*, 
 is what's left so far. Frequent 5h blocks with weekly leftover point to bursts that could be
 spread out; a high leftover with no blocks points to a plan bigger than the usage. `--json`
 prints the rows as a list of `{start, peak_pct, leftover_pct, in_progress, blocked_h,
-blocked_5h_cycles}`, with `start` in ISO 8601 UTC; `--since` doesn't apply.
+blocked_5h_cycles}`, with `start` in ISO 8601 UTC; `--since` doesn't apply. A cycle ends where
+the weekly percent drops or the reset time the API reports moves, so a reset that came while no
+collection ran still splits two cycles, even when the new one's first reading isn't lower.
 
 Blocked time is measured between snapshots, so its resolution is the collection interval
 (20 minutes with `cmon install`): a block that starts and ends between two collections doesn't

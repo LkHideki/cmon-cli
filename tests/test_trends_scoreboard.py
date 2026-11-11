@@ -110,6 +110,19 @@ def test_scoreboard_ignores_gaps_longer_than_the_5h_window(cli, clock) -> None:
     assert row["blocked_5h_cycles"] == 1  # one cycle as _cycles sees it (no drop observed)
 
 
+def test_scoreboard_splits_at_a_reset_with_no_drop(cli, clock) -> None:
+    # Machine off across the weekly reset at 168h; the new cycle's first reading (15%) is above the
+    # old one's last (10%), so only resets_at shows the new cycle. Jitter under an hour doesn't cut.
+    _seed([(0, "weekly_all", 2, 168), (24, "weekly_all", 10, 168 + 0.5 / 3600),
+           (170, "weekly_all", 15, 336), (180, "weekly_all", 20, 336)])
+    clock.set(T0 + timedelta(hours=190))
+    out = json.loads(cli("trends", "--scoreboard", "--json").stdout)
+    assert [(r["start"], r["peak_pct"], r["leftover_pct"], r["in_progress"]) for r in out] == [
+        ("2030-01-01T00:00:00+00:00", 10.0, 90.0, False),
+        ("2030-01-08T02:00:00+00:00", 20.0, 80.0, True),
+    ]
+
+
 def test_scoreboard_without_weekly_history(cli, clock) -> None:
     _seed([(0, "session", 40, 5)])
     text = cli("trends", "--scoreboard")

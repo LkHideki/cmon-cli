@@ -88,6 +88,16 @@ def test_projection_of_another_cycle_is_left_out(con, paced):
     assert "exhausts_at" not in windows(next_5h)["session"]
 
 
+def test_window_at_100_drops_the_projection_cached_before_it(con, paced):
+    # A 'status --live' read (cmon Bar) between two collects sees 100% in the same cycle: the
+    # cached 130% / exhausts_at from the last collect no longer applies.
+    cmon._refresh_projection(con, paced, T0)
+    full = [("session", "Current session", 100.0, SESSION_RESET.isoformat(), True), paced[1]]
+    got = windows(full)
+    assert set(got["session"]) == {"key", "label", "percent", "resets_at", "active"}
+    assert got["weekly_all"]["projected_percent"] == pytest.approx(80.0)
+
+
 def test_nothing_to_project_leaves_the_window_without_fields(con):
     reset = (T0 + 3 * H).isoformat()
     snap(con, T0 - H, 100, "session", reset)
