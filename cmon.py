@@ -99,10 +99,27 @@ SERVICE, ACCOUNT = "cmon", "claude-oauth"  # entry in the OS secure vault (manua
 # Legacy (<= 0.5): a refresh chain cmon derived from Claude Code's refresh_token. Never used
 # now; purged from the vault once (see _purge_legacy_chain).
 LEGACY_AUTO_ACCOUNT = "claude-oauth-auto"
-RETRIES = int(os.environ.get("CMON_RETRIES", "3"))
-DEDUP_SECS = int(os.environ.get("CMON_DEDUP_SECS", "60"))  # window to deduplicate collect
-ALERT_LEAD_MIN = int(os.environ.get("CMON_ALERT_LEAD", "60"))  # minutes-before-reset to alert (5h window)
-ALERT_LEAD_WEEKLY_MIN = int(os.environ.get("CMON_ALERT_LEAD_WEEKLY", "180"))  # same, for the weekly window
+_ENV_ERRORS: list[str] = []  # invalid CMON_* numbers, which main() reports before any command runs
+
+
+def _env_number(name: str, default, kind=int):
+    """The number in env var NAME, or DEFAULT when it's unset. An invalid value is recorded in
+    _ENV_ERRORS, not raised: raised here, at import, it was a traceback before main() could say
+    anything, and its exit 1 is what 'guard' means by "at or above --max"."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return kind(raw)
+    except ValueError:
+        _ENV_ERRORS.append(f"{name}={raw!r} is not {'a whole number' if kind is int else 'a number'}")
+        return default
+
+
+RETRIES = _env_number("CMON_RETRIES", 3)
+DEDUP_SECS = _env_number("CMON_DEDUP_SECS", 60)  # window to deduplicate collect
+ALERT_LEAD_MIN = _env_number("CMON_ALERT_LEAD", 60)  # minutes-before-reset to alert (5h window)
+ALERT_LEAD_WEEKLY_MIN = _env_number("CMON_ALERT_LEAD_WEEKLY", 180)  # same, for the weekly window
 # Per-window lead (minutes-before-reset) for the time-based alert. Extend here to cover more windows.
 LEAD_MIN_BY_KEY = {"session": ALERT_LEAD_MIN, "weekly_all": ALERT_LEAD_WEEKLY_MIN}
 LEAD_LABEL_BY_KEY = {"session": "5h window", "weekly_all": "Weekly limit"}
@@ -111,12 +128,12 @@ MAX_JSONL_LINE = 4 << 20  # 4 MiB: skip parsing absurdly large transcript lines 
 # histogram: a wide gap can't say when inside it the usage happened, and spreading it evenly
 # invents consumption at 4am. Recency decays instead of being truncated so the shape drifts
 # with your routine rather than jumping when a day leaves a fixed window.
-PROFILE_PAIR_MAX_H = float(os.environ.get("CMON_PROFILE_PAIR_MAX_H", "1.5"))  # gap above this = ignorance
-PROFILE_HALFLIFE_D = float(os.environ.get("CMON_PROFILE_HALFLIFE_D", "10"))   # weight half-life
-PROFILE_MAX_AGE_D = float(os.environ.get("CMON_PROFILE_MAX_AGE_D", "42"))     # hard cutoff (~2 half-lives+)
-PROFILE_MIN_HOURS = float(os.environ.get("CMON_PROFILE_MIN_HOURS", "24"))     # dense coverage needed
-PROFILE_MIN_DAYS = int(os.environ.get("CMON_PROFILE_MIN_DAYS", "3"))          # days of token_log needed
-PROFILE_MIN_BUCKETS = int(os.environ.get("CMON_PROFILE_MIN_BUCKETS", "8"))    # distinct hours needed
+PROFILE_PAIR_MAX_H = _env_number("CMON_PROFILE_PAIR_MAX_H", 1.5, float)   # gap above this = ignorance
+PROFILE_HALFLIFE_D = _env_number("CMON_PROFILE_HALFLIFE_D", 10.0, float)  # weight half-life
+PROFILE_MAX_AGE_D = _env_number("CMON_PROFILE_MAX_AGE_D", 42.0, float)    # hard cutoff (~2 half-lives+)
+PROFILE_MIN_HOURS = _env_number("CMON_PROFILE_MIN_HOURS", 24.0, float)    # dense coverage needed
+PROFILE_MIN_DAYS = _env_number("CMON_PROFILE_MIN_DAYS", 3)                # days of token_log needed
+PROFILE_MIN_BUCKETS = _env_number("CMON_PROFILE_MIN_BUCKETS", 8)          # distinct hours needed
 PROFILE_MIN_BUCKET_H = 0.5   # below this an hour bucket is "unobserved" (one noisy sample)
 PROFILE_PSEUDO_H = 1.0       # shrinkage strength toward the local prior, in observed-hour units
 PROFILE_FLOOR = 0.02         # no hour is ever exactly 0 intensity (kills divide-by-zero anchors)
@@ -124,10 +141,10 @@ PROFILE_ACTIVE_FRAC = 0.05   # a day-hour is "active" above this fraction of the
 QUIET_MULT = 0.05            # intensity multiplier inside declared quiet hours
 # Forecast logging (see _log_forecasts / backtest): predictions are stored so they can be
 # scored against reality later. Kept cheap — one write per interval, pruned by age.
-FORECAST_EVERY_S = int(os.environ.get("CMON_FORECAST_EVERY_S", "900"))  # dedup between writes
+FORECAST_EVERY_S = _env_number("CMON_FORECAST_EVERY_S", 900)  # dedup between writes
 FORECAST_HORIZONS = (1.0, 3.0, 6.0)  # fixed horizons, plus each window's own time-to-reset
-FORECAST_MATCH_MIN = int(os.environ.get("CMON_FORECAST_MATCH_MIN", "20"))  # snapshot match window
-FORECAST_KEEP_D = int(os.environ.get("CMON_FORECAST_KEEP_D", "60"))  # retention
+FORECAST_MATCH_MIN = _env_number("CMON_FORECAST_MATCH_MIN", 20)  # snapshot match window
+FORECAST_KEEP_D = _env_number("CMON_FORECAST_KEEP_D", 60)  # retention
 # Tunable model parameters, with the values used until 'cmon tune' has evidence to change them.
 # Persisted as one small JSON row in `meta` (a few hundred bytes) rather than a new table or
 # file: they are three numbers, and they belong next to the history they were fitted on.
@@ -142,7 +159,7 @@ PARAM_GRID = {"halflife_d": [5.0, 10.0, 21.0], "harmonics": [0.0, 2.0, 3.0],
               "blend": [0.0, 0.5, 1.0], "robust": [0.0, 0.5, 1.0]}
 TUNE_STEP = 24  # subsample the history when tuning: 27 candidates x a full replay is minutes
 TUNE_MIN_GAIN = 0.05  # MAE points a candidate must win by before it's worth persisting
-PARAM_MIN_SCORED = int(os.environ.get("CMON_TUNE_MIN_SCORED", "200"))  # per-band evidence needed
+PARAM_MIN_SCORED = _env_number("CMON_TUNE_MIN_SCORED", 200)  # per-band evidence needed
 # How each projection source is described to the user, keyed by _project()'s third return value.
 PROJ_NOTE = {"learned": " (weighted by your usage profile)",
              "quiet_hours": " (skipping your quiet hours)"}
@@ -2801,7 +2818,12 @@ def _cache_payload() -> dict:
     if not os.path.exists(CACHE):
         return {"version": CACHE_VERSION, "providers": {}}
     with open(CACHE, encoding="utf-8") as f:
-        data = json.load(f)
+        try:
+            data = json.load(f)
+        except RecursionError:  # nested past the parser's limit: as unreadable as broken JSON
+            raise ValueError("cache nested too deeply") from None
+    if not isinstance(data, dict):  # every reader calls .get on it
+        raise ValueError("cache is not a JSON object")
     if data.get("version") == CACHE_VERSION and isinstance(data.get("providers"), dict):
         return data
     if "ts" in data and isinstance(data.get("rows"), list):
@@ -3252,6 +3274,22 @@ def guard(args):
     cycle that already reset, so a hook never waits on the network or on a collect's write lock."""
     out = {"window": PLAN_ALIASES.get(args.window.lower(), args.window), "percent": None,
            "max": args.max, "resets_at": None, "age_s": None, "result": "no_data"}
+    try:
+        msg = _guard_verdict(args, out)
+    except Exception as e:  # Python's own exit code here would be 1, which says "at or above --max"
+        out |= {"percent": None, "resets_at": None, "result": "no_data"}
+        msg = f"couldn't read the cache ({_safe(e)})"
+    if args.json:
+        print(json.dumps(out))
+    if not args.quiet:
+        print(f"cmon guard: {msg}.", file=sys.stderr)
+    sys.exit(GUARD_EXIT.get(out["result"], 3))
+
+
+def _guard_verdict(args, out: dict) -> str:
+    """Fill OUT with guard's verdict from the status cache and return the one-line explanation."""
+    if _ENV_ERRORS:  # main() lets guard run anyway, so a bad variable reads as unknown, not as over
+        return "; ".join(_ENV_ERRORS)
     got = _read_cache()
     rows = [r for r in got[0] if len(r) >= 5 and isinstance(r[0], str)] if got else []
     if not rows:
@@ -3272,7 +3310,7 @@ def guard(args):
             out["result"] = "missing"
             known = ", ".join(_safe(r[0], 60) for r in rows)
             msg = f"no window {args.window!r} in the cache (known: {known})"
-        elif isinstance(pct, bool) or not isinstance(pct, (int, float)):
+        elif not _finite(pct):  # NaN compared as "under", Infinity as "over", and neither is JSON
             msg = f"the cached {label} has no usable percent"
         else:
             reset = row[3] if isinstance(row[3], str) and row[3] else None
@@ -3291,11 +3329,7 @@ def guard(args):
                 msg = f"{label} at {pct:g}%, {verdict} --max {args.max:g}"
                 if reset:
                     msg += f"; resets in {fmt_eta(reset)}"
-    if args.json:
-        print(json.dumps(out))
-    if not args.quiet:
-        print(f"cmon guard: {msg}.", file=sys.stderr)
-    sys.exit(GUARD_EXIT.get(out["result"], 3))
+    return msg
 
 
 SESSIONS_KEEP = 300  # sessions in sessions.json: the most recently active of the weekly cycle
@@ -3349,7 +3383,13 @@ def _refresh_session_cost(con, rows, now_utc) -> None:
 
 
 def _finite(value) -> bool:
-    return not isinstance(value, bool) and isinstance(value, int | float) and math.isfinite(value)
+    """A number a float can hold: not a bool, NaN, an infinity or an int past float range."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:  # an int too large for a float, such as a 400-digit JSON literal
+        return False
 
 
 def _statusline_input() -> dict:
@@ -3423,7 +3463,7 @@ def _session_usage(sid: str, windows: dict) -> tuple[float | None, dict]:
                     and abs((shown - computed).total_seconds()) <= CYCLE_JITTER_S:
                 pp[key] = float(value)
         return (float(cost) if _finite(cost) and cost >= 0 else None), pp
-    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError):
         return None, {}
 
 
@@ -3438,7 +3478,10 @@ def _statusline_text(data: dict, now_utc) -> str:
         row = cached.get(key)
         reset = _reset_time(row[3]) if row else None
         ended = reset is not None and reset <= now_utc
-        if key in live and (row is None or ended or not fresh):
+        # A row with no reset time is parked (the window rolled over, see _window_parked): a
+        # stdin window with a reset ahead is running now, so it's the newer of the two.
+        parked = row is not None and reset is None and key in live and live[key][3] is not None
+        if key in live and (row is None or ended or parked or not fresh):
             windows[key] = live[key]  # fresher than a missing, stale or rolled-over cache row
         elif row is not None:
             # A cycle that already reset counts as 0%, as in 'guard': nothing used in the new one yet.
@@ -5408,6 +5451,8 @@ def main():
     cfclr.add_argument("--all", action="store_true", help="remove every persisted preference")
 
     args = p.parse_args()
+    if _ENV_ERRORS and args.cmd != "guard":  # guard reports it as no data: its exit 1 means "over"
+        sys.exit(f"cmon: {'; '.join(_ENV_ERRORS)}.")
     if args.db:
         global DB
         DB = args.db

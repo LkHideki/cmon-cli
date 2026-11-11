@@ -28,10 +28,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   single wait. Without the key nothing changes.
 - **`cmon guard --max N`: an exit code for scripts and Claude Code hooks.** Exits 1 when the window
   (`--window`, default `session`; `5h`, `weekly` and scoped models work) is at or above N percent,
-  0 under it, and 3 when there's no data, the window is missing or the cache is older than
-  `--stale-min` (60 minutes), so an empty cache can't pass for a free window. A cached cycle that
-  already reset counts as 0%. It reads only the status cache, never the API or the database, so a
-  hook doesn't wait on the network or on a running `collect`. `--quiet` drops the stderr line and
+  0 under it, and 3 when there's no data, the window is missing, the cache is older than
+  `--stale-min` (60 minutes) or can't be read, so an empty or broken cache can't pass for a free
+  window; exit 1 means only "at or above", even when something unexpected fails. A cached cycle
+  that already reset counts as 0%. It reads only the status cache, never the API or the database,
+  so a hook doesn't wait on the network or on a running `collect`. `--quiet` drops the stderr line and
   `--json` prints `{window, percent, max, resets_at, age_s, result}`. `status` keeps exiting 0.
 - **A daily budget of the weekly limit in `cmon now`.** A new `Today:` line puts the points used
   since local midnight against today's share of what was left of the week at that moment, spread
@@ -67,12 +68,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 - **`cmon statusline`: a `statusLine` command for Claude Code.** It reads the JSON Claude Code
   sends on stdin and prints the plan with what this session cost and how many points of each
   window it took: `5h 62% 1h40m · wk 44% · session $3.10 (5h 2pp, wk 0.4pp)`. The plan comes from
-  the status cache, with the `rate_limits` on stdin filling in a window the cache lacks, has seen
-  reset, or holds for more than 30 minutes. The cost is Claude Code's own `cost.total_cost_usd`
-  when present. The points come from the new `~/.cmon/sessions.json`, which `collect` writes per
-  session id over each window's current cycle, so they lag by up to one collection. It never calls
-  the API or opens the database and always exits 0; missing or invalid stdin prints the plan
-  alone. `cmon status` is unchanged.
+  the status cache, with the `rate_limits` on stdin filling in a window the cache lacks or can't
+  read, has seen reset (a row parked at 0% with no reset time included), or holds for more than 30
+  minutes. The cost is Claude Code's own `cost.total_cost_usd` when present. The points come from
+  the new `~/.cmon/sessions.json`, which `collect` writes per session id over each window's current
+  cycle, so they lag by up to one collection. It never calls the API or opens the database and
+  always exits 0; missing or invalid stdin prints the plan alone. `cmon status` is unchanged.
 - **`cmon doctor`: the installation check on any OS.** Until now only `make doctor` existed, and
   only for a macOS clone. It checks the token source (named, never printed), one call to the usage
   API (`--offline` skips it), the background job where `cmon install` puts it on each OS, the
@@ -97,6 +98,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **An invalid number in a `CMON_*` variable no longer ends in a traceback.** `CMON_ALERT_LEAD=30m`
+  or an empty `CMON_RETRIES=` raised at import, before any command ran. Every command now stops
+  with one line naming the variable, and `cmon guard` exits 3 (no data) instead of the traceback's
+  1, which a hook reads as "at or above --max".
 - **`cmon burn` no longer prices an unknown model at zero in silence.** It warns on stderr, naming
   the model and its tokens, since that zero also hands the model's share of the percent in
   `burn --plan` to other groups or to *other*. A new model such as Mythos used to show up as US$ 0

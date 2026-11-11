@@ -253,7 +253,7 @@ source:
 
 | Part | Source |
 |---|---|
-| `5h 62% 1h40m · wk 44%` | The status cache that `collect`, `status`, `now` and `watch` write. When the cache is missing, older than 30 minutes, or one of its windows has already reset, the `rate_limits` that Claude Code sends (Pro and Max plans, after the session's first response) fill in that window. A cached window that already reset with nothing to replace it shows 0%, as in `guard`, and `45m ago` marks a stale cache. |
+| `5h 62% 1h40m · wk 44%` | The status cache that `collect`, `status`, `now` and `watch` write. When the cache is missing or unreadable, older than 30 minutes, or one of its windows has already reset (or sits at 0% with no reset time, as the API reports a window that rolled over), the `rate_limits` that Claude Code sends (Pro and Max plans, after the session's first response) fill in that window. A cached window that already reset with nothing to replace it shows 0%, as in `guard`, and `45m ago` marks a stale cache. |
 | `session $3.10` | Claude Code's own estimate (`cost.total_cost_usd`) when stdin carries it, else cmon's from the last `collect`. |
 | `(5h 2pp, wk 0.4pp)` | `~/.cmon/sessions.json`, which each `cmon collect` rewrites: this session's points of each window's current cycle, split as `burn --plan` splits them, by the API-equivalent cost logged while the percent rose. |
 
@@ -281,7 +281,7 @@ cmon guard --window session --max 90 || exit 0   # don't start the batch near th
 | 0 | Under `--max`, including a window whose cached reset already passed (nothing used in the new cycle yet) |
 | 1 | At or above `--max` |
 | 2 | Bad arguments (argparse's usage error) |
-| 3 | No data: no cache, the window isn't in it, or it's older than `--stale-min` minutes (60) |
+| 3 | No data: no cache, the window isn't in it, it's older than `--stale-min` minutes (60), or it can't be read (a file that isn't a cache, a percent that isn't a number, an invalid number in a `CMON_*` variable) |
 
 Exit 3 is separate on purpose: an empty or stale cache must not pass for a free window. Test
 for 1 when "unknown" should let the work go ahead, as the hook below does.
@@ -948,7 +948,8 @@ environment variables: `CMON_DB` (database path), `CMON_RETRIES`, `CMON_DEDUP_SE
 `CMON_HOOK` (command run on every alert; see [Alerts](#alerts)),
 `CMON_OAUTH_CLIENT_ID` / `CMON_OAUTH_TOKEN_URL` (OAuth refresh overrides; URL allowlisted to
 `*.anthropic.com`), `CMON_ALLOW_PLAINTEXT_KEYRING` (permit saving to a cleartext keyring backend),
-`CMON_TZ` (display timezone override; see [Config](#config)).
+`CMON_TZ` (display timezone override; see [Config](#config)). A number variable that doesn't parse
+stops every command with one line naming it, and makes `cmon guard` exit 3.
 
 ## Warning
 

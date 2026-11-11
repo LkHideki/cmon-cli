@@ -1,5 +1,9 @@
 import json
-from datetime import timedelta
+import math
+import os
+import subprocess
+import sys
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -96,9 +100,13 @@ def test_no_cache_is_3_not_a_free_window(cli, no_backend):
     assert "no cached usage" in result.stderr
 
 
-@pytest.mark.parametrize("content", ["{not json", '{"version": 2, "providers": {"claude": {}}}',
-                                     '{"version": 2, "providers": {"claude": {"updated_at": '
-                                     '"2030-01-02T05:55:00+00:00", "windows": {}}}}'])
+@pytest.mark.parametrize("content", [
+    "{not json", '{"version": 2, "providers": {"claude": {}}}',
+    '{"version": 2, "providers": {"claude": {"updated_at": "2030-01-02T05:55:00+00:00", "windows": {}}}}',
+    # JSON, but not an object, or nested past the parser's limit: was a traceback and exit 1,
+    # which a hook reads as "over --max".
+    "[]", "null", '"x"', "1", pytest.param("[" * 100_000 + "]" * 100_000, id="deep-nesting"),
+])
 def test_unreadable_or_empty_cache_is_3(cli, clock, no_backend, paths, content):
     paths.cache.parent.mkdir(parents=True, exist_ok=True)
     paths.cache.write_text(content)
@@ -113,7 +121,65 @@ def test_malformed_percent_is_3(cli, clock, no_backend):
     assert "no usable percent" in result.stderr
 
 
-@pytest.mark.parametrize("reset", ["garbage", "2030-01-02T08:00:00"])  # unparseable; no offset
+def _refuse(token):
+    raise AssertionError(f"--json printed {token}, which isn't JSON")
+
+
+@pytest.mark.parametrize("pct", [math.nan, math.inf, -math.inf, 10 ** 400],
+                         ids=["nan", "inf", "-inf", "int-past-float"])
+def test_non_finite_or_huge_percent_is_3_with_valid_json(cli, clock, no_backend, pct):
+    # NaN passed as "under" (exit 0), Infinity as "over", and a 401-digit int was an OverflowError.
+    _cache(clock, [("session", "Current session", pct, RESET, True)])
+    result = cli("guard", "--max", "90", "--json")
+    assert result.exit_code == 3 and "no usable percent" in result.stderr
+    assert json.loads(result.stdout, parse_constant=_refuse)["result"] == "no_data"
+
+
+def test_unexpected_error_is_3_not_1(cli, clock, no_backend, monkeypatch):
+    def boom(*_a):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(cmon, "_read_cache", boom)
+    result = cli("guard", "--max", "90", "--json")
+    assert result.exit_code == 3 and _json(result)["result"] == "no_data"
+    assert result.stderr == "cmon guard: couldn't read the cache (boom).\n"
+
+
+def test_invalid_number_in_the_environment_is_3_for_guard_and_a_message_elsewhere(cli, clock, no_backend,
+                                                                                  monkeypatch):
+    _cache(clock)
+    monkeypatch.setattr(cmon, "_ENV_ERRORS", ["CMON_ALERT_LEAD='30m' is not a whole number"])
+    result = cli("guard", "--max", "90", "--json")
+    assert result.exit_code == 3 and _json(result)["result"] == "no_data"
+    assert result.stderr == "cmon guard: CMON_ALERT_LEAD='30m' is not a whole number.\n"
+    other = cli("status")
+    assert other.as_dict() == {"exit_code": 1, "stdout": "",
+                               "stderr": "cmon: CMON_ALERT_LEAD='30m' is not a whole number.\n"}
+
+
+def test_env_number_records_a_bad_value_instead_of_raising(monkeypatch):
+    errors = []
+    monkeypatch.setattr(cmon, "_ENV_ERRORS", errors)
+    monkeypatch.setenv("CMON_X", "")
+    monkeypatch.setenv("CMON_Y", "2.5")
+    assert cmon._env_number("CMON_X", 60) == 60
+    assert cmon._env_number("CMON_Y", 1.0, float) == 2.5
+    assert cmon._env_number("CMON_UNSET_FOR_TEST", 7) == 7
+    assert errors == ["CMON_X='' is not a whole number"]
+
+
+def test_invalid_env_number_in_a_fresh_process_is_3(paths):
+    """The variables are read at import, before main(): this was a traceback with exit 1."""
+    cmon._write_cache([("session", "Current session", 10.0, None, True)], datetime.now(UTC))
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CMON_") and k != "CLAUDE_OAUTH_TOKEN"}
+    env.update(HOME=str(paths.home), CMON_DB=str(paths.db), CMON_ALERT_LEAD="")
+    out = subprocess.run([sys.executable, cmon.__file__, "guard", "--max", "90", "--json"], cwd=paths.root,
+                         env=env, capture_output=True, text=True, timeout=30)
+    assert out.returncode == 3, out.stderr
+    assert json.loads(out.stdout)["result"] == "no_data"
+    assert out.stderr == "cmon guard: CMON_ALERT_LEAD='' is not a whole number.\n"
+
+
+@pytest.mark.parametrize("reset",["garbage", "2030-01-02T08:00:00"])  # unparseable; no offset
 @pytest.mark.parametrize(("pct", "code", "result"), [(10.0, 0, "under"), (95.0, 1, "over")])
 def test_unreadable_reset_judges_the_percent_alone(cli, clock, no_backend, reset, pct, code, result):
     # Was a traceback and exit 1, which a hook reads as "over --max" even at 10%.

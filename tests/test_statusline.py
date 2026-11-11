@@ -250,6 +250,54 @@ def test_stale_cache_says_its_age_unless_stdin_has_the_window(clock, cli, stdin,
     assert line(cli) == "5h 30% 1h30m · wk 55%\n"
 
 
+def test_parked_cache_row_gives_way_to_a_running_stdin_window(clock, cli, stdin, no_backend):
+    # After a rollover the API reports 0% and no resets_at until a request opens a new window: a
+    # fresh cache holding that row has seen the window reset, and stdin's has a reset ahead.
+    cache(clock, age_min=10, session_pct=0.0, session_reset=None)
+    assert line(cli) == "5h 0% · wk 54%\n"
+    stdin({"rate_limits": {"five_hour": {"used_percentage": 18, "resets_at": epoch(T0 + 4.5 * H)}}})
+    assert line(cli) == "5h 18% 4h30m · wk 54%\n"
+    stdin({"rate_limits": {"five_hour": {"used_percentage": 18}}})  # no reset: nothing says it's running
+    assert line(cli) == "5h 0% · wk 54%\n"
+
+
+PLAN_STDIN = {"session_id": "x", "cost": {"total_cost_usd": 1.5}, "rate_limits": {
+    "five_hour": {"used_percentage": 23.4, "resets_at": epoch(T0 + 1.5 * H)},
+    "seven_day": {"used_percentage": 41, "resets_at": epoch(WEEK_RESET)}}}
+
+
+@pytest.mark.parametrize("content", ["[]", '"x"', "5", "null",
+                                     pytest.param("[" * 100_000 + "]" * 100_000, id="deep-nesting")])
+def test_unusable_cache_falls_back_to_stdin(clock, cli, stdin, no_backend, paths, content):
+    # Was 'cmon error', dropping the valid stdin along with the cache.
+    paths.cache.parent.mkdir(parents=True, exist_ok=True)
+    paths.cache.write_text(content)
+    stdin(PLAN_STDIN)
+    assert line(cli) == "5h 23% 1h30m · wk 41% · session $1.50\n"
+
+
+HUGE = "1" + "0" * 400  # a JSON integer too large for a float
+
+
+@pytest.mark.parametrize("payload", [
+    '{"session_id": "A", "rate_limits": {"seven_day": {"used_percentage": ' + HUGE + '}}}',
+    '{"session_id": "A", "rate_limits": {"five_hour": {"used_percentage": 5, "resets_at": ' + HUGE + '}}}',
+    '{"session_id": "A", "cost": {"total_cost_usd": ' + HUGE + '}}',
+], ids=["weekly-percent", "5h-reset", "cost"])
+def test_stdin_number_too_big_for_a_float_is_ignored(clock, cli, stdin, no_backend, payload):
+    cache(clock)
+    stdin(payload)
+    assert line(cli) == "5h 20% 2h0m · wk 54%\n"
+
+
+def test_cached_percent_too_big_for_a_float_is_ignored(clock, cli, stdin, no_backend):
+    cmon._write_cache([("session", "Current session", 10 ** 400, SESSION_RESET.isoformat(), True),
+                       ("weekly_all", "All models", 54.0, WEEK_RESET.isoformat(), True)],
+                      clock.instant - timedelta(minutes=5))
+    stdin(PLAN_STDIN)
+    assert line(cli) == "5h 23% 1h30m · wk 54% · session $1.50\n"
+
+
 def test_stdin_window_whose_reset_passed_is_ignored(clock, cli, stdin, no_backend):
     stdin({"rate_limits": {"five_hour": {"used_percentage": 80, "resets_at": epoch(T0 - H)},
                            "seven_day": {"used_percentage": 10}}})
@@ -280,6 +328,8 @@ def test_points_from_another_cycle_are_dropped(clock, cli, stdin, no_backend):
     "{", "[]", '{"sessions": []}', '{"sessions": {"A": "x"}}',
     '{"windows": [], "sessions": {"A": {"cost_usd": 1, "pp": {"session": 1}}}}',
     '{"windows": {}, "sessions": {"A": {"cost_usd": "1", "pp": {"session": "1"}}}}',
+    pytest.param('{"windows": {}, "sessions": {"A": {"cost_usd": ' + HUGE + ', "pp": {}}}}', id="huge-cost"),
+    pytest.param("[" * 100_000 + "]" * 100_000, id="deep-nesting"),
 ])
 def test_malformed_session_cache_is_ignored(clock, cli, stdin, no_backend, content):
     cache(clock)

@@ -106,10 +106,10 @@ false, and the exit code 1, only when a check has `fail`. The keys are `token`, 
 writes the database.
 
 To gate a script or hook on the limit, use `cmon guard --window session --max 90`: exit 0 under
-the percent, 1 at or above it, 3 when there's no fresh data (no cache, window missing, or older
-than `--stale-min`, 60 min), 2 for bad arguments. It reads only the cache, never the API. `--json`
-prints `{window, percent, max, resets_at, age_s, result}`, with `result` one of `under`, `over`,
-`no_data`, `missing`, `stale`.
+the percent, 1 at or above it, 3 when there's no fresh data (no cache, window missing, older
+than `--stale-min`, 60 min, or unreadable), 2 for bad arguments. It reads only the cache, never the
+API. `--json` prints `{window, percent, max, resets_at, age_s, result}`, with `result` one of
+`under`, `over`, `no_data`, `missing`, `stale`.
 
 For where the percent went, use `cmon burn --by surface --plan --json` (also `--by project`,
 `model`, `day`, `device`): `groups[].plan_pp` is each group's points of the window's percent over
