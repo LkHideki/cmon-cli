@@ -15,7 +15,7 @@ wheels/
 *.egg-info
 
 # Environments and caches
-.venv
+.venv*
 .ruff_cache
 .mypy_cache
 .codegraph/
