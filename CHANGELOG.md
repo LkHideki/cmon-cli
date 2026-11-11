@@ -53,6 +53,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   tokens. It takes `--since`, `--surface`, `--device`, `--all-accounts` and `--json` like the other
   modes, and refuses `--by` and `--plan`. It's an estimate: the transcripts don't say which TTL
   applied, and cmon assumes 1h, as its prices do.
+- **Projection and exhaustion time in `status --json` and cmon Bar.** Each window may carry
+  `projected_percent` (percent at the reset at the current pace, the number `now --advice` and
+  `watch` print, capped at 999), `exhausts_at` (when that pace reaches 100%, ISO 8601 UTC, or
+  `null` if not before the reset) and `projection_at`. `status` stays a cache read: `collect`,
+  `watch` and `now` compute the projection and store it in `~/.cmon/projection.json`, so the
+  fields are absent until one of them has run in the current cycle, while there's no rate yet and
+  once a window is at 100%, and older readers see the payload they knew. cmon Bar gets the
+  placeholders `{5h_proj}`, `{wk_proj}` (`112%`) and `{5h_eta}` (`80m` until the 5h window hits
+  100%, blank while the projection stays under 100%), and each menu row adds a projection line,
+  orange past 100%, with its age once it's minutes old. Until now the projection appeared only in
+  `now --advice` and `watch`, so the bar showed where usage was but not where it was going.
 
 ### Changed
 

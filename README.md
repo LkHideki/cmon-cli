@@ -204,6 +204,24 @@ it never shows a dead cycle and never blocks a prompt. `--live` always queries t
 `--json` prints a versioned payload (`version`, `offline`, `observed_at`, `age_s`,
 `providers.claude.windows[]`) for scripts and the menu bar app.
 
+Each window can also say where its pace leads: `projected_percent` is the percent at the reset
+at the current rate (the projection `now --advice` and `watch` print, capped at 999),
+`exhausts_at` is when that pace reaches 100% (ISO 8601, UTC; `null` if not before the reset),
+and `projection_at` is when it was computed:
+
+```json
+{"key": "session", "label": "Current session", "percent": 50.0,
+ "resets_at": "2026-11-04T02:00:00+00:00", "active": true,
+ "projected_percent": 130.0, "exhausts_at": "2026-11-04T00:30:00+00:00",
+ "projection_at": "2026-11-03T22:00:00+00:00"}
+```
+
+`status` stays a cache read, so the projection comes from the last `cmon collect` (every 20 min
+after `cmon install`), `watch` or `now`, not from the reading it prints. It is left out until one
+of them has run in the current cycle, while there's no rate to project (fewer than two readings
+in the cycle, or no rise), and once a window is at 100%. Near the end of a window a projection
+that is 20 minutes old can be well off: check `projection_at` before acting on it.
+
 ### `cmon guard` — exit code for scripts and hooks
 
 `status` always exits 0 so it never breaks a statusline. `guard` is the opposite: it exits
@@ -282,7 +300,9 @@ title shows the quota as `90% 75'  44% 91` — 5h window, then weekly limit, eac
 used and time until it resets: plain hours from 2 h up, minutes with `'` below that and
 seconds with `"` in the last minute — and a click
 opens a per-window breakdown with progress bars, reset times and when the next update is
-due. Under **By client**, one bar per window shows who used this cycle's percent — VS Code,
+due. Once collection has projected the cycle, each window's row adds where the pace leads
+(`Projected 130% · 100% in 1h 20m`, in orange past 100%), with its age once it's a few minutes
+old. Under **By client**, one bar per window shows who used this cycle's percent — VS Code,
 Terminal, Desktop app, SDK — and how much of it nothing on this Mac logged (*claude.ai &
 elsewhere*). The split comes from the background `cmon collect` (see
 [`--plan`](#cmon-burn--tokens--cost-from-logs)), so it appears once collection is installed.
@@ -306,7 +326,11 @@ is reported in the menu and defaults are used):
   `{wk_reset_h}` (hours)
   `{wk_reset_hm}` `{age}` (minutes since the data was read); `{5h_bar}` `{wk_bar}` draw usage
   as a block and `{5h_dot}` `{wk_dot}` as a traffic light; `{top_client}` `{5h_top_client}` name
-  the client that used the most of the week or the 5h window (`VS Code 57%`). The title dims when the data is
+  the client that used the most of the week or the 5h window (`VS Code 57%`); `{5h_proj}`
+  `{wk_proj}` are the projected percent at the reset (`112%`) and `{5h_eta}` the time until the
+  5h window hits 100% at that pace, in the unit of `{reset_short}` (`80m`). These three are blank
+  until a projection exists (see [`status --json`](#cmon-status--statusline)), and `{5h_eta}` is
+  also blank while the projection stays under 100%. The title dims when the data is
   older than `stale_minutes`. With `"hide_empty": true`, a word holding a blank placeholder and
   any segment left empty disappear, which suits labelled layouts:
 

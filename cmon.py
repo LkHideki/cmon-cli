@@ -1314,6 +1314,7 @@ def now(args):
         con = _read_db()  # lazy: only import/open DuckDB once we know the projection is needed (F10)
     if con is None:
         return
+    _refresh_projection(con, rows, _ts, quiet=True)  # status --json and cmon Bar read it
     end = datetime.fromisoformat(reset)
     rate = _rate(con, "session")  # unified EWMA rate: same source as watch/advice/alerts
     if rate is None:
@@ -1427,6 +1428,7 @@ def collect(args):
         print(f"  {lbl:16} {pct:4.0f}%  reset {reset[:16] if reset else '-'}")
     _collect_sync(con)
     _refresh_client_share(con, rows, ts)
+    _refresh_projection(con, rows, ts)
     if getattr(args, "alert", False):
         _fire_rate_alerts(rows, con)  # rate-based: at current pace hits 100% before reset
         _fire_lead_alert(rows)  # time-based: 5h window resets in <= CMON_ALERT_LEAD min
@@ -3074,6 +3076,8 @@ def _status_json(got) -> dict:
         w = {"key": key, "label": label, "percent": percent, "resets_at": resets_at, "active": bool(active)}
         if resets_at and (split := _client_share_for(key, resets_at)):
             w["by_client"] = split  # optional, from the last 'collect'
+        if resets_at and (proj := _projection_for(key, resets_at)):
+            w.update(proj)  # optional: projected_percent, exhausts_at, projection_at
         windows.append(w)
     return {"version": 1, "offline": False, "observed_at": observed.isoformat(),
             "age_s": round(age), "providers": {"claude": {"windows": windows}}}
@@ -3123,6 +3127,68 @@ def _client_share_for(key, resets_at):
                 > CYCLE_JITTER_S:
             return None  # a new cycle began since: the old split would be wrong
         return {"computed_at": data["computed_at"], "clients": w["clients"], "other": w["other"]}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+
+
+PROJ_CAP = 999.0  # what every other surface prints at most; early in a window the pace can say 2000%
+
+
+def _projection_cache() -> str:
+    return os.path.join(CMON_HOME, "projection.json")
+
+
+def _projections(con, rows, now_utc, tz) -> dict:
+    """Projection at reset and the moment of reaching 100%, per window, from the same rate and
+    model as 'now --advice' and watch. Left out where there is nothing to project: no reset ahead,
+    no measurable rate yet, or a window already at 100%."""
+    out = {}
+    for key, _lbl, pct, reset, _a in rows:
+        if not reset or pct >= 100:
+            continue
+        rem_h = (datetime.fromisoformat(reset) - now_utc).total_seconds() / 3600
+        rate = _rate(con, key) if rem_h > 0 else None
+        if not rate:
+            continue
+        proj, eta, _src = _project(con, pct, rate, rem_h, now_utc, tz, key)
+        if not math.isfinite(proj):
+            continue  # NaN would make the whole status --json invalid for strict decoders
+        out[key] = {"resets_at": reset, "projected_percent": round(min(proj, PROJ_CAP), 1),
+                    "exhausts_at": None if eta is None else (now_utc + timedelta(hours=eta)).isoformat()}
+    return out
+
+
+def _refresh_projection(con, rows, now_utc, tz=None, quiet=False) -> None:
+    """Cache each window's projection for 'status --json' and cmon Bar, the way
+    _refresh_client_share caches the split: status must stay a file read, and the rate needs
+    the database. Best-effort; quiet for callers that own the screen (watch) or print their own
+    projection (now)."""
+    try:
+        windows = _projections(con, rows, now_utc, tz or _resolve_tz())
+        _atomic_write_json(_projection_cache(),
+                           {"version": 1, "computed_at": now_utc.isoformat(), "windows": windows})
+    except Exception as e:
+        if not quiet:
+            print(f"cmon: projection skipped: {e}", file=sys.stderr)
+
+
+def _projection_for(key, resets_at):
+    """Cached projection of `key` as status --json fields, if it was computed for the same
+    cycle. Types are checked here: one bad value would fail the menu bar's whole decode."""
+    try:
+        with open(_projection_cache(), encoding="utf-8") as f:
+            data = json.load(f)
+        w = data["windows"][key]
+        if abs((datetime.fromisoformat(w["resets_at"]) - datetime.fromisoformat(resets_at)).total_seconds()) \
+                > CYCLE_JITTER_S:
+            return None  # a new cycle began since: the old pace says nothing about it
+        proj, eta, at = w["projected_percent"], w["exhausts_at"], data["computed_at"]
+        if isinstance(proj, bool) or not isinstance(proj, int | float) or not math.isfinite(proj):
+            return None
+        datetime.fromisoformat(at)
+        if eta is not None:
+            datetime.fromisoformat(eta)
+        return {"projected_percent": float(proj), "exhausts_at": eta, "projection_at": at}
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         return None
 
@@ -4441,6 +4507,7 @@ def watch(args):
         scan_logs(con, since=win, quiet=True)
         _log_forecasts(con, rows, tz, now_utc)  # deduped internally to FORECAST_EVERY_S
         _reconcile_forecasts(con)
+        _refresh_projection(con, rows, now_utc, tz, quiet=True)  # quiet: stderr would tear the TUI
         bs = _burn_summary(_burn_rows(con, win))
         if bs:
             tok, cost, mix = bs
