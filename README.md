@@ -147,6 +147,13 @@ that doesn't open the window is retried after 30 minutes; attempts are logged to
 Windows then run back to back whether you work or not, so you may sit down with only part of one
 left. The reset comes sooner than if your first request had started it.
 
+**`alert_at`** lists, per window, the percents at which `collect --alert` notifies you; see
+[Alerts](#alerts):
+
+```bash
+cmon config set alert_at "session=80,95 weekly_all=50,75,90"   # 5h and weekly work as aliases
+```
+
 **`sync_dir`** and **`device_name`** share usage between your machines; see
 [`cmon sync`](#cmon-sync--usage-by-device).
 
@@ -444,16 +451,29 @@ run — so you can leave it open without tripping the block.
 
 ### Alerts
 
-`collect --alert` fires two kinds of alert to stderr (cron emails them) plus a best-effort
+`collect --alert` fires three kinds of alert to stderr (cron emails them) plus a best-effort
 native notification (macOS/Linux):
 
 - **rate-based** — at the current pace a window will hit **100% before reset** (also shown by
   `cmon now`);
 - **time-based** — a window is within its lead of resetting: the **5h window in ≤ `CMON_ALERT_LEAD`
   minutes** (default 60) and the **weekly window in ≤ `CMON_ALERT_LEAD_WEEKLY` minutes** (default
-  180). Each fires once per cycle (deduped on its own reset), as a desktop notification.
+  180). Each fires once per cycle (deduped on its own reset), as a desktop notification;
+- **threshold** — a window reached a percent you set in `alert_at`, off unless you set it:
 
-Set **`CMON_HOOK`** to run your own command on every alert, of both kinds: cmon executes it via
+  ```bash
+  cmon config set alert_at "5h=80,95 weekly=50,75,90"   # window=percent[,percent...], space-separated
+  ```
+
+  Windows are `session` (alias `5h`), `weekly_all` (aliases `weekly`, `week`) or any other key
+  the API reports, such as `weekly_scoped:Fable`, which `fable` also matches. Percents are whole
+  numbers from 1 to 100, and the value is checked on `set`. Each percent fires once per window
+  cycle. The check runs at each `collect --alert`, every 20 minutes with `cmon install`, so when
+  usage climbs fast one collect can find 80% and 95% both passed: only the highest notifies, and
+  the lower ones count as fired. For the same reason the 95% alert can arrive with the window
+  already at 100%.
+
+Set **`CMON_HOOK`** to run your own command on every alert, of all three kinds: cmon executes it via
 the shell when the alert fires, so once per window cycle and never on the deduplicated repeats
 (best-effort, with a 30s timeout: a broken hook never breaks collection). The alert reaches the
 command in environment variables, which are always set and empty when unknown:
@@ -461,7 +481,7 @@ command in environment variables, which are always set and empty when unknown:
 | Variable | Value |
 |---|---|
 | `CMON_ALERT_MSG` | The alert text, as shown on stderr |
-| `CMON_ALERT_KIND` | `rate` (pace hits 100% before reset) or `lead` (reset is near) |
+| `CMON_ALERT_KIND` | `rate` (pace hits 100% before reset), `lead` (reset is near) or `threshold` (an `alert_at` percent was reached) |
 | `CMON_ALERT_KEY` | The window: `session` (5h) or `weekly_all` |
 | `CMON_ALERT_PERCENT` | Percent of the window used, e.g. `87` or `87.5` |
 | `CMON_ALERT_RESETS_AT` | When the window resets, ISO 8601 in UTC, e.g. `2026-11-04T02:00:00+00:00` |

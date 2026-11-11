@@ -19,6 +19,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `CMON_ALERT_KIND` (`rate` or `lead`), `CMON_ALERT_KEY` (the window), `CMON_ALERT_PERCENT` and
   `CMON_ALERT_RESETS_AT` (ISO 8601, UTC), so a hook can feed ntfy or a JSON webhook without
   parsing the message. The README's Alerts section has both recipes.
+- **Percent-threshold alerts: `cmon config set alert_at "session=80,95 weekly_all=50,75,90"`.**
+  `collect --alert` notifies when a window reaches one of its percents, once per percent per
+  window cycle, through stderr, the desktop notification and `CMON_HOOK` with
+  `CMON_ALERT_KIND=threshold`. `5h` and `weekly` work as aliases, and the value is validated on
+  `set`. If one collect finds several percents passed at once, only the highest notifies. Until
+  now only `cmon wait --at` could say "the 5h window passed 80%", and it held a terminal for a
+  single wait. Without the key nothing changes.
 
 ### Changed
 

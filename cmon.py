@@ -546,7 +546,7 @@ def token_clear(_):
 # --- Config: persisted user preferences (~/.cmon/config.json) ---
 CONFIG = os.path.expanduser("~/.cmon/config.json")
 # allowlist; extend here as new preferences are added
-CONFIG_KEYS = {"timezone", "quiet_hours", "keepalive", "sync_dir", "device_name"}
+CONFIG_KEYS = {"timezone", "quiet_hours", "keepalive", "sync_dir", "device_name", "alert_at"}
 
 
 def _validate_timezone(value: str) -> str:
@@ -628,9 +628,53 @@ def _validate_device_name(value: str) -> str:
     return name
 
 
+def _parse_alert_at(value) -> dict[str, tuple[int, ...]]:
+    """'session=80,95 weekly_all=50,75,90' -> {'session': (80, 95), 'weekly_all': (50, 75, 90)},
+    or ValueError saying what's wrong. Window names go through PLAN_ALIASES (5h, weekly); any other
+    name is kept as typed, since the API may add windows (weekly_scoped:Fable, or just fable)."""
+    usage = ("Use window=percent[,percent...] pairs separated by spaces, e.g. "
+             "'session=80,95 weekly_all=50,75,90' (5h and weekly work as aliases).")
+    if not isinstance(value, str) or not value.split():
+        raise ValueError(f"Invalid alert_at {value!r}. {usage}")
+    out: dict[str, tuple[int, ...]] = {}
+    for part in value.split():
+        name, sep, nums = part.partition("=")
+        if not sep or not name or not all(c.isalnum() or c in "_.:-" for c in name):
+            raise ValueError(f"Invalid alert_at {value!r}: {part!r} is not window=percent. {usage}")
+        try:
+            pcts = {int(n) for n in nums.split(",")}
+        except ValueError:
+            raise ValueError(f"Invalid alert_at {value!r}: {part!r} needs whole percents. {usage}") from None
+        if not all(1 <= p <= 100 for p in pcts):
+            raise ValueError(f"Invalid alert_at {value!r}: {part!r} has a percent outside 1-100. {usage}")
+        window = PLAN_ALIASES.get(name.lower(), name)
+        if window.lower() in {w.lower() for w in out}:
+            raise ValueError(f"Invalid alert_at {value!r}: window {window!r} appears twice. {usage}")
+        out[window] = tuple(sorted(pcts))
+    return out
+
+
+def _validate_alert_at(value: str) -> str:
+    """Normalize an alert_at spec (aliases resolved, percents sorted and deduped) or raise."""
+    return " ".join(f"{w}={','.join(map(str, ps))}" for w, ps in _parse_alert_at(value).items())
+
+
+def _alert_at() -> dict[str, tuple[int, ...]]:
+    """Configured percent thresholds per window, or {} when unset. A hand-edited invalid value is
+    ignored with a warning, so collection still runs and the other alerts still fire."""
+    raw = _read_config().get("alert_at")
+    if raw is None:
+        return {}
+    try:
+        return _parse_alert_at(raw)
+    except ValueError as e:
+        print(f"cmon: ignoring alert_at from config: {e}", file=sys.stderr)
+        return {}
+
+
 CONFIG_VALIDATORS = {"timezone": _validate_timezone, "quiet_hours": _validate_quiet_hours,
                      "keepalive": _validate_keepalive, "sync_dir": _validate_sync_dir,
-                     "device_name": _validate_device_name}
+                     "device_name": _validate_device_name, "alert_at": _validate_alert_at}
 
 
 def _read_config() -> dict:
@@ -1379,6 +1423,7 @@ def collect(args):
     if getattr(args, "alert", False):
         _fire_rate_alerts(rows, con)  # rate-based: at current pace hits 100% before reset
         _fire_lead_alert(rows)  # time-based: 5h window resets in <= CMON_ALERT_LEAD min
+        _fire_threshold_alerts(rows)  # percent-based: a window reached one of config alert_at
 
 
 def _collect_sync(con) -> None:
@@ -2374,7 +2419,7 @@ def _hook_env(msg: str, kind: str, key: str, percent=None, resets_at=None) -> di
 def _run_hook(msg: str, *, kind: str, key: str, percent=None, resets_at=None) -> None:
     """Run the user's CMON_HOOK command for an alert that fired (best-effort; callers dedup
     first, so a hook never sees a repeat). The alert travels in the environment (_hook_env):
-    kind is the alert's family (lead, rate) and a new family only passes its own name. Shell
+    kind is the alert's family (lead, rate, threshold) and a new family only passes its own name. Shell
     command, so it can be anything. Never raises — a broken hook must not break collection."""
     hook = os.environ.get("CMON_HOOK")
     if not hook:
@@ -2459,6 +2504,32 @@ def _fire_rate_alerts(rows, con) -> None:
         _notify("cmon — Claude limit", msg)
         _run_hook(msg, kind="rate", key=key, percent=pct.get(key), resets_at=reset)
         _mark_alert(f"rate_{key}", marker)
+
+
+def _fire_threshold_alerts(rows) -> None:
+    """Fire the config's alert_at percent thresholds: stderr + desktop notification + CMON_HOOK.
+    Each threshold fires once per window cycle, deduped like the lead alert on the reset rounded
+    to the minute. Collects are 20 min apart, so one can find 80 and 95 both newly crossed: only
+    the highest notifies, and the lower ones are marked with it so they don't fire next time."""
+    spec = _alert_at()
+    if not spec:
+        return
+    for key, lbl, pct, reset, _a in rows:
+        if not reset:
+            continue  # no cycle to dedup on; an idle window without a reset sits at 0% anyway
+        k = key.lower()
+        pcts = sorted({p for w, ps in spec.items() if w.lower() in (k, k.rsplit(":", 1)[-1]) for p in ps})
+        marker = round(datetime.fromisoformat(reset).timestamp() / 60)
+        new = [p for p in pcts if pct >= p and not _alert_fired(f"threshold_{key}_{p}", marker)]
+        if not new:
+            continue
+        name = LEAD_LABEL_BY_KEY.get(key, lbl)
+        msg = f"{name} reached {new[-1]}% (now {round(pct, 1):g}%), resets in ~{fmt_eta(reset)}."
+        print(f"⚠ {msg}", file=sys.stderr)
+        _notify(f"cmon — {name}", msg)
+        _run_hook(msg, kind="threshold", key=key, percent=pct, resets_at=reset)
+        for p in new:
+            _mark_alert(f"threshold_{key}_{p}", marker)
 
 
 def _ai_tip(summary: str) -> str | None:
@@ -4130,8 +4201,9 @@ def main():
     pc.add_argument("--force", action="store_true", help="save even with recent snapshot (bypass dedup)")
     pc.add_argument("--alert", action="store_true",
                     help="alerts (stderr + desktop notification + CMON_HOOK): rate hits 100%% "
-                         "before reset, or a window is within its lead of resetting "
-                         "(CMON_ALERT_LEAD / CMON_ALERT_LEAD_WEEKLY min)")
+                         "before reset, a window is within its lead of resetting "
+                         "(CMON_ALERT_LEAD / CMON_ALERT_LEAD_WEEKLY min), or it reached a percent "
+                         "set in config alert_at")
     pw = sub.add_parser("watch", help="live TUI with current usage, recording each read (Ctrl-C quits)")
     pw.add_argument("-n", "--interval", type=int, default=75, help="seconds between updates (default 75)")
     pw.add_argument("-u", "--usage", action="store_true", help="show the Usage bar column")
@@ -4172,8 +4244,9 @@ def main():
                           description="Currently supports: timezone (used to display timestamps "
                                       "locally instead of UTC), quiet_hours (hours projections skip), "
                                       "keepalive (on: open a new 5h window when the last one ends), "
-                                      "sync_dir (folder shared with your other devices) and device_name "
-                                      "(this machine's label there).")
+                                      "sync_dir (folder shared with your other devices), device_name "
+                                      "(this machine's label there) and alert_at (percents that "
+                                      "'collect --alert' notifies at, e.g. 'session=80,95 weekly=90').")
     cfa = pcfg.add_subparsers(dest="action", required=True)
     cfset = cfa.add_parser("set", help="set a preference")
     cfset.add_argument("key", choices=sorted(CONFIG_KEYS))
