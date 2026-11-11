@@ -45,6 +45,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   many 5h cycles reached 100%, with the current cycle marked *in progress*. `--json` prints a
   list. Blocked time is measured between snapshots, so a block shorter than the collection
   interval doesn't show. `trends` without the flag is unchanged.
+- **`cmon burn --cache`: where the cache cost could have been avoided.** Instead of totals it
+  reports the cache hit rate (cache read over cache read + cache write + input); the cache write
+  of each turn that came after more than 1h idle in its session, the cost of going back to an old
+  session, by project and for the sessions that paid the most; and the `/compact` candidates,
+  sessions of at least 10 turns whose average context per turn is in the top 10% and at least 50k
+  tokens. It takes `--since`, `--surface`, `--device`, `--all-accounts` and `--json` like the other
+  modes, and refuses `--by` and `--plan`. It's an estimate: the transcripts don't say which TTL
+  applied, and cmon assumes 1h, as its prices do.
 
 ### Changed
 

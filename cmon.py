@@ -4040,9 +4040,181 @@ def _plan_window(con, name: str):
     sys.exit(f"No snapshots for window {name!r}. Known: {', '.join(k for k, _l, _s in known)}.")
 
 
+CACHE_TTL_S = 3600  # assumed prompt-cache TTL: Claude Code's 1h, the one PRICES charges (2x input)
+COMPACT_MIN_TURNS = 10  # shorter sessions aren't /compact candidates: little left to save
+COMPACT_MIN_CONTEXT = 50_000  # floor under the top tier, so a base of small sessions flags none
+COMPACT_TIER = 0.9  # /compact candidates: average context at or above this quantile
+CACHE_TOP = 10  # sessions listed per table, and projects in the text form
+
+
+def _cache_report(con, since, src: str, filt: str, fparams: list):
+    """Cache efficiency of `src` rows since `since`: hit rate, cache writes paid again after idle,
+    and sessions living with a large context. A turn whose session was idle longer than
+    CACHE_TTL_S before it found its cache expired, so its cache write counts as a rewrite. The
+    gap is measured over the session's whole history, before `since` and the filters apply, so
+    the first turn of the period still sees the turn before it. Zero-token rows ('<synthetic>',
+    written locally, no API call) are neither turns nor activity. Returns (report, tokens,
+    {unpriced model: tokens}), or None without rows."""
+    rows = con.execute(
+        "WITH t AS (SELECT *, epoch(observed_at) - epoch(lag(observed_at) OVER "
+        "  (PARTITION BY session_id ORDER BY observed_at)) > ? AS idle "
+        f"  FROM {src} WHERE provider='claude' "
+        "  AND input_tokens + output_tokens + cache_read_tokens + cache_write_tokens > 0) "
+        "SELECT session_id, project, model, count(*), sum(input_tokens), sum(output_tokens), "
+        "  sum(cache_read_tokens), sum(cache_write_tokens), count(*) FILTER (WHERE idle), "
+        "  coalesce(sum(cache_write_tokens) FILTER (WHERE idle), 0) "
+        f"FROM t WHERE true{' AND observed_at >= ?' if since else ''}{filt} GROUP BY ALL",
+        [CACHE_TTL_S, *([since] if since else []), *fparams]).fetchall()
+    if not rows:
+        return None
+
+    def acc():
+        return {"turns": 0, "input": 0, "cache_read": 0, "cache_write": 0, "tok": 0, "cost": 0.0,
+                "cache_read_cost": 0.0, "cache_write_cost": 0.0, "idle_rewrites": 0, "idle_tok": 0,
+                "idle_cost": 0.0}
+    total, projects, sessions, unpriced = acc(), {}, {}, {}
+    for sid, project, model, n, i, o, r, w, idle_n, idle_w in rows:
+        p = _price_match(model)
+        if p is None:
+            p = (0.0, 0.0, 0.0, 0.0)
+            unpriced[model or "?"] = unpriced.get(model or "?", 0) + i + o + r + w
+        s = sessions.setdefault(sid, {**acc(), "projects": {}})
+        s["projects"][project] = s["projects"].get(project, 0) + n
+        pj = projects.setdefault(project, {**acc(), "sessions": set()})
+        pj["sessions"].add(sid)
+        for a in (total, pj, s):
+            a["turns"] += n
+            a["input"] += i
+            a["cache_read"] += r
+            a["cache_write"] += w
+            a["tok"] += i + o + r + w
+            a["cost"] += (i * p[0] + o * p[1] + r * p[2] + w * p[3]) / 1e6
+            a["cache_read_cost"] += r * p[2] / 1e6
+            a["cache_write_cost"] += w * p[3] / 1e6
+            a["idle_rewrites"] += idle_n
+            a["idle_tok"] += idle_w
+            a["idle_cost"] += idle_w * p[3] / 1e6
+
+    def hit(a):
+        seen = a["cache_read"] + a["cache_write"] + a["input"]
+        return a["cache_read"] / seen if seen else None
+
+    def main_project(s):  # a session's cwd can change; it belongs where most of its turns ran
+        return max(s["projects"].items(), key=lambda kv: (kv[1], kv[0]))[0]
+
+    proj_out = [{"project": k, "turns": v["turns"], "sessions": len(v["sessions"]), "hit_rate": hit(v),
+                 "cache_write_cost_usd": v["cache_write_cost"], "idle_rewrites": v["idle_rewrites"],
+                 "idle_rewrite_cost_usd": v["idle_cost"], "cost_usd": v["cost"]}
+                for k, v in sorted(projects.items(), key=lambda kv: (-kv[1]["idle_cost"], -kv[1]["cost"], kv[0]))]
+    idle_out = [{"session": k, "project": main_project(v), "turns": v["turns"], "idle_rewrites": v["idle_rewrites"],
+                 "idle_rewrite_cost_usd": v["idle_cost"], "cost_usd": v["cost"]}
+                for k, v in sorted(sessions.items(), key=lambda kv: (-kv[1]["idle_cost"], kv[0]))
+                if v["idle_rewrites"]][:CACHE_TOP]
+    ctx = {k: (v["input"] + v["cache_read"] + v["cache_write"]) / v["turns"]
+           for k, v in sessions.items() if v["turns"] >= COMPACT_MIN_TURNS}
+    threshold = None
+    if ctx:  # nearest-rank quantile: with few sessions the tier is the largest one(s)
+        ranked = sorted(ctx.values())
+        threshold = max(ranked[math.ceil(COMPACT_TIER * len(ranked)) - 1], COMPACT_MIN_CONTEXT)
+    compact = [{"session": k, "project": main_project(sessions[k]), "turns": sessions[k]["turns"],
+                "avg_context_tok": c, "cost_usd": sessions[k]["cost"]}
+               for k, c in ctx.items() if c >= threshold]
+    compact.sort(key=lambda d: (-d["cost_usd"], d["session"]))
+    return {"since": since.isoformat() if since else None, "estimate": True, "ttl_s": CACHE_TTL_S,
+            "turns": total["turns"], "sessions": len(sessions), "hit_rate": hit(total),
+            "tokens": {"input": total["input"], "cache_read": total["cache_read"],
+                       "cache_write": total["cache_write"]},
+            "cost_usd": {"total": total["cost"], "cache_read": total["cache_read_cost"],
+                         "cache_write": total["cache_write_cost"]},
+            "idle_rewrites": {"turns": total["idle_rewrites"], "tok": total["idle_tok"],
+                              "cost_usd": total["idle_cost"]},
+            "projects": proj_out, "idle_sessions": idle_out,
+            "compact": {"min_turns": COMPACT_MIN_TURNS, "min_context_tok": COMPACT_MIN_CONTEXT,
+                        "tier": COMPACT_TIER, "threshold_tok": threshold, "sessions": compact[:CACHE_TOP]},
+            "unpriced_models": sorted(unpriced)}, total["tok"], unpriced
+
+
+def _burn_cache(con, args, since) -> None:
+    """'burn --cache': where the cache part of the cost could have been avoided (estimate)."""
+    filt, fparams, fdesc = _burn_filters(args)
+    src = "token_log" if getattr(args, "all_accounts", False) else "token_terminal"
+    got = _cache_report(con, since, src, filt, fparams)
+    if got is None:
+        sys.exit("No Claude Code log data in period.")
+    rep, tok, unpriced = got
+    if getattr(args, "json", False):
+        print(json.dumps(rep, ensure_ascii=False))
+        return
+    if unpriced:
+        names = ", ".join(f"{m} ({t / 1e6:.1f}M tok)" for m, t in sorted(unpriced.items()))
+        print(f"cmon: no price for {names}: counted as US$ 0. Add it to {_prices_file()} (see README).",
+              file=sys.stderr)
+    excluded = 0 if src == "token_log" else con.execute(
+        "SELECT coalesce(sum(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens), 0) "
+        f"FROM token_log WHERE provider='claude'{' AND observed_at >= ?' if since else ''}{filt}",
+        ([since] if since else []) + fparams).fetchone()[0] - tok
+
+    def pct(v):
+        return f"{v * 100:5.1f}%" if v is not None else "    -"
+
+    def short(s, n=24):
+        return s if len(s) <= n else s[:n - 1] + "…"
+    hours = CACHE_TTL_S / 3600
+    since_local = since.astimezone(_resolve_tz()) if since else None
+    window = f" since {since_local:%Y-%m-%d %H:%M %Z}" if since_local else ""
+    only = "".join(f" · {d}" for d in fdesc)
+    c, t, idle = rep["cost_usd"], rep["tokens"], rep["idle_rewrites"]
+    print(f"Cache efficiency{window}{only} (API equivalent, estimate):")
+    print(f"  hit rate      {pct(rep['hit_rate']):>10}   of the input context came from cache "
+          f"({rep['turns']} turn{'s' * (rep['turns'] != 1)}, {rep['sessions']} "
+          f"session{'s' * (rep['sessions'] != 1)})")
+    print(f"  cache read    {t['cache_read'] / 1e6:9.1f}M tok   US$ {c['cache_read']:9.2f}")
+    print(f"  cache write   {t['cache_write'] / 1e6:9.1f}M tok   US$ {c['cache_write']:9.2f}")
+    share = f"   {idle['cost_usd'] / c['cache_write'] * 100:3.0f}% of cache write" if c["cache_write"] else ""
+    print(f"  idle rewrites {idle['turns']:9d} turns  US$ {idle['cost_usd']:9.2f}{share}")
+
+    print(f"\nBy project (rewrite = cache write of the first turn after > {hours:g}h idle in a session):")
+    w = max(len("project"), *(len(short(p["project"])) for p in rep["projects"][:CACHE_TOP]))
+    print(f"  {'project':<{w}}  {'turns':>7}  hit rate  rewrites  US$ rewrites  US$ cache write")
+    for p in rep["projects"][:CACHE_TOP]:
+        print(f"  {short(p['project']):<{w}}  {p['turns']:7d}    {pct(p['hit_rate'])}  {p['idle_rewrites']:8d}  "
+              f"{p['idle_rewrite_cost_usd']:12.2f}  {p['cache_write_cost_usd']:15.2f}")
+    if len(rep["projects"]) > CACHE_TOP:
+        print(f"  … {len(rep['projects']) - CACHE_TOP} more (--json lists all)")
+
+    print("\nSessions that paid the most to rewrite their cache after idle:")
+    if not rep["idle_sessions"]:
+        print(f"  none: no session went on after more than {hours:g}h idle.")
+    for s in rep["idle_sessions"]:
+        print(f"  {s['session']}  {short(s['project'], 20):<20} {s['idle_rewrites']:4d} "
+              f"{'rewrite' if s['idle_rewrites'] == 1 else 'rewrites':<8}   "
+              f"US$ {s['idle_rewrite_cost_usd']:8.2f} of {s['cost_usd']:.2f}")
+
+    cp = rep["compact"]
+    print(f"\n/compact candidates (≥ {cp['min_turns']} turns, average context per turn in the top "
+          f"{(1 - cp['tier']) * 100:.0f}% and ≥ {cp['min_context_tok'] / 1e3:.0f}k tok):")
+    if not cp["sessions"]:
+        print("  none in the period.")
+    for s in cp["sessions"]:
+        print(f"  {s['session']}  {short(s['project'], 20):<20} {s['turns']:5d} turns   "
+              f"avg {s['avg_context_tok'] / 1e3:6.0f}k tok   US$ {s['cost_usd']:9.2f}")
+
+    print(f"\nEstimate. Transcripts don't say which cache TTL applied: cmon assumes {hours:g}h, as its prices do,\n"
+          f"so the cache write of a turn after more than {hours:g}h idle counts as a rewrite (it also holds\n"
+          "that turn's new content). Going back to an old session pays that rewrite; a new session or\n"
+          "/compact writes less. API EQUIVALENT cost: you pay the subscription, not this.")
+    if excluded:
+        print(f"Excluded {excluded / 1e6:.1f}M tok from Claude Desktop sessions of another or unknown "
+              f"account (--all-accounts to include).")
+
+
 def burn(args):
     """Report tokens & estimated US$ from local Claude Code logs; with --plan, also each
     group's share of the official percent."""
+    cache = getattr(args, "cache", False)
+    if cache and (getattr(args, "plan", None) or getattr(args, "by", None)):
+        sys.exit("--cache is a report of its own: it doesn't take --by or --plan.")
+    by = getattr(args, "by", None) or "model"
     con = db()
     raw_since = getattr(args, "since", None)
     plan = _plan_window(con, args.plan) if getattr(args, "plan", None) else None
@@ -4051,8 +4223,10 @@ def burn(args):
     else:
         since = _parse_since(raw_since)
     scan_logs(con, since)
+    if cache:
+        return _burn_cache(con, args, since)
     col = {"model": "model", "surface": "surface", "day": "CAST(observed_at AS DATE)",
-           "project": "project", "session": "session_id", "device": _device_col()}[args.by]
+           "project": "project", "session": "session_id", "device": _device_col()}[by]
     filt, fparams, fdesc = _burn_filters(args)
     where = "WHERE provider='claude'" + (" AND observed_at >= ?" if since else "") + filt
     wparams = ([since] if since else []) + fparams
@@ -4122,12 +4296,12 @@ def burn(args):
               f"gives the percent {'it' if one else 'they'} used to other groups (or to 'other'). "
               f"Add {'it' if one else 'them'} to {_prices_file()} (see README).", file=sys.stderr)
     per = {"model": "model", "surface": "surface", "day": "day",
-           "project": "project", "session": "session", "device": "device"}[args.by]
+           "project": "project", "session": "session", "device": "device"}[by]
     since_local = since.astimezone(_resolve_tz()) if since else None
     window = f" since {since_local:%Y-%m-%d %H:%M %Z}" if since_local else ""
     only = "".join(f" · {d}" for d in fdesc)
     print(f"Consumption by {per}{window}{only} (API equivalent):")
-    lines = [(_surface(g) if args.by == "surface" else str(g), v[0] / 1e6, v[1], pp.get(g, 0.0))
+    lines = [(_surface(g) if by == "surface" else str(g), v[0] / 1e6, v[1], pp.get(g, 0.0))
              for g, v in ordered]
     other_lbl, rest_lbl = "other (no local log)", "rest (filtered out)"
     w = max([len(lbl) for lbl, *_ in lines] + [len(other_lbl) if share else len("TOTAL")])
@@ -4489,7 +4663,7 @@ def main():
                           "the 5h window sat at 100 percent and 5h cycles that reached it, instead of the "
                           "summary (--json prints a list; --since doesn't apply)")
     pb = sub.add_parser("burn", help="tokens & estimated US$ from local Claude Code logs")
-    pb.add_argument("--by", choices=["model", "surface", "day", "project", "session", "device"], default="model",
+    pb.add_argument("--by", choices=["model", "surface", "day", "project", "session", "device"],
                     help="group by model (default), surface (terminal/vscode/app/sdk), day, project, session or "
                          "device (see 'cmon sync')")
     pb.add_argument("--since",
@@ -4504,6 +4678,10 @@ def main():
     pb.add_argument("--json", action="store_true", help="JSON output")
     pb.add_argument("--all-accounts", action="store_true",
                     help="include Claude Desktop sessions not tied to the terminal's account")
+    pb.add_argument("--cache", action="store_true",
+                    help="cache efficiency instead of totals: hit rate, cache rewritten after more than 1h "
+                         "idle by project and session, and /compact candidates (estimate; not with --by "
+                         "or --plan)")
     psy = sub.add_parser("sync", help="exchange usage rows with your other devices through a synced folder "
                                       "('cmon config set sync_dir …'); 'collect' does it by itself once set")
     psy.add_argument("--dir", help="sync folder for this run (default: config sync_dir)")

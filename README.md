@@ -402,6 +402,7 @@ uv run cmon burn --since 7d         # smaller window (24h, 7d, ISO date…)
 uv run cmon burn --since all        # full history (but Claude Code only keeps ~30d)
 uv run cmon burn --json
 uv run cmon burn --all-accounts     # include Desktop sessions of other accounts (see below)
+uv run cmon burn --cache --since 7d # where the cache cost was avoidable (see below)
 ```
 
 **Which account counts.** Only the account the terminal's Claude Code is signed into
@@ -460,6 +461,50 @@ typically account for ~80% of the cost** — the model re-reading cached context
 each message, not new work. And the value is the **API-equivalent cost**
 (pay-per-token): **you pay the subscription, not this** — the number shows the *value*
 you extract from your plan (easily tens of times the monthly subscription).
+
+**Cache efficiency: `--cache`.** The component breakdown says how much the cache cost; `--cache`
+says where part of it was avoidable. It replaces the totals with three things:
+
+- the **hit rate**, cache read ÷ (cache read + cache write + input): how much of the context each
+  turn sent came from cache;
+- the **idle rewrites**: the cache write of each turn that came more than 1h after the previous
+  turn of its session, when the cache had expired. That's the price of going back to an old
+  session instead of opening a new one, shown by project and for the sessions that paid the most;
+- the **`/compact` candidates**: sessions of at least 10 turns whose average context per turn
+  (input + cache read + cache write) is in the top 10% of the period, and at least 50k tokens.
+  Every turn of those re-reads that whole context, so a `/compact` pays back quickly.
+
+```text
+$ cmon burn --cache --since 7d
+Cache efficiency since 2026-11-04 10:59 -03 (API equivalent, estimate):
+  hit rate           93.1%   of the input context came from cache (120 turns, 4 sessions)
+  cache read         14.4M tok   US$      7.20
+  cache write         0.9M tok   US$      8.88
+  idle rewrites         4 turns  US$      5.40    61% of cache write
+
+By project (rewrite = cache write of the first turn after > 1h idle in a session):
+  project    turns  hit rate  rewrites  US$ rewrites  US$ cache write
+  site          60     93.7%         2          3.00             4.74
+  cmon          60     92.3%         2          2.40             4.14
+
+Sessions that paid the most to rewrite their cache after idle:
+  00000003-1111-4222-8333-444455556663  site                    1 rewrite    US$     1.80 of 7.09
+  00000002-1111-4222-8333-444455556662  cmon                    1 rewrite    US$     1.50 of 6.20
+  00000001-1111-4222-8333-444455556661  site                    1 rewrite    US$     1.20 of 5.29
+  00000000-1111-4222-8333-444455556660  cmon                    1 rewrite    US$     0.90 of 4.39
+
+/compact candidates (≥ 10 turns, average context per turn in the top 10% and ≥ 50k tok):
+  00000003-1111-4222-8333-444455556663  site                    30 turns   avg    190k tok   US$      7.09
+```
+
+It takes `--since` (default 30 days), `--surface`, `--device`, `--all-accounts` and `--json`, and
+refuses `--by` and `--plan`. `--json` prints an object with `hit_rate`, `tokens`, `cost_usd`,
+`idle_rewrites`, `projects` (all of them), `idle_sessions` and `compact` (the 10 costliest of each),
+and `unpriced_models`. All of it is an estimate. The transcripts don't say which cache TTL applied,
+so cmon assumes 1h, as its prices do; a turn's cache write also holds its new content, not only the
+rewrite; and subagent turns count in their parent session, which lowers its average context. The
+gap is measured over the session's whole history, so the first turn of the period still counts
+when the turn before it is older than `--since`.
 
 Crossing both sources: the **API** tells you *where the wall is* (official % + reset), the
 **logs** tell you *how you spent it* (which model/project drained it). Caveats: cost is
