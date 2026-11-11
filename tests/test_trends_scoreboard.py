@@ -123,6 +123,16 @@ def test_scoreboard_splits_at_a_reset_with_no_drop(cli, clock) -> None:
     ]
 
 
+def test_scoreboard_splits_5h_cycles_at_a_reset_with_no_drop(cli, clock) -> None:
+    # Asleep across the 5h reset at 1h while another device filled the next window: both readings
+    # are 100% and only resets_at shows two cycles. The 0h-2h gap wasn't all spent blocked.
+    _seed([(0, "weekly_all", 10, 100), (2, "weekly_all", 30, 100),
+           (0, "session", 100, 1), (2, "session", 100, 6), (2.5, "session", 100, 6)])
+    clock.set(T0 + timedelta(hours=3))
+    (row,) = json.loads(cli("trends", "--scoreboard", "--json").stdout)
+    assert (row["blocked_h"], row["blocked_5h_cycles"]) == (0.5, 2)
+
+
 def test_scoreboard_without_weekly_history(cli, clock) -> None:
     _seed([(0, "session", 40, 5)])
     text = cli("trends", "--scoreboard")

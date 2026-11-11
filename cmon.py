@@ -3099,8 +3099,10 @@ def _status_json(got) -> dict:
         w = {"key": key, "label": label, "percent": percent, "resets_at": resets_at, "active": bool(active)}
         if resets_at and (split := _client_share_for(key, resets_at)):
             w["by_client"] = split  # optional, from the last 'collect'
-        exhausted = _is_number(percent) and percent >= 100  # a cached projection predates reaching it
-        if resets_at and not exhausted and (proj := _projection_for(key, resets_at)):
+        proj = _projection_for(key, resets_at) if resets_at else None
+        # The reading shown contradicts a cached projection that predates it reaching 100%, or that
+        # it already passed: usage can't fall inside a cycle, so that pace is out of date.
+        if proj and not (_is_number(percent) and (percent >= 100 or proj["projected_percent"] < percent)):
             w.update(proj)  # optional: projected_percent, exhausts_at, projection_at
         windows.append(w)
     return {"version": 1, "offline": False, "observed_at": observed.isoformat(),
@@ -3628,15 +3630,15 @@ def _scoreboard(con, now: datetime) -> list[dict]:
     it only sees what the collection interval sees: the stretch before the first 100% reading
     and after the last one is not counted, and a 5h cycle with one 100% reading counts as a hit
     with no hours. A gap longer than the 5h window hides a reset and is left out. The last
-    cycle is in progress unless its latest reading says it already reset. Weekly cycles also
-    split where resets_at moves: a light week can start at or above the last week's final
-    reading, with no drop to cut at."""
+    cycle is in progress unless its latest reading says it already reset. Cycles of both windows
+    also split where resets_at moves: a light week can start at or above the last week's final
+    reading, and two 5h cycles both read at 100% across an unseen reset have no drop to cut at."""
     weeks = _cycles(con, "weekly_all", by_reset=True)[-SCOREBOARD_CYCLES:]
     if not weeks:
         return []
     window = timedelta(minutes=300)
     hits, blocked = [], []  # first 100% reading of each 5h cycle; (from, to) spans at 100%
-    for s in _cycles(con, "session"):  # percent never drops inside a cycle, so 100% holds to its end
+    for s in _cycles(con, "session", by_reset=True):  # percent never drops inside a cycle: 100% holds
         first = next((i for i, p in enumerate(s.percent) if p >= 100), None)
         if first is None:
             continue

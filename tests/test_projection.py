@@ -98,6 +98,18 @@ def test_window_at_100_drops_the_projection_cached_before_it(con, paced):
     assert got["weekly_all"]["projected_percent"] == pytest.approx(80.0)
 
 
+def test_projection_the_live_reading_already_passed_is_dropped(con, paced):
+    # Usage can't fall inside a cycle: 'Projected 80% at reset' under 85% used is contradicted by
+    # the reading next to it, as a cached projection is at 100%. Equal is still a valid pace.
+    cmon._refresh_projection(con, paced, T0)
+    passed = [paced[0], ("weekly_all", "All models", 85.0, WEEK_RESET.isoformat(), True)]
+    got = windows(passed)
+    assert set(got["weekly_all"]) == {"key", "label", "percent", "resets_at", "active"}
+    assert got["session"]["projected_percent"] == pytest.approx(130.0)
+    level = [paced[0], ("weekly_all", "All models", 80.0, WEEK_RESET.isoformat(), True)]
+    assert windows(level)["weekly_all"]["projected_percent"] == pytest.approx(80.0)
+
+
 def test_nothing_to_project_leaves_the_window_without_fields(con):
     reset = (T0 + 3 * H).isoformat()
     snap(con, T0 - H, 100, "session", reset)

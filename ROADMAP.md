@@ -136,9 +136,12 @@ Segue o desenho de `by_client`: `collect`, `watch` e `now` calculam e gravam em
 cada janela e sem quebrar leitores antigos, `projected_percent` (limitado a 999, como nas outras
 saídas), `exhausts_at` (`null` quando o ritmo não chega a 100% antes do reset) e `projection_at`.
 Os campos ficam ausentes, e não `null`, quando não há ritmo medível (menos de duas leituras no
-ciclo, ou nenhuma subida), quando o reset já passou e quando a janela está em 100%. Esse último
-caso só passou a valer com a correção de revisão em `e353cab`: `status` juntava a projeção do
-cache mesmo depois de uma leitura `--live` em 100% entre duas coletas. Na barra, os placeholders
+ciclo, ou nenhuma subida), quando o reset já passou, quando a janela está em 100% e quando a
+leitura já passou do percentual projetado. O caso dos 100% só passou a valer com a correção de
+revisão em `e353cab`: `status` juntava a projeção do cache mesmo depois de uma leitura `--live` em
+100% entre duas coletas. O da leitura acima da projeção veio na revisão seguinte, pelo mesmo
+motivo: o consumo não cai dentro do ciclo, e "Projected 22% at reset" sob 70% usados se contradiz.
+Na barra, os placeholders
 `{5h_proj}`, `{wk_proj}` e `{5h_eta}` (no formato de `{reset_short}`, `80m`, em branco enquanto a
 projeção fica abaixo de 100%) e uma linha de projeção em cada janela do menu, em laranja acima de
 100% e com a idade a partir de dois minutos. Esforço M. A projeção envelhece com o cache: a 20
@@ -259,7 +262,10 @@ fora porque pode esconder um reset. O último ciclo conta como em andamento, a n
 com a máquina desligada no reset e a primeira leitura do ciclo novo igual ou acima da última do
 anterior, duas semanas viravam uma linha e a sobra da que terminou se perdia. Desde a correção de
 revisão em `e353cab` o placar corta também onde `resets_at` muda mais que `CYCLE_JITTER_S`, como
-`_plan_share` já fazia; os outros usos de `_cycles` não mudaram.
+`_plan_share` já fazia. Os ciclos de 5h do placar passaram a cortar do mesmo jeito: duas leituras
+em 100% dos dois lados de um reset (máquina dormindo enquanto outro aparelho enchia a janela
+seguinte) viravam um ciclo só, com o intervalo contado como bloqueado. Os outros usos de `_cycles`
+não mudaram.
 
 ### C5. Mapa de calor por hora e dia da semana
 

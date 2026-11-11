@@ -45,7 +45,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   8: start, peak, what was left at the reset, hours the 5h window sat at 100% inside it and how
   many 5h cycles reached 100%, with the current cycle marked *in progress*. `--json` prints a
   list. Blocked time is measured between snapshots, so a block shorter than the collection
-  interval doesn't show. `trends` without the flag is unchanged.
+  interval doesn't show, and 5h cycles split at each reset the API reports, even with no drop
+  between two readings at 100%. `trends` without the flag is unchanged.
 - **`cmon burn --cache`: where the cache cost could have been avoided.** Instead of totals it
   reports the cache hit rate (cache read over cache read + cache write + input); the cache write
   of each turn that came after more than 1h idle in its session, the cost of going back to an old
@@ -56,15 +57,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   applied, and cmon assumes 1h, as its prices do.
 - **Projection and exhaustion time in `status --json` and cmon Bar.** Each window may carry
   `projected_percent` (percent at the reset at the current pace, the number `now --advice` and
-  `watch` print, capped at 999), `exhausts_at` (when that pace reaches 100%, ISO 8601 UTC, or
-  `null` if not before the reset) and `projection_at`. `status` stays a cache read: `collect`,
-  `watch` and `now` compute the projection and store it in `~/.cmon/projection.json`, so the
-  fields are absent until one of them has run in the current cycle, while there's no rate yet and
-  once a window is at 100%, and older readers see the payload they knew. cmon Bar gets the
-  placeholders `{5h_proj}`, `{wk_proj}` (`112%`) and `{5h_eta}` (`80m` until the 5h window hits
-  100%, blank while the projection stays under 100%), and each menu row adds a projection line,
-  orange past 100%, with its age once it's minutes old. Until now the projection appeared only in
-  `now --advice` and `watch`, so the bar showed where usage was but not where it was going.
+  `watch` print, capped at 999), `exhausts_at` (when that pace reaches 100%, ISO 8601 UTC, or `null`
+  if not before the reset) and `projection_at`. `status` stays a cache read: `collect`, `watch` and
+  `now` compute the projection and store it in `~/.cmon/projection.json`, so the fields are absent
+  until one of them has run in the current cycle, while there's no rate yet, once a window is at
+  100% and once the reading has passed the projected percent, and older readers see the payload they
+  knew. cmon Bar gets the placeholders `{5h_proj}`, `{wk_proj}` (`112%`) and `{5h_eta}` (`80m` until
+  the 5h window hits 100%, blank while the projection stays under 100%), and each menu row adds a
+  projection line, orange past 100%, with its age once it's minutes old. Until now the projection
+  appeared only in `now --advice` and `watch`, so the bar showed where usage was but not where it
+  was going.
 - **`cmon statusline`: a `statusLine` command for Claude Code.** It reads the JSON Claude Code
   sends on stdin and prints the plan with what this session cost and how many points of each
   window it took: `5h 62% 1h40m · wk 44% · session $3.10 (5h 2pp, wk 0.4pp)`. The plan comes from

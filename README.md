@@ -222,7 +222,8 @@ and `projection_at` is when it was computed:
 `status` stays a cache read, so the projection comes from the last `cmon collect` (every 20 min
 after `cmon install`), `watch` or `now`, not from the reading it prints. It is left out until one
 of them has run in the current cycle, while there's no rate to project (fewer than two readings
-in the cycle, or no rise), and once a window is at 100%. Near the end of a window a projection
+in the cycle, or no rise), once a window is at 100%, and once the reading has passed the projected
+percent, which usage can't fall back under within a cycle. Near the end of a window a projection
 that is 20 minutes old can be well off: check `projection_at` before acting on it.
 
 ### `cmon statusline` — Claude Code's status line
@@ -454,7 +455,10 @@ Blocked time is measured between snapshots, so its resolution is the collection 
 (20 minutes with `cmon install`): a block that starts and ends between two collections doesn't
 show, a 5h cycle seen at 100% by a single reading counts as a hit with no hours, and the minutes
 before the first and after the last 100% reading aren't counted. A gap in the readings longer
-than the 5h window isn't counted either, since a reset may have happened inside it.
+than the 5h window isn't counted either, since a reset may have happened inside it, and 5h cycles
+also split where the reset time moves: two readings at 100% on either side of a reset (the
+machine asleep while another device filled the next window) count as two cycles, not as hours
+blocked.
 
 ### `cmon burn` — tokens & cost (from logs)
 

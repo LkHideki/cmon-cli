@@ -86,14 +86,14 @@ Prefer `cmon status --json`, the stable contract (`--live` forces an API call):
     "resets_at": "2026-11-04T14:00:00+00:00", "active": true}]}}}
 ```
 
-A window may also carry `by_client` (`clients[]` with `key`, `label`, `share` as a fraction of
-what the window used, plus `other`), written by `cmon collect` for the current cycle; it's absent
-until collection has run. It may also carry `projected_percent` (percent at the reset at the
-current pace, capped at 999), `exhausts_at` (when that pace reaches 100%, ISO UTC, or `null` if not
-before the reset) and `projection_at` (when it was computed), written by `cmon collect`, `watch`
-and `now`. They're absent until computed for the current cycle, while there's no rate yet and once
-the window is at 100%; check `projection_at`, since a projection from the last collect can be 20
-minutes old.
+A window may also carry `by_client` (`clients[]` with `key`, `label`, `share` as a fraction of what
+the window used, plus `other`), written by `cmon collect` for the current cycle; it's absent until
+collection has run. It may also carry `projected_percent` (percent at the reset at the current pace,
+capped at 999), `exhausts_at` (when that pace reaches 100%, ISO UTC, or `null` if not before the
+reset) and `projection_at` (when it was computed), written by `cmon collect`, `watch` and `now`.
+They're absent until computed for the current cycle, while there's no rate yet, once the window is
+at 100% and once the reading has passed the projected percent; check `projection_at`, since a
+projection from the last collect can be 20 minutes old.
 
 `offline: true` means no data is available, and `providers` is then empty. `status` exits 0 even
 when offline, so check that field rather than the exit code.
