@@ -3340,10 +3340,35 @@ def _plan_share(con, key, since=None, until=None, col="surface", src="token_term
             "cycles": cycles}
 
 
+PLAN_ALIASES = {"weekly": "weekly_all", "week": "weekly_all", "5h": "session"}
+
+
+def _plan_window(con, name: str):
+    """(key, label, start of its latest cycle or None) for 'burn --plan NAME'. NAME is a snapshot
+    key, an alias (weekly, 5h) or a scoped model (fable for weekly_scoped:Fable)."""
+    known = con.execute(
+        "SELECT key, arg_max(label, observed_at), "
+        "arg_max(resets_at - INTERVAL 1 MINUTE * window_minutes, observed_at) FILTER (WHERE resets_at IS NOT NULL) "
+        "FROM snapshots WHERE provider='claude' GROUP BY key ORDER BY key").fetchall()
+    if not known:
+        sys.exit("--plan needs usage snapshots: run 'cmon collect', or 'cmon install' to collect them.")
+    want = PLAN_ALIASES.get(name.lower(), name).lower()
+    for key, label, start in known:
+        if want in (key.lower(), key.lower().rsplit(":", 1)[-1]):
+            return key, label, start
+    sys.exit(f"No snapshots for window {name!r}. Known: {', '.join(k for k, _l, _s in known)}.")
+
+
 def burn(args):
-    """Report tokens & estimated US$ from local Claude Code logs."""
+    """Report tokens & estimated US$ from local Claude Code logs; with --plan, also each
+    group's share of the official percent."""
     con = db()
-    since = _parse_since(getattr(args, "since", None))
+    raw_since = getattr(args, "since", None)
+    plan = _plan_window(con, args.plan) if getattr(args, "plan", None) else None
+    if raw_since is None:  # default: the window's current cycle with --plan, else 30 days
+        since = plan[2] if plan and plan[2] else _parse_since("30d")
+    else:
+        since = _parse_since(raw_since)
     scan_logs(con, since)
     col = {"model": "model", "surface": "surface", "day": "CAST(observed_at AS DATE)",
            "project": "project", "session": "session_id"}[args.by]
@@ -3378,25 +3403,48 @@ def burn(args):
         ccost["output"] += o * p[1] / 1e6
         ccost["cache read"] += r * p[2] / 1e6
         ccost["cache write"] += c * p[3] / 1e6
-    ordered = sorted(agg.items(), key=lambda kv: -kv[1][1])  # by cost desc
+    share = _plan_share(con, plan[0], since=since, col=col, src=src) if plan else None
+    if plan and share is None:
+        sys.exit(f"No '{plan[0]}' snapshots in period: run 'cmon collect', or 'cmon install' to collect them.")
+    pp = share["groups"] if share else {}
+    for g in pp:
+        agg.setdefault(g, [0, 0.0])  # a period starting mid-cycle can charge a group outside it
+    ordered = sorted(agg.items(), key=lambda kv: (-pp.get(kv[0], 0.0), -kv[1][1]))  # share, then cost
     if getattr(args, "json", False):
-        print(json.dumps([{"grp": g.isoformat() if hasattr(g, "isoformat") else g,
-                            "tok": int(v[0]), "custo": v[1]} for g, v in ordered],
-                         ensure_ascii=False))
+        items = [{"grp": g.isoformat() if hasattr(g, "isoformat") else g, "tok": int(v[0]), "custo": v[1],
+                  **({"plan_pp": pp.get(g, 0.0)} if share else {})} for g, v in ordered]
+        if share:
+            print(json.dumps({"window": plan[0], "since": since.isoformat() if since else None,
+                              "cycles": share["cycles"], "total_pp": share["total"],
+                              "other_pp": share["other"], "groups": items}, ensure_ascii=False))
+        else:
+            print(json.dumps(items, ensure_ascii=False))
         return
     per = {"model": "model", "surface": "surface", "day": "day",
            "project": "project", "session": "session"}[args.by]
     since_local = since.astimezone(_resolve_tz()) if since else None
     window = f" since {since_local:%Y-%m-%d %H:%M %Z}" if since_local else ""
     print(f"Consumption by {per}{window} (API equivalent):")
-    lines = [(_surface(g) if args.by == "surface" else str(g), v[0] / 1e6, v[1])
+    lines = [(_surface(g) if args.by == "surface" else str(g), v[0] / 1e6, v[1], pp.get(g, 0.0))
              for g, v in ordered]
-    w = max([len(lbl) for lbl, _, _ in lines] + [len("TOTAL")])  # widest label incl. long model ids
-    for lbl, tok_m, cost in lines:
-        print(f"  {lbl:<{w}} {tok_m:9.1f}M tok   US$ {cost:9.2f}")
+    other_lbl = "other (no local log)"
+    w = max([len(lbl) for lbl, *_ in lines] + [len(other_lbl) if share else len("TOTAL")])
+    total_pp = share["total"] if share else 0.0
+
+    def pp_col(v):
+        return f"   {v:6.1f} pp  {v / total_pp * 100 if total_pp else 0:3.0f}%" if share else ""
+    for lbl, tok_m, cost, gpp in lines:
+        print(f"  {lbl:<{w}} {tok_m:9.1f}M tok   US$ {cost:9.2f}{pp_col(gpp)}")
+    if share:
+        print(f"  {other_lbl:<{w}} {'':30}{pp_col(share['other'])}")
     total_c = sum(v[1] for _, v in ordered)
     total_tok = sum(v[0] for _, v in ordered)
-    print(f"  {'TOTAL':<{w}} {total_tok / 1e6:9.1f}M tok   US$ {total_c:9.2f}")
+    print(f"  {'TOTAL':<{w}} {total_tok / 1e6:9.1f}M tok   US$ {total_c:9.2f}{pp_col(total_pp)}")
+    if share:
+        cyc = "this cycle" if share["cycles"] == 1 else f"{share['cycles']} cycles"
+        print(f"\npp = points of {plan[1]} ({plan[0]}) over {cyc}, split by the API-equivalent cost logged\n"
+              "while it rose. 'other' rose with nothing logged here: claude.ai chat, other devices, cloud\n"
+              "sessions. Estimate.")
 
     # Breakdown by component: cache read usually dominates (context re-reading).
     print("\nBy component:")
@@ -3722,8 +3770,12 @@ def main():
     pb = sub.add_parser("burn", help="tokens & estimated US$ from local Claude Code logs")
     pb.add_argument("--by", choices=["model", "surface", "day", "project", "session"], default="model",
                     help="group by model (default), surface (terminal/vscode/app/sdk), day, project or session")
-    pb.add_argument("--since", default="30d",
-                    help="window: '24h', '7d', '30d' (default), ISO date, or 'all' for everything")
+    pb.add_argument("--since",
+                    help="window: '24h', '7d', '30d' (default; with --plan, the current cycle), ISO date, "
+                         "or 'all' for everything")
+    pb.add_argument("--plan", nargs="?", const="weekly_all", metavar="WINDOW",
+                    help="also split the official percent of WINDOW across groups: weekly (default), 5h, "
+                         "or a scoped model such as fable")
     pb.add_argument("--json", action="store_true", help="JSON output")
     pb.add_argument("--all-accounts", action="store_true",
                     help="include Claude Desktop sessions not tied to the terminal's account")

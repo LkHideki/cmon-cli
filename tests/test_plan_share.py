@@ -1,3 +1,5 @@
+import json
+from argparse import Namespace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -120,3 +122,50 @@ def test_group_column_and_filter(con):
 def test_no_snapshots_is_none(con):
     tok(con, T0, "cli")
     assert cmon._plan_share(con, "weekly_all", since=T0) is None
+
+
+def burn(capsys, **kw):
+    args = {"by": "surface", "since": None, "json": True, "all_accounts": False, "plan": "weekly", **kw}
+    cmon.burn(Namespace(**args))
+    out = capsys.readouterr().out
+    return json.loads(out) if args["json"] else out
+
+
+@pytest.fixture
+def week(con):
+    """Cycle T0-4d → RESET; one terminal message before the cycle began, two inside it."""
+    tok(con, RESET - timedelta(days=8), "cli")  # previous cycle
+    snap(con, T0, 10)
+    tok(con, T0 + MIN, "cli", out=3_000_000)
+    tok(con, T0 + MIN, "claude-vscode")
+    snap(con, T0 + 10 * MIN, 14)
+    snap(con, T0 + 20 * MIN, 16)  # rose with nothing logged
+    con.close()
+
+
+def test_burn_plan_defaults_to_current_cycle(week, capsys):
+    got = burn(capsys)
+    assert got["window"] == "weekly_all" and got["cycles"] == 1
+    assert got["since"].startswith((RESET - timedelta(days=7)).date().isoformat())
+    by = {g["grp"]: g for g in got["groups"]}
+    assert by["cli"]["tok"] == 3_000_000  # the message of the previous cycle is outside
+    # the first reading (10%) has no cost logged since the cycle began, so it is 'other' too
+    assert by["cli"]["plan_pp"] == pytest.approx(3) and by["claude-vscode"]["plan_pp"] == pytest.approx(1)
+    assert got["other_pp"] == pytest.approx(12) and got["total_pp"] == pytest.approx(16)
+
+
+def test_burn_plan_text(week, capsys):
+    out = burn(capsys, json=False)
+    assert "terminal" in out and "3.0 pp" in out and "other (no local log)" in out
+    assert "16.0 pp  100%" in out and "this cycle" in out
+
+
+def test_burn_plan_aliases_and_unknown_window(week, capsys):
+    assert burn(capsys, plan="weekly_all")["window"] == "weekly_all"
+    with pytest.raises(SystemExit, match="Known: weekly_all"):
+        burn(capsys, plan="5h")
+
+
+def test_burn_plan_needs_snapshots(home, capsys):
+    with pytest.raises(SystemExit, match="cmon collect"):
+        burn(capsys)
