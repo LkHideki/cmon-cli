@@ -3,7 +3,9 @@
 Levantamento feito em 2026-11-11 sobre a versão 0.8.0. Nada aqui está comprometido: é uma lista
 de candidatas, cada uma com o que resolve, em que parte do código atual se apoia, o esforço e o
 que pode dar errado. Quando uma for escolhida, ela ganha um plano próprio em
-[`docs/plans/`](docs/plans/) e sai desta lista.
+[`docs/plans/`](docs/plans/) e sai desta lista. As dez da tabela abaixo foram implementadas na
+branch `feat/roadmap-top10` e continuam aqui, cada uma com uma linha **Estado** e o texto
+ajustado onde a implementação se afastou do que eu tinha descrito.
 
 Esforço: **P** cabe em uma sessão, **M** em um ou dois dias, **G** pede plano próprio e vários
 incrementos. As funções citadas estão em [`cmon.py`](cmon.py), salvo indicação contrária.
@@ -12,46 +14,64 @@ incrementos. As funções citadas estão em [`cmon.py`](cmon.py), salvo indicaç
 
 As dez de melhor relação entre valor e esforço, na ordem em que eu faria:
 
-| ID | Funcionalidade | Esforço |
-|---|---|---|
-| [G2](#g2-tabela-de-preços-fora-do-código) | Tabela de preços fora do código, com aviso de modelo desconhecido | P |
-| [A2](#a2-hook-em-todos-os-alertas-com-dados-estruturados) | Hook em todos os alertas, com dados estruturados | P |
-| [A1](#a1-alertas-por-limiar-de-percentual) | Alertas por limiar de percentual | P |
-| [A4](#a4-cmon-guard-código-de-saída-para-scripts-e-hooks) | `cmon guard`: código de saída para scripts e hooks | P |
-| [E1](#e1-cmon-statusline-para-o-claude-code) | `cmon statusline` para o Claude Code, com o custo da sessão | M |
-| [B1](#b1-projeção-e-hora-de-esgotamento-no-status-e-na-barra) | Projeção e hora de esgotamento no `status` e na barra | M |
-| [B2](#b2-orçamento-diário-do-limite-semanal) | Orçamento diário do limite semanal | P |
-| [C1](#c1-relatório-de-eficiência-de-cache) | Relatório de eficiência de cache | M |
-| [C4](#c4-placar-de-ciclos-bloqueio-e-sobra) | Placar de ciclos: tempo bloqueado e sobra | P |
-| [G1](#g1-cmon-doctor-no-próprio-cli) | `cmon doctor` no próprio CLI | M |
+| ID | Funcionalidade | Esforço | Estado |
+|---|---|---|---|
+| [G2](#g2-tabela-de-preços-fora-do-código) | Tabela de preços fora do código, com aviso de modelo desconhecido | P | Implementada (`5cde799`) |
+| [A2](#a2-hook-em-todos-os-alertas-com-dados-estruturados) | Hook em todos os alertas, com dados estruturados | P | Implementada (`0dc20c0`) |
+| [A1](#a1-alertas-por-limiar-de-percentual) | Alertas por limiar de percentual | P | Implementada (`7623fb0`) |
+| [A4](#a4-cmon-guard-código-de-saída-para-scripts-e-hooks) | `cmon guard`: código de saída para scripts e hooks | P | Implementada (`32bf08c`) |
+| [E1](#e1-cmon-statusline-para-o-claude-code) | `cmon statusline` para o Claude Code, com o custo da sessão | M | Implementada (`9a4655f`) |
+| [B1](#b1-projeção-e-hora-de-esgotamento-no-status-e-na-barra) | Projeção e hora de esgotamento no `status` e na barra | M | Implementada (`efd9c07`) |
+| [B2](#b2-orçamento-diário-do-limite-semanal) | Orçamento diário do limite semanal | P | Implementada (`fced00c`) |
+| [C1](#c1-relatório-de-eficiência-de-cache) | Relatório de eficiência de cache | M | Implementada (`9e56bde`) |
+| [C4](#c4-placar-de-ciclos-bloqueio-e-sobra) | Placar de ciclos: tempo bloqueado e sobra | P | Implementada (`74a5dd3`) |
+| [G1](#g1-cmon-doctor-no-próprio-cli) | `cmon doctor` no próprio CLI | M | Implementada (`8248d7a`) |
 
-G2 vem primeiro porque corrige um erro silencioso de hoje, descrito na própria seção.
+G2 veio primeiro porque corrigia um erro silencioso, descrito na própria seção. Depois das dez, uma
+revisão encontrou defeitos em algumas delas, corrigidos em `be82763`, `e353cab`, `7828ec6` e
+`4ac02e4`; cada seção diz o que mudou.
 
 ## A. Alertas e automação
 
 ### A1. Alertas por limiar de percentual
+
+**Estado:** implementada na branch feat/roadmap-top10 (commit 7623fb0).
 
 Hoje `collect --alert` dispara em dois casos: o ritmo vai estourar a janela antes do reset
 (`_fire_rate_alerts`) ou o reset está próximo (`_fire_lead_alert`). Não há aviso do tipo "a janela
 de 5h passou de 80%". `cmon wait --at 80` faz isso, mas prende um terminal e vale para uma única
 espera.
 
-Uma chave `alert_at` em `~/.cmon/config.json`, por janela (`session: 80,95`, `weekly_all: 50,75,90`),
-avaliada a cada coleta e deduplicada por ciclo com o mesmo marcador de `_alert_fired`. Esforço P.
-O percentual é inteiro e a coleta roda a cada 20 minutos, então o aviso de 95% pode chegar com a
-janela já em 100%; com cmon Bar aberto a leitura é mais frequente e o atraso cai.
+Uma chave `alert_at` em `~/.cmon/config.json`, gravada com
+`cmon config set alert_at "session=80,95 weekly_all=50,75,90"` e validada no `set`. Aceita os
+apelidos `5h` e `weekly` e modelos com escopo, como `fable`. É avaliada a cada `collect --alert` e
+deduplicada por percentual e por ciclo com o mesmo marcador de `_alert_fired`; quando uma coleta
+encontra vários percentuais ultrapassados de uma vez, só o maior notifica e os menores ficam
+marcados. Esforço P. O percentual é inteiro e a coleta roda a cada 20 minutos, então o aviso de 95%
+pode chegar com a janela já em 100%. Eu tinha escrito que cmon Bar aberto encurtaria esse atraso,
+e não encurta: a barra roda `cmon status --json --live` (`menubar/CmonBar.swift`), e `status` não
+dispara alerta; só `collect --alert` dispara.
 
 ### A2. Hook em todos os alertas, com dados estruturados
+
+**Estado:** implementada na branch feat/roadmap-top10 (commit 0dc20c0).
 
 `CMON_HOOK` só roda no alerta de proximidade do reset: `_fire_lead_alert` chama `_run_hook`,
 `_fire_rate_alerts` não. Quem liga o hook a um webhook perde justamente o alerta mais útil, o de
 que o ritmo vai estourar.
 
-Chamar o hook em todo alerta e passar, além de `CMON_ALERT_MSG`, as variáveis `CMON_ALERT_KIND`
-(`rate`, `lead`, `threshold`, `reset`), `CMON_ALERT_KEY`, `CMON_ALERT_PERCENT` e
-`CMON_ALERT_RESETS_AT`. Com isso o README pode trazer receitas prontas para ntfy, Slack e Discord
-sem que o cmon precise conhecer nenhum desses serviços. Esforço P. Muda o comportamento de quem já
-usa o hook, que passaria a receber mais chamadas; vale anunciar no CHANGELOG.
+O hook passou a rodar em todo alerta de `collect --alert` e recebe, além de `CMON_ALERT_MSG`, as
+variáveis `CMON_ALERT_KIND`, `CMON_ALERT_KEY`, `CMON_ALERT_PERCENT` e `CMON_ALERT_RESETS_AT` (ISO
+8601 em UTC), sempre definidas e vazias quando o valor é desconhecido, para não derrubar um hook
+com `set -u`. Os tipos que existem são `rate` e `lead`, e `threshold` veio com A1; `reset` depende
+de A3, que não foi feita, e as notificações de `cmon wait` (limiar atingido, janela liberada)
+continuam sem hook. `CMON_ALERT_KEY` não se limita a `session` e `weekly_all`: os alertas de ritmo
+e de limiar passam qualquer janela da API, como `weekly_scoped:Fable`, com o nome do modelo como a
+API o devolve. A primeira versão do README dizia o contrário e tratava a chave como segura para
+colar em JSON; a correção de revisão em `7828ec6` acertou o texto e passou a testar que as
+variáveis ficam definidas mesmo vazias. O README traz receitas para ntfy e para um webhook JSON
+genérico, sem que o cmon conheça nenhum desses serviços. Esforço P. Muda o comportamento de quem já
+usa o hook, que passa a receber mais chamadas; está no CHANGELOG.
 
 ### A3. Aviso de janela liberada, em segundo plano
 
@@ -62,6 +82,8 @@ ele vira uma notificação a cada cinco horas.
 
 ### A4. `cmon guard`: código de saída para scripts e hooks
 
+**Estado:** implementada na branch feat/roadmap-top10 (commit 32bf08c).
+
 `cmon status` sai com 0 sempre, de propósito, para não quebrar statusline. Falta o inverso: um
 comando que leia o cache e saia com código diferente de zero acima de um limite.
 
@@ -70,9 +92,17 @@ cmon guard --window session --max 90 || exit 0   # não começa o lote se a jane
 ```
 
 Serve a laços de `claude -p`, a jobs de CI e a hooks do Claude Code (`UserPromptSubmit`, `Stop`)
-que avisam o agente para encerrar e salvar estado antes do bloqueio. Lê só o cache, como `status`,
-então custa milissegundos. Precisa de um terceiro código de saída para "sem dados", senão um cache
-vazio passa por "liberado". Esforço P.
+que avisam o agente para encerrar e salvar estado antes do bloqueio. Lê só o cache de status
+(`_read_cache`), então custa milissegundos. Eu tinha escrito "como `status`", e não é: sem
+`--live`, `status` cai no DuckDB quando falta o cache e chama a API quando um ciclo já resetou;
+`guard` não faz nem uma coisa nem outra. O preço é que, sem `status.json` e com o banco presente,
+`guard` sai com 3 em vez de ler o banco, caso raro porque `collect`, `status --live` e a barra
+regravam o cache. Precisa de um terceiro código de saída para "sem dados", senão um cache vazio
+passa por "liberado": ficou 0 abaixo de `--max`, 1 no limite ou acima, 3 sem dados (sem cache,
+janela ausente ou cache mais velho que `--stale-min`, 60 minutos) e 2 para argumento inválido, que
+é o código do argparse. Um ciclo que já resetou no cache conta como 0%. Uma data de reset ilegível
+no cache derrubava o comando com saída 1, o código de "acima do limite"; desde a correção de
+revisão em `be82763` o percentual decide sozinho. Esforço P.
 
 ### A5. Detecção de consumo fora do padrão
 
@@ -95,29 +125,51 @@ computador acordado e deve vir desligada.
 
 ### B1. Projeção e hora de esgotamento no `status` e na barra
 
+**Estado:** implementada na branch feat/roadmap-top10 (commit efd9c07).
+
 `now --advice` já calcula a projeção no reset e em quantas horas a janela chega a 100%
 (`_window_tips`), mas isso não aparece no `status` nem em cmon Bar. A barra mostra onde o consumo
 está, sem dizer para onde vai.
 
-Seguir o desenho de `by_client`: `collect` calcula e grava em cache (como `_refresh_client_share`),
-e `status --json` passa a carregar `projected_percent` e `exhausts_at` opcionais em cada janela,
-sem quebrar leitores antigos. Na barra, placeholders `{5h_proj}`, `{wk_proj}` e `{5h_eta}`, mais
-uma marca visual quando a projeção passa de 100%. Esforço M. A projeção envelhece com o cache: a
-20 minutos de distância ela pode estar bem errada perto do fim da janela, e o payload deve dizer
+Segue o desenho de `by_client`: `collect`, `watch` e `now` calculam e gravam em
+`~/.cmon/projection.json` (como `_refresh_client_share`), e `status --json` carrega, opcionais em
+cada janela e sem quebrar leitores antigos, `projected_percent` (limitado a 999, como nas outras
+saídas), `exhausts_at` (`null` quando o ritmo não chega a 100% antes do reset) e `projection_at`.
+Os campos ficam ausentes, e não `null`, quando não há ritmo medível (menos de duas leituras no
+ciclo, ou nenhuma subida), quando o reset já passou e quando a janela está em 100%. Esse último
+caso só passou a valer com a correção de revisão em `e353cab`: `status` juntava a projeção do
+cache mesmo depois de uma leitura `--live` em 100% entre duas coletas. Na barra, os placeholders
+`{5h_proj}`, `{wk_proj}` e `{5h_eta}` (no formato de `{reset_short}`, `80m`, em branco enquanto a
+projeção fica abaixo de 100%) e uma linha de projeção em cada janela do menu, em laranja acima de
+100% e com a idade a partir de dois minutos. Esforço M. A projeção envelhece com o cache: a 20
+minutos de distância ela pode estar bem errada perto do fim da janela, e por isso o payload diz
 quando foi calculada.
 
 ### B2. Orçamento diário do limite semanal
 
+**Estado:** implementada na branch feat/roadmap-top10 (commit fced00c).
+
 A pergunta prática do dia a dia é "quanto posso gastar hoje sem faltar na sexta". Dá para
 responder com o que já existe: o que resta do limite semanal, dividido pelos dias até o reset e
-ponderado pelo peso de cada dia da semana (`_day_weights`). Uma linha em `cmon now`:
+ponderado pelo peso de cada dia da semana. Eu tinha apontado `_day_weights` para esse peso, mas ele
+guarda um peso de recência por data; o peso por dia da semana são os multiplicadores `dow` de
+`_hour_profile`, e o piso de cobertura é a fonte `learned` dele. A implementação usa também a forma
+das horas (intensidade = taxa da hora × `dow`, como em `_project`), de modo que os dias inteiros
+diferem só pelo dia da semana, mas um dia parcial (hoje a partir da leitura inicial, o dia do reset
+até o reset) pesa pelas horas que contém. Uma linha em `cmon now`:
 
 ```text
-Hoje: 9 pp usados de ~14 pp de orçamento (semana em 41%, reset em 3d 22h)
+Today: 9 pp used of ~14 pp budget (profile-weighted), 5 pp left — week at 41%, resets in 3d 22h.
 ```
 
 Esforço P. Com pouco histórico os pesos por dia são ruído; abaixo do mesmo piso de cobertura do
-perfil, dividir em partes iguais.
+perfil a divisão é em partes iguais (*equal split*), e um perfil sintético de `quiet_hours` conta
+como divisão igual. Casos que a descrição não previa: um ciclo que começou hoje conta a partir do
+reset em 0%; leituras separadas por mais de `PROFILE_PAIR_MAX_H` em volta da meia-noite, com o
+percentual mudando no meio, movem a contagem para a primeira leitura do dia; um reset ainda hoje
+faz de todo o restante o orçamento do dia; sem leitura anterior a linha mostra só o orçamento; o
+limite esgotado tem linha própria. Sem janela semanal, sem `resets_at` ou com o reset já passado,
+não há linha. `now --advice` ficou como estava.
 
 ### B3. Faixa de erro nas projeções
 
@@ -149,6 +201,8 @@ alertas por cliente e um resumo semanal. Não repito essas aqui.
 
 ### C1. Relatório de eficiência de cache
 
+**Estado:** implementada na branch feat/roadmap-top10 (commit 9e56bde).
+
 O README diz que leitura e escrita de cache respondem por cerca de 80% do custo em uso agêntico, e
 `burn` mostra o total por componente. Falta dizer onde esse custo é evitável. Com
 `cache_read_tokens`, `cache_write_tokens` e `observed_at` por mensagem dá para medir, por sessão e
@@ -162,6 +216,14 @@ por projeto:
 
 Esforço M. É estimativa: o log não diz qual TTL foi aplicado a cada bloco, e o corte por pausa
 depende de supor 1h, como a tabela de preços já supõe.
+
+Ficou como `cmon burn --cache`, que recusa `--by` e `--plan`. Candidata a `/compact` é a sessão com
+pelo menos 10 turnos, contexto médio por turno entre os 10% maiores do período e pelo menos 50k
+tokens, piso que impede um período só de sessões pequenas de apontar alguma. A primeira versão
+chamava de 10% o 90º percentil por posição com tudo o que estava acima dele, o que dava 2 de 10
+sessões e 3 de 20; desde a correção de revisão em `e353cab` são os 10% arredondados para cima, no
+mínimo uma, mais as empatadas no corte. A pausa é medida sobre o histórico inteiro da sessão, antes
+de `--since` e dos filtros, e linhas `<synthetic>` sem tokens não contam como turno.
 
 ### C2. Linha do tempo de uma sessão
 
@@ -180,16 +242,30 @@ vem vazio e a saída precisa dizer isso.
 
 ### C4. Placar de ciclos: bloqueio e sobra
 
+**Estado:** implementada na branch feat/roadmap-top10 (commit 74a5dd3).
+
 `trends` mostra o pico de cada ciclo. Dois números derivados dizem mais sobre o uso do plano:
 quantas horas a janela ficou em 100%, isto é, tempo bloqueado, e quanto do limite semanal sobrou
 no reset. Bloqueio frequente com sobra semanal indica rajadas mal distribuídas; sobra alta sem
 bloqueio indica plano grande demais. Esforço P, só com `snapshots`. A resolução é a do intervalo
 de coleta: um bloqueio de dez minutos entre duas coletas não aparece.
 
+Ficou como `trends --scoreboard`, que substitui a saída normal e ignora `--since`, com os últimos 8
+ciclos semanais. O tempo bloqueado soma os intervalos entre leituras consecutivas de um ciclo de
+5h a partir da primeira em 100%, recortados ao ciclo semanal, e um intervalo maior que 5h fica de
+fora porque pode esconder um reset. O último ciclo conta como em andamento, a não ser que o
+`resets_at` semanal mais recente já tenha passado. Sem histórico semanal, o modo texto sai com 1 e
+`--json` imprime `[]`. Os ciclos semanais vinham só de `_cycles`, que corta onde o percentual cai:
+com a máquina desligada no reset e a primeira leitura do ciclo novo igual ou acima da última do
+anterior, duas semanas viravam uma linha e a sobra da que terminou se perdia. Desde a correção de
+revisão em `e353cab` o placar corta também onde `resets_at` muda mais que `CYCLE_JITTER_S`, como
+`_plan_share` já fazia; os outros usos de `_cycles` não mudaram.
+
 ### C5. Mapa de calor por hora e dia da semana
 
 A projeção aprende um perfil de 24 horas e um multiplicador por dia da semana
-(`_hour_buckets_tokens`, `_day_weights`), e nenhum dos dois é mostrado. Um painel a mais em
+(`_hour_buckets_tokens` e os multiplicadores `dow` de `_hour_profile`; `_day_weights`, que eu
+tinha citado aqui, é um peso de recência por data, como B2 mostrou), e nenhum dos dois é mostrado. Um painel a mais em
 `cmon plot` e uma versão em texto em `trends --heatmap`, com a grade completa de hora por dia
 tirada do `token_log`, deixam o usuário conferir se o que o cmon aprendeu bate com a rotina dele,
 o que também ajuda a depurar projeções estranhas. Esforço P.
@@ -243,19 +319,30 @@ continuaria sendo a fonte da verdade. Prioridade baixa: o público atual edita J
 
 ### E1. `cmon statusline` para o Claude Code
 
+**Estado:** implementada na branch feat/roadmap-top10 (commit 9a4655f).
+
 O Claude Code entrega ao comando de statusline um JSON no stdin com a sessão, o modelo e o
-diretório. `cmon status` ignora esse JSON e imprime só o plano. Um subcomando próprio juntaria os
-dois lados: percentuais do plano e, pelo `session_id`, o custo e os pontos que *esta* sessão já
-consumiu.
+diretório e, conferido na documentação em 2026-11-11, também `cost.total_cost_usd` e, nos planos
+Pro e Max depois da primeira resposta da sessão, `rate_limits.five_hour` e `rate_limits.seven_day`
+(`used_percentage` de 0 a 100 e `resets_at` em segundos Unix, cada um opcional). `cmon status`
+ignora esse JSON e imprime só o plano. Um subcomando próprio junta os dois lados: percentuais do
+plano e, pelo `session_id`, o custo e os pontos que *esta* sessão já consumiu.
 
 ```text
-5h 62% 1h40 · wk 44% · sessão US$ 3,10 (2 pp)
+5h 62% 1h40m · wk 44% · session $3.10 (5h 2pp, wk 0.4pp)
 ```
 
 Esforço M. A statusline roda a cada atualização da tela, então o comando não pode varrer
-transcripts nem esperar o lock do DuckDB: lê o cache de status e um cache por sessão que `collect`
-mantém, e o número da sessão pode estar alguns minutos atrasado. O formato exato do JSON de
-entrada precisa ser conferido na documentação do Claude Code antes de implementar.
+transcripts nem esperar o lock do DuckDB: lê o cache de status e um cache por sessão
+(`~/.cmon/sessions.json`) que `collect` mantém, e os pontos da sessão podem estar até uma coleta
+atrasados. O stdin mais rico mudou duas coisas. O custo mostrado é o `cost.total_cost_usd` ao vivo
+do Claude Code quando ele vem, e o do cache só na falta dele, de modo que aparece custo mesmo para
+sessão que o cache ainda não tem. E o plano continua vindo primeiro do cache, mas os `rate_limits`
+preenchem uma janela quando o cache falta, tem mais de 30 minutos ou guarda uma janela cujo reset
+já passou; uma janela que resetou sem substituto aparece em 0%, como em `guard`, e os pontos de um
+ciclo já encerrado são descartados. O comando sai sempre com 0: a correção de revisão em `be82763`
+cobriu um stdin aninhado fundo demais, que estourava a recursão do parser e saía com traceback, e
+`4ac02e4` isolou o teste que roda o comando em processo filho das credenciais reais.
 
 ### E2. `status --format`
 
@@ -291,23 +378,46 @@ token que expira sem renovação automática.
 
 ### G1. `cmon doctor` no próprio CLI
 
+**Estado:** implementada na branch feat/roadmap-top10 (commit 8248d7a).
+
 `make doctor` vive em [`scripts/setup.sh`](scripts/setup.sh) e só existe para quem clonou o
 repositório no macOS. Quem instalou com `uv tool install`, em qualquer sistema, não tem diagnóstico
 nenhum. Trazer as checagens que não são do macOS para um subcomando: origem e validade do token,
 alcance da API, agendamento instalado, idade do último snapshot, versão do schema, lock do banco,
-`sync_dir` acessível. `--json` para assistentes. `make doctor` passaria a chamar o subcomando e
-acrescentar só o que é do app. Esforço M.
+`sync_dir` acessível. `--json` para assistentes. `make doctor` passa a chamar o subcomando e
+acrescenta só o que é do app. Esforço M.
+
+Além do que eu tinha listado, entraram `config.json` e `bar.json`, este conferido contra os tipos
+que o decodificador de cmon Bar aceita e não só contra a sintaxe JSON, porque um tipo errado faz o
+app trocar o arquivo inteiro pelos padrões. Cada checagem sai como `ok`, `warn`, `fail` ou `skip`
+(este para `--offline`, `sync_dir` não definido, sistema sem suporte e checagens de banco que não
+podem rodar); só `fail` muda o código de saída, e por isso agendamento ausente, snapshot com mais
+de 60 minutos, lock ocupado e schema antigo são avisos. O token nunca aparece, nem mascarado: só a
+origem e a validade. A chamada à API não grava snapshot nem cache, e o banco é aberto só para
+leitura. Se o `cmon` instalado é anterior ao `doctor`, `make doctor` falha numa checagem própria,
+`cmon command is up to date`, com a correção `make install`. Na revisão, `be82763` fez um
+`bar.json` aninhado fundo demais virar `fail` em vez de traceback, e `4ac02e4` passou a testar o
+`ok` do `--json` num diagnóstico com falha e a abertura do banco só para leitura.
 
 ### G2. Tabela de preços fora do código
+
+**Estado:** implementada na branch feat/roadmap-top10 (commit 5cde799).
 
 `PRICES` é um dicionário fixo, e `_price` devolve zero para modelo que não esteja nele. Um modelo
 novo aparece em `burn` com custo US$ 0 e, como `_plan_share` reparte os pontos pelo custo, recebe
 zero ponto em `burn --plan`: o que ele consumiu vai para os grupos que tiveram custo no mesmo
-intervalo, ou para *other* quando ninguém mais teve, sem aviso. É o caso de Mythos hoje, que
-`_short_model` reconhece e `PRICES` não tem.
+intervalo, ou para *other* quando ninguém mais teve, sem aviso. É o caso de Mythos, que
+`_short_model` reconhece e `PRICES` não tem; continua sem preço embutido, mas agora aparece no
+aviso e pode ganhar preço em `prices.json`.
 
-Duas mudanças: `~/.cmon/prices.json` sobrepõe a tabela embutida, e `burn` avisa quando encontra
-tokens de um modelo sem preço em vez de somar zero calado. Esforço P.
+Duas mudanças: `~/.cmon/prices.json` sobrepõe a tabela embutida (vence a substring mais longa, e
+um arquivo inválido é ignorado com um aviso), e `burn` avisa quando encontra tokens de um modelo
+sem preço em vez de somar zero calado. Esforço P. O aviso vai para o stderr só no modo texto. Em
+`burn --json`, a lista `unpriced_models` não pôde ir para o topo como eu tinha pensado: sem
+`--plan` a saída é uma lista solta, e uma chave no topo a transformaria em objeto e quebraria o
+contrato. Nesse formato a lista vai em cada grupo que tem tokens sem preço, e a saída de referência
+dos testes não muda; com `--plan` o objeto tem `unpriced_models` no topo, mesmo vazio, e os grupos
+levam a mesma chave.
 
 ### G3. Cópia de segurança antes de migrar
 
