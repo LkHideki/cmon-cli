@@ -17,4 +17,6 @@ body:
     id: context
     attributes:
       label: Context
-      description: The command you ran and its output, or `cmon doctor --json --offline` if it's about the setup.
+      description: >-
+        The command you ran and its output, or `cmon doctor --json --offline` if it's about the
+        setup. That output never shows the token, but it prints your home and sync_dir paths.

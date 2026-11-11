@@ -27,7 +27,10 @@ body:
     id: doctor
     attributes:
       label: Output of `cmon doctor --json --offline`
-      description: It never shows the token. Drop `--offline` if the problem involves the usage API.
+      description: >-
+        It never shows the token, but it prints paths: your home folder and, if set, your sync_dir
+        folder. Replace what you'd rather keep private. Drop `--offline` if the problem involves
+        the usage API.
       render: json
     validations:
       required: true
@@ -35,7 +38,7 @@ body:
     id: version
     attributes:
       label: cmon version
-      description: "`uv tool list | grep cmon-cli`, or `git rev-parse --short HEAD` if you run it from a clone"
+      description: "The `cmon-cli` line of `uv tool list`, or `git rev-parse --short HEAD` if you run it from a clone"
     validations:
       required: true
   - type: dropdown

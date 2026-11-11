@@ -28,8 +28,10 @@ uv sync --extra plot     # also matplotlib and seaborn, for `cmon plot`
 uv run cmon --help       # run straight from the source
 ```
 
-`uv run cmon` uses your real login and writes its caches to your real `~/.cmon`. To try a command
-that writes to the database, give it a scratch one: `uv run cmon --db /tmp/scratch.duckdb collect`.
+`uv run cmon` uses your real login and your real `~/.cmon`. `--db` moves only the database: the
+caches and `config.json` stay where they are, and with `sync_dir` set, `collect` would write the
+scratch database's device file into your synced folder. `uv run cmon --db /tmp/scratch.duckdb burn`
+is a safe way to see the transcript import without touching your history.
 
 | Path | What it is |
 |---|---|
@@ -38,7 +40,7 @@ that writes to the database, give it a scratch one: `uv run cmon --db /tmp/scrat
 | [`scripts/setup.sh`](scripts/setup.sh) | What `make install`, `make uninstall` and `make doctor` run |
 | [`tests/`](tests/) | pytest suite; [`tests/conftest.py`](tests/conftest.py) gives every test a temporary home and blocks the network |
 | [`tests/golden/`](tests/golden/) | Reference outputs; when one changes, the diff should show why |
-| [`docs/plans/`](docs/plans/) | Design plans for larger work, in Portuguese |
+| [`docs/plans/`](docs/plans/) | Design plans for larger work, mostly in Portuguese |
 | [`AGENTS.md`](AGENTS.md) | The guide for AI coding assistants, also linked as `CLAUDE.md` |
 
 ## Before opening a PR
@@ -56,7 +58,7 @@ CI also runs the suite against DuckDB 1.1.1, the oldest version `pyproject.toml`
 reproduce that job, use a separate environment so your `.venv` stays as it is:
 
 ```bash
-UV_PROJECT_ENVIRONMENT=.venv-duckdb11 uv sync
+UV_PROJECT_ENVIRONMENT=.venv-duckdb11 uv sync --python 3.11
 uv pip install --python .venv-duckdb11 duckdb==1.1.1   # `uv pip` ignores UV_PROJECT_ENVIRONMENT
 UV_PROJECT_ENVIRONMENT=.venv-duckdb11 uv run --no-sync pytest -q
 ```

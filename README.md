@@ -19,7 +19,7 @@ cmon tracks Claude only for now. Its database is already prepared for other prov
 | [`menubar/`](menubar/) | cmon Bar, the macOS app, in Swift |
 | [`scripts/setup.sh`](scripts/setup.sh) | What `make install`, `make uninstall` and `make doctor` run |
 | [`tests/`](tests/) | Python tests; they never touch your real data or the network |
-| [`docs/plans/`](docs/plans/) | Design plans, in Portuguese; not all of them are implemented |
+| [`docs/plans/`](docs/plans/) | Design plans, mostly in Portuguese; not all of them are implemented |
 | [`CHANGELOG.md`](CHANGELOG.md) | What changed in each release, and how to upgrade |
 | [`ROADMAP.md`](ROADMAP.md) | Candidate features, open for contributions |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to set up, test and send a change |

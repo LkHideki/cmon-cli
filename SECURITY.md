@@ -28,10 +28,12 @@ These are the parts where a bug is a security bug rather than a plain one:
 - **Claude Code's login.** cmon never redeems or stores Claude Code's refresh token; doing so would
   log Claude Code out.
 - **Usage data.** `~/.cmon` holds project names, session ids and costs. Only `sync_dir`, which the
-  user sets, copies them anywhere else.
+  user sets, copies them anywhere else, along with the Claude account id and the device name (the
+  hostname unless `device_name` is set).
 - **Commands cmon runs.** `CMON_HOOK` runs a command the user configured, with alert data in
-  environment variables. cmon reads settings from `~/.cmon/.env` and never from a `.env` in the
-  current directory, so a cloned project can't set the hook or swap the token.
+  environment variables. cmon reads settings from `~/.cmon/.env` and, when run from a clone, from
+  that clone's own `.env`; never from a `.env` in whatever other directory you run it in, so
+  another project can't set the hook or swap the token.
 
 Out of scope: the private usage endpoint changing or going away, and anything that requires an
 attacker who can already write to `~/.cmon` or read your vault.

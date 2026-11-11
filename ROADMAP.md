@@ -18,8 +18,9 @@ will look at, and [CONTRIBUTING.md](CONTRIBUTING.md) says what every change need
 
 ## Shipped in 0.9.0
 
-The first ten items, picked for value against effort. The [0.9.0 changelog](CHANGELOG.md) has the
-details, including where each one ended up differing from its first description.
+The first ten items, picked for value against effort. The [0.9.0 changelog](CHANGELOG.md)
+describes each one as it shipped; where one ended up differing from its first description is in
+this file's history (`git show 147b106^:ROADMAP.md`, in Portuguese).
 
 | ID | Feature |
 |---|---|
@@ -243,7 +244,7 @@ Effort M. It holds DuckDB's write lock, so the new views must reuse its open con
 
 ## Planned elsewhere
 
-These plans are in Portuguese.
+All but usage-by-client are in Portuguese.
 
 | Topic | Where | State |
 |---|---|---|
