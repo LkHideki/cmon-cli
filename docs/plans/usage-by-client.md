@@ -105,8 +105,8 @@ what really has no log anywhere.
 | INC-2 | `_plan_share()`: split Δ% per group by interval cost, "other" bucket, cycles, scoped windows | unit tests with synthetic snapshots + rows |
 | INC-3 | `burn --plan [WINDOW]`: pp column and share in text and JSON; default to current cycle | CLI tests |
 | INC-4 | `burn --surface X` filter (label or entrypoint) | CLI test |
-| INC-5 | Device identity, `cmon sync` (export/import parquet, account guard), `--by device`, `--device` | tests with two simulated machines |
-| INC-6 | `sync_dir`/`device_name` config keys; `collect` syncs when configured | test that collect exports |
+| INC-5 | Device identity, `cmon sync` (export/import parquet, account guard), `--by device`, `--device`, `sync_dir`/`device_name` config keys | tests with two simulated machines |
+| INC-6 | `collect` syncs when configured, best-effort | test that collect exchanges and survives a broken folder |
 | INC-7 | README, CHANGELOG, AGENTS.md | `make test` |
 
 Order is linear: all of them edit `cmon.py`.

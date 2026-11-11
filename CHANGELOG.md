@@ -9,6 +9,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`cmon burn --plan` shows who spent the percent.** `cmon burn --by surface --plan` splits the
+  window's official percent across clients (terminal, VS Code, desktop app, SDK) by the cost each
+  logged while it rose, and reports what rose with nothing logged locally (claude.ai chat, other
+  devices) as *other*. Works with any `--by`; defaults to the current cycle.
+- **`cmon burn --surface vscode`** narrows any report to some clients.
+- **Usage by device.** `cmon config set sync_dir <folder>` and `cmon sync` exchange rows between
+  machines through a folder they already sync, with no server; `collect` keeps it up to date.
+  `cmon burn --by device` and `--device NAME` use it. Files from another Claude account are
+  skipped. No database migration.
 - **`cmon config set keepalive on` starts the next 5h window by itself.** When a window rolls over
   and sits parked at `0% –`, cmon sends one small Haiku request through the `claude` command. Off by
   default, because it sends requests on your behalf and they count towards your limits.
