@@ -1,0 +1,20 @@
+name: Question
+description: How to read a number, set something up, or use cmon from a script
+labels: [question]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The README answers most setup questions, and `cmon doctor` prints the fix for each failing
+        check. Never paste a token.
+  - type: textarea
+    id: question
+    attributes:
+      label: Your question
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: The command you ran and its output, or `cmon doctor --json --offline` if it's about the setup.
