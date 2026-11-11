@@ -4184,6 +4184,8 @@ def _cost(model, i, o, r, c) -> float:
 
 CYCLE_JITTER_S = 3600  # resets_at moves by milliseconds between reads; more than this = new cycle
 _REST = "\x00rest"  # group of the rows a plan-share filter leaves out
+# The same value as SQL: DuckDB 1.1's parser ends a quoted literal at a NUL byte.
+_REST_SQL = "chr(0) || 'rest'"
 
 
 def _plan_share(con, key, since=None, until=None, col="surface", src="token_terminal",
@@ -4202,7 +4204,7 @@ def _plan_share(con, key, since=None, until=None, col="surface", src="token_term
     without snapshots in the period."""
     scoped = key.split(":", 1)[1].lower() if ":" in key else None
     tok_where = "provider='claude'" + (" AND lower(model) LIKE ?" if scoped else "")
-    grp = f"CASE WHEN true{where} THEN {col} ELSE '{_REST}' END" if where else col
+    grp = f"CASE WHEN true{where} THEN {col} ELSE {_REST_SQL} END" if where else col
     tok_params = [*params, f"%{scoped}%"] if scoped else list(params)
     bounds, bparams = "", []
     if since:

@@ -101,6 +101,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   the model and its tokens, since that zero also hands the model's share of the percent in
   `burn --plan` to other groups or to *other*. A new model such as Mythos used to show up as US$ 0
   with no hint.
+- **`cmon burn --plan` with `--surface` or `--device` works on DuckDB 1.1.** The query embedded a
+  NUL byte in a string literal, which DuckDB 1.1's parser rejects ("unterminated quoted string"),
+  so the filtered plan share failed there; newer DuckDB accepted it. This is what kept CI red
+  since 0.8.0.
 
 ## [0.8.0] — 2026-11-10
 
