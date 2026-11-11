@@ -29,10 +29,17 @@ Each failing check prints its fix:
 
 | Check | What to do |
 |---|---|
-| `usage API reachable and logged in` | The user must log in to Claude Code, or run `cmon token set`. Don't try to do this for them. |
+| `usage API reachable and logged in`, `token source found` | The user must log in to Claude Code, or run `cmon token set`. Don't try to do this for them. |
 | `cmon Bar running` | `open ~/Applications/"cmon Bar.app"` |
 | `bar.json is valid` | Fix `~/.cmon/bar.json`, or delete it to get the defaults |
+| `config.json is valid` | The detail names the key: `cmon config set <key> <value>` or `cmon config clear <key>`, after asking the user |
+| `sync_dir reachable` | The synced folder is gone or read-only. Ask the user: reconnect it, or `cmon config clear sync_dir` |
+| `database schema is current` | A newer cmon wrote the database, or the file is damaged. Update cmon; never edit or delete the file |
 | Anything else | `make install` again; it is safe to repeat |
+
+From `token source found` on, the checks come from `cmon doctor`, which `make doctor`
+runs after its own checks of the app. Lines marked `warn` (nothing scheduled, a stale snapshot, a
+lock held by `cmon watch`) don't fail `make doctor`; mention them only if they matter to the user.
 
 ### Linux, Windows, or the CLI alone
 
@@ -40,6 +47,7 @@ Each failing check prints its fix:
 uv tool install git+https://github.com/LkHideki/cmon-cli
 cmon now       # check that it reads the usage
 cmon install   # optional: background collection (--dry-run shows what it would do)
+cmon doctor    # exit 0 means no check failed; each problem prints its fix
 ```
 
 cmon Bar is macOS only. cmon isn't on PyPI; the PyPI package named `cmon` is an unrelated project.
@@ -78,17 +86,37 @@ Prefer `cmon status --json`, the stable contract (`--live` forces an API call):
     "resets_at": "2026-11-04T14:00:00+00:00", "active": true}]}}}
 ```
 
-A window may also carry `by_client` (`clients[]` with `key`, `label`, `share` as a fraction of
-what the window used, plus `other`), written by `cmon collect` for the current cycle; it's absent
-until collection has run.
+A window may also carry `by_client` (`clients[]` with `key`, `label`, `share` as a fraction of what
+the window used, plus `other`), written by `cmon collect` for the current cycle; it's absent until
+collection has run. It may also carry `projected_percent` (percent at the reset at the current pace,
+capped at 999), `exhausts_at` (when that pace reaches 100%, ISO UTC, or `null` if not before the
+reset) and `projection_at` (when it was computed), written by `cmon collect`, `watch` and `now`.
+They're absent until computed for the current cycle, while there's no rate yet, once the window is
+at 100% and once the reading has passed the projected percent; check `projection_at`, since a
+projection from the last collect can be 20 minutes old.
 
 `offline: true` means no data is available, and `providers` is then empty. `status` exits 0 even
 when offline, so check that field rather than the exit code.
 
+To diagnose an install, use `cmon doctor --json` (`--offline` skips its one API call):
+`{"version": 1, "ok": true, "checks": [{"key", "name", "status", "detail", "fix"}]}`, with `status`
+one of `ok`, `warn`, `fail`, `skip`, and `fix` the command or step to take, or `null`. `ok` is
+false, and the exit code 1, only when a check has `fail`. The keys are `token`, `api`, `schedule`,
+`lock`, `schema`, `snapshot`, `sync_dir`, `config`, `bar`. It never shows the token and never
+writes the database.
+
+To gate a script or hook on the limit, use `cmon guard --window session --max 90`: exit 0 under
+the percent, 1 at or above it, 3 when there's no fresh data (no cache, window missing, older
+than `--stale-min`, 60 min, or unreadable), 2 for bad arguments. It reads only the cache, never the
+API. `--json` prints `{window, percent, max, resets_at, age_s, result}`, with `result` one of
+`under`, `over`, `no_data`, `missing`, `stale`.
+
 For where the percent went, use `cmon burn --by surface --plan --json` (also `--by project`,
 `model`, `day`, `device`): `groups[].plan_pp` is each group's points of the window's percent over
 the current cycle, and `other_pp` is what rose with nothing logged on this machine (claude.ai chat,
-other devices). It's an estimate built from snapshots and local transcripts.
+other devices). It's an estimate built from snapshots and local transcripts. A non-empty
+`unpriced_models` means those models were costed at zero, which skews `plan_pp` towards the other
+groups; prices go in `~/.cmon/prices.json` (README, `burn` section), and they're the user's call.
 
 ## Explaining the menu bar
 

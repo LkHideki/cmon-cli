@@ -70,6 +70,7 @@ def isolated_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Isolate
     for key in (
         "CLAUDE_OAUTH_TOKEN",
         "CMON_DB",
+        "CMON_HOOK",  # alert tests would otherwise run the developer's own hook
         "CMON_TZ",
         "CMON_QUIET_HOURS",
         "HTTP_PROXY",
@@ -89,6 +90,10 @@ def isolated_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Isolate
     monkeypatch.setattr(cmon, "KEEPALIVE_LOG", str(home / ".cmon" / "keepalive.log"))
     monkeypatch.setattr(cmon, "LEGACY_PURGED", str(home / ".cmon" / ".legacy-chain-purged"))
     monkeypatch.setattr(cmon, "DESKTOP_SESSIONS", str(home / "desktop-sessions"))
+    # Process-wide memo of the learned profile and model params, keyed by tz and the clock:
+    # without a reset one test's history would shape another test's projection or budget.
+    monkeypatch.setattr(cmon, "_profile_cache", {})
+    monkeypatch.setattr(cmon, "_params_cache", None)
 
     def blocked(*_args, **_kwargs):
         raise AssertionError("tests must not use the network")

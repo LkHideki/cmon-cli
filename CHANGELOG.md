@@ -5,6 +5,124 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Prices outside the code: `~/.cmon/prices.json`.** An optional file of model substring →
+  `[input, output, cache_read, cache_write]` in US$ per million tokens replaces built-in prices and
+  adds new models. The longest matching substring wins, so the file's order doesn't matter. An
+  invalid file is ignored with one warning, and the built-in prices apply.
+- **`burn --json` reports `unpriced_models`**: at the top of the `--plan` object, and on each group
+  that has tokens of a model with no price.
+- **The alert hook gets the alert as data.** Besides `CMON_ALERT_MSG`, `CMON_HOOK` now sees
+  `CMON_ALERT_KIND` (`rate` or `lead`), `CMON_ALERT_KEY` (the window), `CMON_ALERT_PERCENT` and
+  `CMON_ALERT_RESETS_AT` (ISO 8601, UTC), so a hook can feed ntfy or a JSON webhook without
+  parsing the message. The README's Alerts section has both recipes.
+- **Percent-threshold alerts: `cmon config set alert_at "session=80,95 weekly_all=50,75,90"`.**
+  `collect --alert` notifies when a window reaches one of its percents, once per percent per
+  window cycle, through stderr, the desktop notification and `CMON_HOOK` with
+  `CMON_ALERT_KIND=threshold`. `5h` and `weekly` work as aliases, and the value is validated on
+  `set`. If one collect finds several percents passed at once, only the highest notifies. Until
+  now only `cmon wait --at` could say "the 5h window passed 80%", and it held a terminal for a
+  single wait. Without the key nothing changes.
+- **`cmon guard --max N`: an exit code for scripts and Claude Code hooks.** Exits 1 when the window
+  (`--window`, default `session`; `5h`, `weekly` and scoped models work) is at or above N percent,
+  0 under it, and 3 when there's no data, the window is missing, the cache is older than
+  `--stale-min` (60 minutes) or can't be read, so an empty or broken cache can't pass for a free
+  window; exit 1 means only "at or above", even when something unexpected fails. A cached cycle
+  that already reset counts as 0%. It reads only the status cache, never the API or the database,
+  so a hook doesn't wait on the network or on a running `collect`. `--quiet` drops the stderr line and
+  `--json` prints `{window, percent, max, resets_at, age_s, result}`. `status` keeps exiting 0.
+- **A daily budget of the weekly limit in `cmon now`.** A new `Today:` line puts the points used
+  since local midnight against today's share of what was left of the week at that moment, spread
+  until the weekly reset. The days are weighted by the learned weekday and hourly profile when it
+  passes its coverage gate (*profile-weighted*), and split evenly otherwise (*equal split*). A
+  cycle that began today counts from its reset, a reset later today makes all that's left today's,
+  a gap in the readings around midnight moves the count to the first reading of the day, and with
+  no earlier reading today the line shows only the budget. No line without a weekly window.
+- **`cmon trends --scoreboard`: how each weekly cycle went.** One row per weekly cycle, the last
+  8: start, peak, what was left at the reset, hours the 5h window sat at 100% inside it and how
+  many 5h cycles reached 100%, with the current cycle marked *in progress*. `--json` prints a
+  list. Blocked time is measured between snapshots, so a block shorter than the collection
+  interval doesn't show, and 5h cycles split at each reset the API reports, even with no drop
+  between two readings at 100%. `trends` without the flag is unchanged.
+- **`cmon burn --cache`: where the cache cost could have been avoided.** Instead of totals it
+  reports the cache hit rate (cache read over cache read + cache write + input); the cache write
+  of each turn that came after more than 1h idle in its session, the cost of going back to an old
+  session, by project and for the sessions that paid the most; and the `/compact` candidates,
+  sessions of at least 10 turns whose average context per turn is in the top 10% and at least 50k
+  tokens. It takes `--since`, `--surface`, `--device`, `--all-accounts` and `--json` like the other
+  modes, and refuses `--by` and `--plan`. It's an estimate: the transcripts don't say which TTL
+  applied, and cmon assumes 1h, as its prices do.
+- **Projection and exhaustion time in `status --json` and cmon Bar.** Each window may carry
+  `projected_percent` (percent at the reset at the current pace, the number `now --advice` and
+  `watch` print, capped at 999), `exhausts_at` (when that pace reaches 100%, ISO 8601 UTC, or `null`
+  if not before the reset) and `projection_at`. `status` stays a cache read: `collect`, `watch` and
+  `now` compute the projection and store it in `~/.cmon/projection.json`, so the fields are absent
+  until one of them has run in the current cycle, while there's no rate yet, once a window is at
+  100% and once the reading has passed the projected percent, and older readers see the payload they
+  knew. cmon Bar gets the placeholders `{5h_proj}`, `{wk_proj}` (`112%`) and `{5h_eta}` (`80m` until
+  the 5h window hits 100%, blank while the projection stays under 100%), and each menu row adds a
+  projection line, orange past 100%, with its age once it's minutes old. Until now the projection
+  appeared only in `now --advice` and `watch`, so the bar showed where usage was but not where it
+  was going.
+- **`cmon statusline`: a `statusLine` command for Claude Code.** It reads the JSON Claude Code
+  sends on stdin and prints the plan with what this session cost and how many points of each
+  window it took: `5h 62% 1h40m · wk 44% · session $3.10 (5h 2pp, wk 0.4pp)`. The plan comes from
+  the status cache, with the `rate_limits` on stdin filling in a window the cache lacks or can't
+  read, has seen reset (a row parked at 0% with no reset time included), or holds for more than 30
+  minutes. The cost is Claude Code's own `cost.total_cost_usd` when present. The points come from
+  the new `~/.cmon/sessions.json`, which `collect` writes per session id over each window's current
+  cycle, so they lag by up to one collection. It never calls the API or opens the database and
+  always exits 0; missing or invalid stdin prints the plan alone. `cmon status` is unchanged.
+- **`cmon doctor`: the installation check on any OS.** Until now only `make doctor` existed, and
+  only for a macOS clone. It checks the token source (named, never printed), one call to the usage
+  API (`--offline` skips it), the background job where `cmon install` puts it on each OS, the
+  database lock, schema version and age of the last snapshot, `sync_dir` when set, and
+  `config.json` and `bar.json` when present. Each line is `ok`, `warn`, `FAIL` or `skip`, and each
+  problem prints its fix. It exits 1 only when a check fails; nothing scheduled, a stale snapshot
+  or a held lock are warnings. `--json` prints `{version, ok, checks[]}` for assistants. It opens
+  the database read-only and never migrates or writes it.
+
+### Changed
+
+- **`CMON_HOOK` also runs on rate alerts**, the warning that the pace will hit 100% before the
+  reset. It used to run only when a reset was near, so a hook wired to a webhook missed the alert
+  that matters most. If you use a hook, expect up to one more call per window cycle; it still
+  never runs on the deduplicated repeats of an alert.
+- **`make doctor` runs `cmon doctor`** after its checks of cmon Bar, so it now also reports the
+  token, background collection, the database, `sync_dir` and `config.json`. Its exit code still
+  means the same: 1 when any check fails, and warnings don't count. `bar.json is valid` now holds
+  the file to the types cmon Bar decodes, not just JSON syntax: a file that parsed but had, say, a
+  number in `segments` passed before, while the app ignored the whole file. A `cmon` command too old
+  to have `doctor` fails `cmon command is up to date`; `make install` fixes it.
+
+### Fixed
+
+- **An invalid number in a `CMON_*` variable no longer ends in a traceback.** `CMON_ALERT_LEAD=30m`
+  or an empty `CMON_RETRIES=` raised at import, before any command ran. Every command now stops
+  with one line naming the variable, and `cmon guard` exits 3 (no data) instead of the traceback's
+  1, which a hook reads as "at or above --max".
+- **`cmon burn` no longer prices an unknown model at zero in silence.** It warns on stderr, naming
+  the model and its tokens, since that zero also hands the model's share of the percent in
+  `burn --plan` to other groups or to *other*. That includes a model only in the rows `--surface`
+  or `--device` filtered out, which the split still prices as *rest (filtered out)*. A new model
+  such as Mythos used to show up as US$ 0 with no hint.
+- **`cmon burn --plan` with `--surface` or `--device` works on DuckDB 1.1.** The query embedded a
+  NUL byte in a string literal, which DuckDB 1.1's parser rejects ("unterminated quoted string"),
+  so the filtered plan share failed there; newer DuckDB accepted it for every `--by` but `day`,
+  whose dates DuckDB wouldn't mix with the *rest* group's text, so `--by day --plan` with a filter
+  failed on every version. Both work now. The NUL byte is what kept CI red since 0.8.0.
+- **A token with a CR or LF in it no longer shows up in error messages.** requests refuses such a
+  header before sending anything and quotes the whole `Bearer` value in its error, which `cmon now`,
+  `collect` and the new `cmon doctor` printed as it came. The token and any `Bearer` value are now
+  replaced by `<token>`. It takes a `CLAUDE_OAUTH_TOKEN` read from a file with CRLF line endings.
+- **A timezone that names a tzdata folder (`America`) or is too long for a file name no longer
+  crashes cmon** on Python 3.11 and 3.12, where it raises IsADirectoryError or OSError rather than
+  the not-found error cmon caught. `config set` refuses it, display commands fall back to UTC with
+  the usual warning, and `doctor` reports it as a failed `config.json is valid` check.
+
 ## [0.8.0] — 2026-11-10
 
 ### Added

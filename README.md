@@ -57,6 +57,7 @@ package named `cmon` is an unrelated project, so install from this repository:
 ```bash
 uv tool install git+https://github.com/LkHideki/cmon-cli
 cmon now
+cmon doctor   # checks the token, the API, background collection and the database
 ```
 
 To work on the code instead, clone it and run `uv sync`; commands then run as `uv run cmon …`.
@@ -147,6 +148,13 @@ that doesn't open the window is retried after 30 minutes; attempts are logged to
 Windows then run back to back whether you work or not, so you may sit down with only part of one
 left. The reset comes sooner than if your first request had started it.
 
+**`alert_at`** lists, per window, the percents at which `collect --alert` notifies you; see
+[Alerts](#alerts):
+
+```bash
+cmon config set alert_at "session=80,95 weekly_all=50,75,90"   # 5h and weekly work as aliases
+```
+
 **`sync_dir`** and **`device_name`** share usage between your machines; see
 [`cmon sync`](#cmon-sync--usage-by-device).
 
@@ -158,6 +166,8 @@ The examples use `uv run cmon`, for a clone of this repository. After `make inst
 ```bash
 uv run cmon now       # current usage + reset + rate/projection (--advice adds pacing tips)
 uv run cmon status    # one-liner for statusline/tmux/prompt
+uv run cmon statusline  # Claude Code's statusLine: the plan plus this session's cost and points
+uv run cmon guard --max 90  # exit 1 when the 5h window is at 90% or more (scripts, hooks)
 uv run cmon watch     # live TUI, self-updating (Ctrl-C exits)
 uv run cmon wait      # block until 5h window resets, then notify
 uv run cmon collect   # save 1 snapshot to database (with UTC timestamp)
@@ -168,6 +178,7 @@ uv run cmon plot      # charts -> usage.png
 uv run cmon backtest  # how accurate past projections were (--replay scores existing history)
 uv run cmon tune      # fit the projection's parameters to your own history
 uv run cmon install   # schedule background collection in OS scheduler
+uv run cmon doctor    # what's wrong and how to fix it (--json for assistants)
 ```
 
 History lives in `~/.cmon/usage.duckdb` whatever directory you run from. Global option
@@ -196,6 +207,139 @@ it never shows a dead cycle and never blocks a prompt. `--live` always queries t
 `--json` prints a versioned payload (`version`, `offline`, `observed_at`, `age_s`,
 `providers.claude.windows[]`) for scripts and the menu bar app.
 
+Each window can also say where its pace leads: `projected_percent` is the percent at the reset
+at the current rate (the projection `now --advice` and `watch` print, capped at 999),
+`exhausts_at` is when that pace reaches 100% (ISO 8601, UTC; `null` if not before the reset),
+and `projection_at` is when it was computed:
+
+```json
+{"key": "session", "label": "Current session", "percent": 50.0,
+ "resets_at": "2026-11-04T02:00:00+00:00", "active": true,
+ "projected_percent": 130.0, "exhausts_at": "2026-11-04T00:30:00+00:00",
+ "projection_at": "2026-11-03T22:00:00+00:00"}
+```
+
+`status` stays a cache read, so the projection comes from the last `cmon collect` (every 20 min
+after `cmon install`), `watch` or `now`, not from the reading it prints. It is left out until one
+of them has run in the current cycle, while there's no rate to project (fewer than two readings
+in the cycle, or no rise), once a window is at 100%, and once the reading has passed the projected
+percent, which usage can't fall back under within a cycle. Near the end of a window a projection
+that is 20 minutes old can be well off: check `projection_at` before acting on it.
+
+### `cmon statusline` — Claude Code's status line
+
+`status` prints the plan alone. `statusline` is made for Claude Code's `statusLine` setting: it
+reads the JSON Claude Code sends on stdin and adds what the current session cost and how many
+points of each window it took:
+
+```
+5h 62% 1h40m · wk 44% · session $3.10 (5h 2pp, wk 0.4pp)
+```
+
+Add it to `~/.claude/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "cmon statusline"
+  }
+}
+```
+
+Claude Code runs the command after each assistant message (debounced at 300 ms) and blanks the
+row when it fails, so `statusline` never calls the API, never opens the database and always exits
+0. With the cache in place it takes about 35 ms, most of it Python starting. Each part has its own
+source:
+
+| Part | Source |
+|---|---|
+| `5h 62% 1h40m · wk 44%` | The status cache that `collect`, `status`, `now` and `watch` write. When the cache is missing or unreadable, older than 30 minutes, or one of its windows has already reset (or sits at 0% with no reset time, as the API reports a window that rolled over), the `rate_limits` that Claude Code sends (Pro and Max plans, after the session's first response) fill in that window. A cached window that already reset with nothing to replace it shows 0%, as in `guard`, and `45m ago` marks a stale cache. |
+| `session $3.10` | Claude Code's own estimate (`cost.total_cost_usd`) when stdin carries it, else cmon's from the last `collect`. |
+| `(5h 2pp, wk 0.4pp)` | `~/.cmon/sessions.json`, which each `cmon collect` rewrites: this session's points of each window's current cycle, split as `burn --plan` splits them, by the API-equivalent cost logged while the percent rose. |
+
+The points lag by up to one collection (20 minutes after `cmon install`), are absent until a
+`collect` has seen the session, and drop out for a window once its cycle resets. The file holds
+the session ids, costs and points of the 300 most recently active sessions of the weekly cycle.
+
+Run by hand without input, or given input that isn't a JSON object, it prints the plan part only;
+`cmon offline` means there's nothing at all to show. If Claude Code doesn't find `cmon` on its
+`PATH`, give the full path (`uv tool dir --bin` prints the folder). Prefer the installed command
+to `python cmon.py statusline`, which compiles the whole script on every run and takes about twice
+as long.
+
+### `cmon guard` — exit code for scripts and hooks
+
+`status` always exits 0 so it never breaks a statusline. `guard` is the opposite: it exits
+non-zero when a window is at or above a percent, so a batch can stop before the limit blocks it:
+
+```sh
+cmon guard --window session --max 90 || exit 0   # don't start the batch near the end of the window
+```
+
+| Exit | Meaning |
+|---|---|
+| 0 | Under `--max`, including a window whose cached reset already passed (nothing used in the new cycle yet) |
+| 1 | At or above `--max` |
+| 2 | Bad arguments (argparse's usage error) |
+| 3 | No data: no cache, the window isn't in it, it's older than `--stale-min` minutes (60), or it can't be read (a file that isn't a cache, a percent that isn't a number, an invalid number in a `CMON_*` variable) |
+
+Exit 3 is separate on purpose: an empty or stale cache must not pass for a free window. Test
+for 1 when "unknown" should let the work go ahead, as the hook below does.
+
+`--window` takes `session` (the default, alias `5h`), `weekly_all` (alias `weekly`) or a scoped
+model such as `fable`. The one-line explanation goes to stderr (`--quiet` drops it), and
+`--json` prints the verdict on stdout:
+
+```json
+{"window": "session", "percent": 42.0, "max": 90.0, "resets_at": "2026-11-04T02:00:00+00:00", "age_s": 300, "result": "under"}
+```
+
+`result` is `under`, `over`, `no_data`, `missing` or `stale`; `percent` and `resets_at` are
+`null` unless it's `under` or `over`, and `resets_at` is also `null` once the cached cycle ended
+or when the cached reset time can't be read, in which case the percent alone decides.
+
+`guard` reads only the cache that `cmon collect` (every 20 min after `cmon install`),
+`status --live` and cmon Bar keep. It never calls the API or opens the database, so it takes
+milliseconds and a running `collect` can't hold it up. Unlike `status`, it doesn't fetch the new
+cycle when the cached one already reset. If a long loop needs a fresher number, run
+`cmon status --live > /dev/null` before it, at the cost of one API call.
+
+A loop of `claude -p` runs that stops near the limit:
+
+```sh
+for task in tasks/*.md; do
+  cmon guard --max 85 || break   # 1: near the limit, 3: no fresh data
+  claude -p "$(cat "$task")" > "${task%.md}.out"
+done
+```
+
+A Claude Code hook that tells the agent to wrap up once the 5h window passes 90%. In
+`UserPromptSubmit`, what a hook prints with exit 0 is added to the agent's context; any other
+exit code except 2 is only reported as a hook error, so the command maps the verdict to text
+and always exits 0. In `~/.claude/settings.json` or a project's `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cmon guard --max 90 --quiet; [ $? -ne 1 ] || echo 'The 5h usage window is above 90%. Finish the current step, commit, and write down where you stopped before the limit blocks this session.'"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+To refuse new prompts instead, exit 2 from the hook: Claude Code then blocks the prompt and
+shows the hook's stderr, e.g.
+`cmon guard --max 98; [ $? -ne 1 ] || exit 2`.
+
 ### Menu bar (macOS)
 
 `menubar/` holds **cmon Bar**, a native menu bar item (Swift, no third-party app). The
@@ -203,7 +347,9 @@ title shows the quota as `90% 75'  44% 91` — 5h window, then weekly limit, eac
 used and time until it resets: plain hours from 2 h up, minutes with `'` below that and
 seconds with `"` in the last minute — and a click
 opens a per-window breakdown with progress bars, reset times and when the next update is
-due. Under **By client**, one bar per window shows who used this cycle's percent — VS Code,
+due. Once collection has projected the cycle, each window's row adds where the pace leads
+(`Projected 130% · 100% in 1h 20m`, in orange past 100%), with its age once it's a few minutes
+old. Under **By client**, one bar per window shows who used this cycle's percent — VS Code,
 Terminal, Desktop app, SDK — and how much of it nothing on this Mac logged (*claude.ai &
 elsewhere*). The split comes from the background `cmon collect` (see
 [`--plan`](#cmon-burn--tokens--cost-from-logs)), so it appears once collection is installed.
@@ -227,7 +373,11 @@ is reported in the menu and defaults are used):
   `{wk_reset_h}` (hours)
   `{wk_reset_hm}` `{age}` (minutes since the data was read); `{5h_bar}` `{wk_bar}` draw usage
   as a block and `{5h_dot}` `{wk_dot}` as a traffic light; `{top_client}` `{5h_top_client}` name
-  the client that used the most of the week or the 5h window (`VS Code 57%`). The title dims when the data is
+  the client that used the most of the week or the 5h window (`VS Code 57%`); `{5h_proj}`
+  `{wk_proj}` are the projected percent at the reset (`112%`) and `{5h_eta}` the time until the
+  5h window hits 100% at that pace, in the unit of `{reset_short}` (`80m`). These three are blank
+  until a projection exists (see [`status --json`](#cmon-status--statusline)), and `{5h_eta}` is
+  also blank while the projection stays under 100%. The title dims when the data is
   older than `stale_minutes`. With `"hide_empty": true`, a word holding a blank placeholder and
   any segment left empty disappear, which suits labelled layouts:
 
@@ -287,7 +437,28 @@ delta versus the previous one, and a warning if the current cycle deviates from 
 uv run cmon trends                # summary + cycle breakdown
 uv run cmon trends --since 24h    # summary over the last 24h (accepts 7d or ISO date)
 uv run cmon trends --json         # JSON summary for script/pipe
+uv run cmon trends --scoreboard   # one row per weekly cycle: peak, leftover, time blocked
 ```
+
+**Cycle scoreboard.** `--scoreboard` replaces the output above with one row per weekly
+(All models) cycle, the last 8, oldest first: when it started, its peak, what was left at the
+reset (100% minus the cycle's last reading), the hours the 5h window spent at 100% inside it,
+and how many 5h cycles reached 100%. The current cycle is marked *in progress*, and its leftover
+is what's left so far. Frequent 5h blocks with weekly leftover point to bursts that could be
+spread out; a high leftover with no blocks points to a plan bigger than the usage. `--json`
+prints the rows as a list of `{start, peak_pct, leftover_pct, in_progress, blocked_h,
+blocked_5h_cycles}`, with `start` in ISO 8601 UTC; `--since` doesn't apply. A cycle ends where
+the weekly percent drops or the reset time the API reports moves, so a reset that came while no
+collection ran still splits two cycles, even when the new one's first reading isn't lower.
+
+Blocked time is measured between snapshots, so its resolution is the collection interval
+(20 minutes with `cmon install`): a block that starts and ends between two collections doesn't
+show, a 5h cycle seen at 100% by a single reading counts as a hit with no hours, and the minutes
+before the first and after the last 100% reading aren't counted. A gap in the readings longer
+than the 5h window isn't counted either, since a reset may have happened inside it, and 5h cycles
+also split where the reset time moves: two readings at 100% on either side of a reset (the
+machine asleep while another device filled the next window) count as two cycles, not as hours
+blocked.
 
 ### `cmon burn` — tokens & cost (from logs)
 
@@ -307,6 +478,7 @@ uv run cmon burn --since 7d         # smaller window (24h, 7d, ISO date…)
 uv run cmon burn --since all        # full history (but Claude Code only keeps ~30d)
 uv run cmon burn --json
 uv run cmon burn --all-accounts     # include Desktop sessions of other accounts (see below)
+uv run cmon burn --cache --since 7d # where the cache cost was avoidable (see below)
 ```
 
 **Which account counts.** Only the account the terminal's Claude Code is signed into
@@ -350,7 +522,8 @@ estimate, and it gets better the closer together the snapshots are.
 Without `--since` it covers the window's current cycle. `--plan` takes `weekly` (default), `5h` or a
 scoped model such as `fable`. With `--surface` or `--device`, the clients filtered out keep their
 points as *rest (filtered out)*, so what's left isn't inflated. `--json` with `--plan` prints an
-object with `window`, `since`, `cycles`, `total_pp`, `other_pp` and `groups`, each with `plan_pp`.
+object with `window`, `since`, `cycles`, `total_pp`, `other_pp`, `unpriced_models` (see *Prices*
+below) and `groups`, each with `plan_pp`.
 
 Scanning is incremental (caches by `mtime`+size, deduplicates by `uuid`): the
 first run reads everything (~tens of seconds on large bases), subsequent runs take
@@ -365,11 +538,80 @@ each message, not new work. And the value is the **API-equivalent cost**
 (pay-per-token): **you pay the subscription, not this** — the number shows the *value*
 you extract from your plan (easily tens of times the monthly subscription).
 
+**Cache efficiency: `--cache`.** The component breakdown says how much the cache cost; `--cache`
+says where part of it was avoidable. It replaces the totals with three things:
+
+- the **hit rate**, cache read ÷ (cache read + cache write + input): how much of the context each
+  turn sent came from cache;
+- the **idle rewrites**: the cache write of each turn that came more than 1h after the previous
+  turn of its session, when the cache had expired. That's the price of going back to an old
+  session instead of opening a new one, shown by project and for the sessions that paid the most;
+- the **`/compact` candidates**: sessions of at least 10 turns whose average context per turn
+  (input + cache read + cache write) is in the top 10% of the period, and at least 50k tokens.
+  Every turn of those re-reads that whole context, so a `/compact` pays back quickly.
+
+```text
+$ cmon burn --cache --since 7d
+Cache efficiency since 2026-11-04 10:59 -03 (API equivalent, estimate):
+  hit rate           93.1%   of the input context came from cache (120 turns, 4 sessions)
+  cache read         14.4M tok   US$      7.20
+  cache write         0.9M tok   US$      8.88
+  idle rewrites         4 turns  US$      5.40    61% of cache write
+
+By project (rewrite = cache write of the first turn after > 1h idle in a session):
+  project    turns  hit rate  rewrites  US$ rewrites  US$ cache write
+  site          60     93.7%         2          3.00             4.74
+  cmon          60     92.3%         2          2.40             4.14
+
+Sessions that paid the most to rewrite their cache after idle:
+  00000003-1111-4222-8333-444455556663  site                    1 rewrite    US$     1.80 of 7.09
+  00000002-1111-4222-8333-444455556662  cmon                    1 rewrite    US$     1.50 of 6.20
+  00000001-1111-4222-8333-444455556661  site                    1 rewrite    US$     1.20 of 5.29
+  00000000-1111-4222-8333-444455556660  cmon                    1 rewrite    US$     0.90 of 4.39
+
+/compact candidates (≥ 10 turns, average context per turn in the top 10% and ≥ 50k tok):
+  00000003-1111-4222-8333-444455556663  site                    30 turns   avg    190k tok   US$      7.09
+```
+
+It takes `--since` (default 30 days), `--surface`, `--device`, `--all-accounts` and `--json`, and
+refuses `--by` and `--plan`. `--json` prints an object with `hit_rate`, `tokens`, `cost_usd`,
+`idle_rewrites`, `projects` (all of them), `idle_sessions` and `compact` (the 10 costliest of each),
+and `unpriced_models`. All of it is an estimate. The transcripts don't say which cache TTL applied,
+so cmon assumes 1h, as its prices do; a turn's cache write also holds its new content, not only the
+rewrite; and subagent turns count in their parent session, which lowers its average context. The
+gap is measured over the session's whole history, so the first turn of the period still counts
+when the turn before it is older than `--since`.
+
 Crossing both sources: the **API** tells you *where the wall is* (official % + reset), the
 **logs** tell you *how you spent it* (which model/project drained it). Caveats: cost is
-an **estimate** (price table editable at the top of [`cmon.py`](cmon.py); cache write
-at 2×, TTL 1h), and logs cover **only Claude Code CLI** — usage on claude.ai web/desktop
-doesn't appear (but counts toward the official %).
+an **estimate** (prices below; cache write at 2×, TTL 1h), and logs cover **only Claude Code
+CLI** — usage on claude.ai web/desktop doesn't appear (but counts toward the official %).
+
+**Prices: `~/.cmon/prices.json`.** cmon ships prices for Fable, Opus, Sonnet and Haiku. The file,
+optional, replaces any of them and adds new ones, in US$ per million tokens, in the order input,
+output, cache read, cache write:
+
+```json
+{
+  "mythos": [20, 100, 2, 40],
+  "opus-4-1": [15, 75, 1.5, 30]
+}
+```
+
+Each key is matched, case-insensitively, as a substring of the model id in the transcripts
+(`claude-opus-4-1-20250805`), and the longest matching key wins whatever its place in the file, so
+`opus-4-1` takes precedence over the built-in `opus`. Built-in keys you don't list keep their price.
+An invalid file (not JSON, a value that isn't four numbers ≥ 0, the same key twice in different
+case) is ignored as a whole, with one warning, and the built-in prices apply. Edits take effect on
+the next run, and in a running `watch` on its next refresh.
+
+A model that matches no key costs US$ 0. `burn` then warns on stderr, naming the model and its
+tokens, because that zero also skews `--plan`: the percent the model used goes to whichever groups
+logged a cost in the same interval, or to *other*. `--json` reports the same thing as
+`unpriced_models`: a list at the top of the `--plan` object, and on each group that has such tokens
+in both forms. The warning and the top-level list also name a model found only in the rows that
+`--surface` or `--device` filtered out, since the split still prices those rows, as *rest*. cmon
+doesn't guess a price for a model it doesn't know.
 
 **The `<synthetic>` label** (usually `0%` in the model mix) is not a real model: Claude
 Code stamps `model: "<synthetic>"` on messages it generates *locally* instead of calling
@@ -420,18 +662,43 @@ run — so you can leave it open without tripping the block.
 
 ### Alerts
 
-`collect --alert` fires two kinds of alert to stderr (cron emails them) plus a best-effort
+`collect --alert` fires three kinds of alert to stderr (cron emails them) plus a best-effort
 native notification (macOS/Linux):
 
 - **rate-based** — at the current pace a window will hit **100% before reset** (also shown by
   `cmon now`);
 - **time-based** — a window is within its lead of resetting: the **5h window in ≤ `CMON_ALERT_LEAD`
   minutes** (default 60) and the **weekly window in ≤ `CMON_ALERT_LEAD_WEEKLY` minutes** (default
-  180). Each fires once per cycle (deduped on its own reset), as a desktop notification.
+  180). Each fires once per cycle (deduped on its own reset), as a desktop notification;
+- **threshold** — a window reached a percent you set in `alert_at`, off unless you set it:
 
-Set **`CMON_HOOK`** to run your own command on the time-based alert: cmon executes it via the
-shell with the message in `$CMON_ALERT_MSG` (best-effort — a broken hook never breaks
-collection). Pipe it into a bell, a webhook, `tmux display-message`, etc.
+  ```bash
+  cmon config set alert_at "5h=80,95 weekly=50,75,90"   # window=percent[,percent...], space-separated
+  ```
+
+  Windows are `session` (alias `5h`), `weekly_all` (aliases `weekly`, `week`) or any other key
+  the API reports, such as `weekly_scoped:Fable`, which `fable` also matches. Percents are whole
+  numbers from 1 to 100, and the value is checked on `set`. Each percent fires once per window
+  cycle. The check runs at each `collect --alert`, every 20 minutes with `cmon install`, so when
+  usage climbs fast one collect can find 80% and 95% both passed: only the highest notifies, and
+  the lower ones count as fired. For the same reason the 95% alert can arrive with the window
+  already at 100%.
+
+Set **`CMON_HOOK`** to run your own command on every alert, of all three kinds: cmon executes it via
+the shell when the alert fires, so once per window cycle and never on the deduplicated repeats
+(best-effort, with a 30s timeout: a broken hook never breaks collection). The alert reaches the
+command in environment variables, which are always set and empty when unknown:
+
+| Variable | Value |
+|---|---|
+| `CMON_ALERT_MSG` | The alert text, as shown on stderr |
+| `CMON_ALERT_KIND` | `rate` (pace hits 100% before reset), `lead` (reset is near) or `threshold` (an `alert_at` percent was reached) |
+| `CMON_ALERT_KEY` | The window: `session` (5h), `weekly_all`, or for rate and threshold alerts any other key the API reports, such as `weekly_scoped:Fable` |
+| `CMON_ALERT_PERCENT` | Percent of the window used, e.g. `87` or `87.5` |
+| `CMON_ALERT_RESETS_AT` | When the window resets, ISO 8601 in UTC, e.g. `2026-11-04T02:00:00+00:00` |
+
+The hook doesn't see cmon's `CLAUDE_OAUTH_TOKEN`. Pipe it into a bell, a webhook,
+`tmux display-message`, etc.
 
 ```cron
 */20 * * * * cd ~/cmon && /path/to/uv run cmon collect --alert
@@ -440,7 +707,25 @@ collection). Pipe it into a bell, a webhook, `tmux display-message`, etc.
 ```bash
 export CMON_ALERT_LEAD=30                                        # alert 30min before the 5h reset
 export CMON_ALERT_LEAD_WEEKLY=180                               # alert 3h before the weekly reset
-export CMON_HOOK='tmux display-message "cmon: $CMON_ALERT_MSG"'  # run on that alert
+export CMON_HOOK='tmux display-message "cmon: $CMON_ALERT_MSG"'  # run on every alert
+```
+
+A push to your phone through [ntfy.sh](https://ntfy.sh) (pick a topic name nobody will guess;
+anyone who knows it can read it):
+
+```bash
+export CMON_HOOK='curl -fsS -m 10 -H "Title: cmon $CMON_ALERT_KIND $CMON_ALERT_KEY" \
+  -d "$CMON_ALERT_MSG" https://ntfy.sh/my-cmon-topic-7f3k'
+```
+
+Any JSON webhook. It leaves out `CMON_ALERT_MSG`, which may hold quotes. `CMON_ALERT_KIND`,
+`CMON_ALERT_PERCENT` and `CMON_ALERT_RESETS_AT` never do, and neither does `CMON_ALERT_KEY` for
+`session` and `weekly_all`. A scoped key such as `weekly_scoped:Fable` ends in the model name
+exactly as the API reports it, so this recipe trusts that name to hold no quotes; build the JSON
+with a tool such as `jq` if you'd rather not:
+
+```bash
+export CMON_HOOK='curl -fsS -m 10 -H "Content-Type: application/json" -d "{\"kind\":\"$CMON_ALERT_KIND\",\"window\":\"$CMON_ALERT_KEY\",\"percent\":${CMON_ALERT_PERCENT:-null},\"resets_at\":\"$CMON_ALERT_RESETS_AT\"}" https://example.com/hooks/cmon'
 ```
 
 ### `cmon now` — current usage & pacing
@@ -454,9 +739,30 @@ Current usage:
   All models       ████████··········  41%    resets in 3d 22h
   Fable only       ████████··········  43%    resets in 3d 22h  ←active
 
+Today: 9 pp used of ~14 pp budget (profile-weighted), 5 pp left — week at 41%, resets in 3d 22h.
+
 5h window: 7% used — expires in 4h 25min.
 Rate: 2.1%/h → projection at reset: 16%.
 ```
+
+The **Today** line answers "how much can I spend today without running short before the weekly
+reset". The budget is what was left of the weekly limit at the start of your local day (the
+`timezone` setting), spread over the time until the reset, so the reset day counts only up to the
+reset. When the learned usage profile passes its coverage gate (the same one the projection uses)
+each day is weighted by your weekday multiplier and hourly shape and the line says
+*profile-weighted*; otherwise every hour counts the same and it says *equal split*. The budget is a
+share, not a forecast: it doesn't shrink as the day goes by, and using less today leaves more for
+the days after.
+
+Today's starting point comes from the snapshots either side of local midnight, interpolated when
+they're at most `CMON_PROFILE_PAIR_MAX_H` (1.5 h) apart, or taken as is when the percent didn't
+move between them. When they're further apart and the percent moved, as after a night with the
+laptop asleep, nothing says how much of that rise was today's, so the count starts at the first
+reading of the day (`Today since 08:10: …`) and the budget covers the rest of the day. A weekly
+cycle that began today counts from its reset, at 0%. A reset later today makes everything left
+today's budget (*all that's left*). With no reading today before the current one there's nothing
+to measure today's use against, and the line gives only the budget. A used-up limit says so, and
+there's no line without a weekly window. `--advice` keeps its own pacing view and doesn't print it.
 
 Add **`--advice`** for the full pacing view — the goal being to spend close to **100% of the
 weekly limit** by reset, without exhausting early and without hitting the **5h window** (which
@@ -540,6 +846,56 @@ parameters on that unseen slice, and unless there are at least 200 scoreable pre
 search over a few dozen points fits noise, not your routine. The result is four numbers stored as
 a single small JSON row in the database, next to the history they were fitted on.
 
+### `cmon doctor` — what's wrong and how to fix it
+
+```bash
+cmon doctor            # every check, and the fix for each problem
+cmon doctor --offline  # the same without its one API call
+cmon doctor --json     # for assistants and scripts
+```
+
+It works on any OS and after any kind of install, so `uv tool install` users get the checks that
+`make doctor` runs on a macOS clone. In order:
+
+| Check | Fails or warns when |
+|---|---|
+| `token source found` | No token in `CLAUDE_OAUTH_TOKEN`, the OS vault or Claude Code's login (fail), or Claude Code's access token has expired (warn). Same lookup as `cmon token status`; doctor names the source and never prints the token, not even masked |
+| `usage API reachable and logged in` | The one call to the usage endpoint fails; the fix depends on the cause (log in, network, update cmon). Nothing is saved |
+| `background collection scheduled` | Nothing where `cmon install` puts it: the LaunchAgent on macOS, the systemd timer or the crontab line on Linux, the Task Scheduler task on Windows (warn). It fails when the job points at a file that's gone, such as a deleted clone, and warns when it collects into another database; on Windows only when `schtasks` prints the task's command as UTF-8 or UTF-16 (otherwise the detail says the command couldn't be read), since a path decoded with the wrong code page would look gone |
+| `database not locked` | Another process holds DuckDB's write lock for more than 2 s; the detail names its PID (warn) |
+| `database schema is current` | The schema is newer than this cmon reads, or the file isn't a usable database (fail); older, so the next write migrates it (warn) |
+| `last snapshot is recent` | No snapshot yet, or the last one is over 60 minutes old (warn) |
+| `sync_dir reachable` | `sync_dir` is set and the folder is gone or read-only (fail). Skipped when unset |
+| `config.json is valid` | `~/.cmon/config.json` isn't JSON, or holds a value `cmon config set` would refuse (fail), or keys cmon doesn't know (warn). cmon itself reads a broken file as empty, in silence |
+| `bar.json is valid` | `~/.cmon/bar.json` isn't JSON or has a value of the wrong type for cmon Bar, a number past what a Double holds (`1e400`) included, which then ignores the whole file (fail). `null` and unknown keys are fine, as in the app |
+
+```text
+  ok    token source found (Claude Code credentials, expires in 5h 12m)
+  ok    usage API reachable and logged in (Current session 12%, All models 40%)
+  warn  background collection scheduled
+        not scheduled
+        -> cmon install
+  ok    database not locked (free)
+  ok    database schema is current (v2)
+  warn  last snapshot is recent
+        3h 5m ago
+        -> cmon collect (prints the error, if any)
+  skip  sync_dir reachable (not set)
+  ok    config.json is valid (2 preference(s))
+  ok    bar.json is valid (not present; cmon Bar writes the defaults on first run)
+
+No problems, 2 warning(s).
+```
+
+It exits 1 when any check fails and 0 otherwise: a warning is worth knowing about but doesn't stop
+cmon from working. The database is opened read-only, so doctor never creates, migrates or writes
+it, and it doesn't touch the status cache either. `--json` prints
+`{"version": 1, "ok": …, "checks": [{"key", "name", "status", "detail", "fix"}, …]}`, with
+`status` one of `ok`, `warn`, `fail`, `skip`, `fix` `null` when there's nothing to do, and these
+keys in this order: `token`, `api`, `schedule`, `lock`, `schema`, `snapshot`, `sync_dir`,
+`config`, `bar`. `make doctor` checks cmon Bar (installed, starts at login, running), then runs
+`cmon doctor` and counts its failures as its own.
+
 ## Continuous collection
 
 `plot`/`trends`/alerts become useful with history. Every command that queries the
@@ -595,10 +951,11 @@ CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs ruff + CLI smok
 on Python 3.11–3.13. PRs welcome: keep `ruff` green and the file style lean. Useful
 environment variables: `CMON_DB` (database path), `CMON_RETRIES`, `CMON_DEDUP_SECS`,
 `CMON_ALERT_LEAD` / `CMON_ALERT_LEAD_WEEKLY` (minutes before the 5h / weekly reset to alert),
-`CMON_HOOK` (command run on that alert),
+`CMON_HOOK` (command run on every alert; see [Alerts](#alerts)),
 `CMON_OAUTH_CLIENT_ID` / `CMON_OAUTH_TOKEN_URL` (OAuth refresh overrides; URL allowlisted to
 `*.anthropic.com`), `CMON_ALLOW_PLAINTEXT_KEYRING` (permit saving to a cleartext keyring backend),
-`CMON_TZ` (display timezone override; see [Config](#config)).
+`CMON_TZ` (display timezone override; see [Config](#config)). A number variable that doesn't parse
+stops every command with one line naming it, and makes `cmon guard` exit 3.
 
 ## Warning
 

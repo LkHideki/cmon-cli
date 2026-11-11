@@ -105,6 +105,40 @@ topTitle.segments = ["{wk_pct}", "{5h_top_client}", "{top_client}"]
 check(renderTitle(topTitle, split, now: now) == "80%  VS Code 60%", "top client placeholder, blank one hidden")
 check(snapshot(session: 2, resetIn: 150 * m).window("weekly_all")?.byClient == nil, "older JSON still decodes")
 
+// Projection: optional fields from `cmon collect`, drive {5h_proj} {wk_proj} {5h_eta} and the menu line.
+func projected(session: String, weekly: String) -> Snapshot {
+    let json = """
+    {"version":1,"offline":false,"observed_at":"\(iso(-12))","age_s":12,"providers":{"claude":{"windows":[
+    {"key":"session","label":"Current session","percent":50,"resets_at":"\(iso(4 * 3600))","active":true\(session)},
+    {"key":"weekly_all","label":"All models","percent":30,"resets_at":"\(iso(50 * 3600))","active":true\(weekly)}]}}}
+    """
+    return try! JSONDecoder().decode(Snapshot.self, from: Data(json.utf8))
+}
+let over = projected(
+    session: #","projected_percent":130.4,"exhausts_at":"\#(iso(80 * m + 30))","projection_at":"\#(iso(-30))""#,
+    weekly: #","projected_percent":79.6,"exhausts_at":null,"projection_at":"\#(iso(-30))""#)
+var projTitle = Settings()
+projTitle.segments = ["{5h_pct} →{5h_proj} {5h_eta}", "{wk_proj}"]
+check(renderTitle(projTitle, over, now: now) == "50% →130% 80m  80%", "projection placeholders")
+check(over.window("weekly_all")?.exhaustsAt == nil && exhaustsIn(over.window("weekly_all"), now: now) == nil,
+      "null exhausts_at decodes, no eta")
+check(projectionDetail(over.window("session")!, now: now) == "Projected 130% · 100% in 1h 20m",
+      "menu line past 100%")
+check(projectionDetail(over.window("weekly_all")!, now: now) == "Projected 80% at reset", "menu line under 100%")
+check(projectionDetail(over.window("session")!, now: now.addingTimeInterval(10 * m))
+      == "Projected 130% · 100% in 1h 10m · 10 min ago", "menu line says how old the projection is")
+check(projectionDetail(over.window("session")!, now: now.addingTimeInterval(2 * 3600))
+      == "Projected 130% at reset · 2h 0m ago", "a lapsed exhaustion time is dropped")
+check(exhaustsIn(over.window("session"), now: now.addingTimeInterval(81 * m)) == nil, "eta in the past is blank")
+let none = snapshot(session: 50, resetIn: 4 * 3600)
+check(none.window("session")?.projectedPercent == nil && projectionDetail(none.window("session")!, now: now) == nil,
+      "older JSON decodes without a projection, no menu line")
+check(renderTitle(projTitle, none, now: now) == "50% →   ", "unknown projection is blank")
+projTitle.hideEmpty = true
+check(renderTitle(projTitle, none, now: now) == "50%", "blank projection words hidden")
+let inconsistent = projected(session: #","projected_percent":95,"exhausts_at":"\#(iso(3600))""#, weekly: "")
+check(renderTitle(projTitle, inconsistent, now: now) == "50% →95%", "no eta while the projection is under 100%")
+
 if failures > 0 {
     print("\(failures) failed")
     exit(1)

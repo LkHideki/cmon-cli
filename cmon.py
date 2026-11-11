@@ -99,10 +99,27 @@ SERVICE, ACCOUNT = "cmon", "claude-oauth"  # entry in the OS secure vault (manua
 # Legacy (<= 0.5): a refresh chain cmon derived from Claude Code's refresh_token. Never used
 # now; purged from the vault once (see _purge_legacy_chain).
 LEGACY_AUTO_ACCOUNT = "claude-oauth-auto"
-RETRIES = int(os.environ.get("CMON_RETRIES", "3"))
-DEDUP_SECS = int(os.environ.get("CMON_DEDUP_SECS", "60"))  # window to deduplicate collect
-ALERT_LEAD_MIN = int(os.environ.get("CMON_ALERT_LEAD", "60"))  # minutes-before-reset to alert (5h window)
-ALERT_LEAD_WEEKLY_MIN = int(os.environ.get("CMON_ALERT_LEAD_WEEKLY", "180"))  # same, for the weekly window
+_ENV_ERRORS: list[str] = []  # invalid CMON_* numbers, which main() reports before any command runs
+
+
+def _env_number(name: str, default, kind=int):
+    """The number in env var NAME, or DEFAULT when it's unset. An invalid value is recorded in
+    _ENV_ERRORS, not raised: raised here, at import, it was a traceback before main() could say
+    anything, and its exit 1 is what 'guard' means by "at or above --max"."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return kind(raw)
+    except ValueError:
+        _ENV_ERRORS.append(f"{name}={raw!r} is not {'a whole number' if kind is int else 'a number'}")
+        return default
+
+
+RETRIES = _env_number("CMON_RETRIES", 3)
+DEDUP_SECS = _env_number("CMON_DEDUP_SECS", 60)  # window to deduplicate collect
+ALERT_LEAD_MIN = _env_number("CMON_ALERT_LEAD", 60)  # minutes-before-reset to alert (5h window)
+ALERT_LEAD_WEEKLY_MIN = _env_number("CMON_ALERT_LEAD_WEEKLY", 180)  # same, for the weekly window
 # Per-window lead (minutes-before-reset) for the time-based alert. Extend here to cover more windows.
 LEAD_MIN_BY_KEY = {"session": ALERT_LEAD_MIN, "weekly_all": ALERT_LEAD_WEEKLY_MIN}
 LEAD_LABEL_BY_KEY = {"session": "5h window", "weekly_all": "Weekly limit"}
@@ -111,12 +128,12 @@ MAX_JSONL_LINE = 4 << 20  # 4 MiB: skip parsing absurdly large transcript lines 
 # histogram: a wide gap can't say when inside it the usage happened, and spreading it evenly
 # invents consumption at 4am. Recency decays instead of being truncated so the shape drifts
 # with your routine rather than jumping when a day leaves a fixed window.
-PROFILE_PAIR_MAX_H = float(os.environ.get("CMON_PROFILE_PAIR_MAX_H", "1.5"))  # gap above this = ignorance
-PROFILE_HALFLIFE_D = float(os.environ.get("CMON_PROFILE_HALFLIFE_D", "10"))   # weight half-life
-PROFILE_MAX_AGE_D = float(os.environ.get("CMON_PROFILE_MAX_AGE_D", "42"))     # hard cutoff (~2 half-lives+)
-PROFILE_MIN_HOURS = float(os.environ.get("CMON_PROFILE_MIN_HOURS", "24"))     # dense coverage needed
-PROFILE_MIN_DAYS = int(os.environ.get("CMON_PROFILE_MIN_DAYS", "3"))          # days of token_log needed
-PROFILE_MIN_BUCKETS = int(os.environ.get("CMON_PROFILE_MIN_BUCKETS", "8"))    # distinct hours needed
+PROFILE_PAIR_MAX_H = _env_number("CMON_PROFILE_PAIR_MAX_H", 1.5, float)   # gap above this = ignorance
+PROFILE_HALFLIFE_D = _env_number("CMON_PROFILE_HALFLIFE_D", 10.0, float)  # weight half-life
+PROFILE_MAX_AGE_D = _env_number("CMON_PROFILE_MAX_AGE_D", 42.0, float)    # hard cutoff (~2 half-lives+)
+PROFILE_MIN_HOURS = _env_number("CMON_PROFILE_MIN_HOURS", 24.0, float)    # dense coverage needed
+PROFILE_MIN_DAYS = _env_number("CMON_PROFILE_MIN_DAYS", 3)                # days of token_log needed
+PROFILE_MIN_BUCKETS = _env_number("CMON_PROFILE_MIN_BUCKETS", 8)          # distinct hours needed
 PROFILE_MIN_BUCKET_H = 0.5   # below this an hour bucket is "unobserved" (one noisy sample)
 PROFILE_PSEUDO_H = 1.0       # shrinkage strength toward the local prior, in observed-hour units
 PROFILE_FLOOR = 0.02         # no hour is ever exactly 0 intensity (kills divide-by-zero anchors)
@@ -124,10 +141,10 @@ PROFILE_ACTIVE_FRAC = 0.05   # a day-hour is "active" above this fraction of the
 QUIET_MULT = 0.05            # intensity multiplier inside declared quiet hours
 # Forecast logging (see _log_forecasts / backtest): predictions are stored so they can be
 # scored against reality later. Kept cheap — one write per interval, pruned by age.
-FORECAST_EVERY_S = int(os.environ.get("CMON_FORECAST_EVERY_S", "900"))  # dedup between writes
+FORECAST_EVERY_S = _env_number("CMON_FORECAST_EVERY_S", 900)  # dedup between writes
 FORECAST_HORIZONS = (1.0, 3.0, 6.0)  # fixed horizons, plus each window's own time-to-reset
-FORECAST_MATCH_MIN = int(os.environ.get("CMON_FORECAST_MATCH_MIN", "20"))  # snapshot match window
-FORECAST_KEEP_D = int(os.environ.get("CMON_FORECAST_KEEP_D", "60"))  # retention
+FORECAST_MATCH_MIN = _env_number("CMON_FORECAST_MATCH_MIN", 20)  # snapshot match window
+FORECAST_KEEP_D = _env_number("CMON_FORECAST_KEEP_D", 60)  # retention
 # Tunable model parameters, with the values used until 'cmon tune' has evidence to change them.
 # Persisted as one small JSON row in `meta` (a few hundred bytes) rather than a new table or
 # file: they are three numbers, and they belong next to the history they were fitted on.
@@ -142,7 +159,7 @@ PARAM_GRID = {"halflife_d": [5.0, 10.0, 21.0], "harmonics": [0.0, 2.0, 3.0],
               "blend": [0.0, 0.5, 1.0], "robust": [0.0, 0.5, 1.0]}
 TUNE_STEP = 24  # subsample the history when tuning: 27 candidates x a full replay is minutes
 TUNE_MIN_GAIN = 0.05  # MAE points a candidate must win by before it's worth persisting
-PARAM_MIN_SCORED = int(os.environ.get("CMON_TUNE_MIN_SCORED", "200"))  # per-band evidence needed
+PARAM_MIN_SCORED = _env_number("CMON_TUNE_MIN_SCORED", 200)  # per-band evidence needed
 # How each projection source is described to the user, keyed by _project()'s third return value.
 PROJ_NOTE = {"learned": " (weighted by your usage profile)",
              "quiet_hours": " (skipping your quiet hours)"}
@@ -546,15 +563,23 @@ def token_clear(_):
 # --- Config: persisted user preferences (~/.cmon/config.json) ---
 CONFIG = os.path.expanduser("~/.cmon/config.json")
 # allowlist; extend here as new preferences are added
-CONFIG_KEYS = {"timezone", "quiet_hours", "keepalive", "sync_dir", "device_name"}
+CONFIG_KEYS = {"timezone", "quiet_hours", "keepalive", "sync_dir", "device_name", "alert_at"}
+
+
+def _tz_errors() -> tuple:
+    """What ZoneInfo raises for a name it can't load. Before Python 3.13 a tzdata folder such as
+    'America' raises IsADirectoryError and a name past the OS's limit OSError, not
+    ZoneInfoNotFoundError; an absolute or '..' path raises ValueError on every version."""
+    from zoneinfo import ZoneInfoNotFoundError
+    return ZoneInfoNotFoundError, OSError, ValueError
 
 
 def _validate_timezone(value: str) -> str:
     """Raise ValueError with a user-facing message if `value` isn't a valid IANA tz name."""
-    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    from zoneinfo import ZoneInfo
     try:
         ZoneInfo(value)
-    except ZoneInfoNotFoundError as e:
+    except _tz_errors() as e:
         raise ValueError(
             f"Unknown timezone {value!r}. Use an IANA name, e.g. 'America/Sao_Paulo', 'UTC'.") from e
     return value
@@ -628,9 +653,53 @@ def _validate_device_name(value: str) -> str:
     return name
 
 
+def _parse_alert_at(value) -> dict[str, tuple[int, ...]]:
+    """'session=80,95 weekly_all=50,75,90' -> {'session': (80, 95), 'weekly_all': (50, 75, 90)},
+    or ValueError saying what's wrong. Window names go through PLAN_ALIASES (5h, weekly); any other
+    name is kept as typed, since the API may add windows (weekly_scoped:Fable, or just fable)."""
+    usage = ("Use window=percent[,percent...] pairs separated by spaces, e.g. "
+             "'session=80,95 weekly_all=50,75,90' (5h and weekly work as aliases).")
+    if not isinstance(value, str) or not value.split():
+        raise ValueError(f"Invalid alert_at {value!r}. {usage}")
+    out: dict[str, tuple[int, ...]] = {}
+    for part in value.split():
+        name, sep, nums = part.partition("=")
+        if not sep or not name or not all(c.isalnum() or c in "_.:-" for c in name):
+            raise ValueError(f"Invalid alert_at {value!r}: {part!r} is not window=percent. {usage}")
+        try:
+            pcts = {int(n) for n in nums.split(",")}
+        except ValueError:
+            raise ValueError(f"Invalid alert_at {value!r}: {part!r} needs whole percents. {usage}") from None
+        if not all(1 <= p <= 100 for p in pcts):
+            raise ValueError(f"Invalid alert_at {value!r}: {part!r} has a percent outside 1-100. {usage}")
+        window = PLAN_ALIASES.get(name.lower(), name)
+        if window.lower() in {w.lower() for w in out}:
+            raise ValueError(f"Invalid alert_at {value!r}: window {window!r} appears twice. {usage}")
+        out[window] = tuple(sorted(pcts))
+    return out
+
+
+def _validate_alert_at(value: str) -> str:
+    """Normalize an alert_at spec (aliases resolved, percents sorted and deduped) or raise."""
+    return " ".join(f"{w}={','.join(map(str, ps))}" for w, ps in _parse_alert_at(value).items())
+
+
+def _alert_at() -> dict[str, tuple[int, ...]]:
+    """Configured percent thresholds per window, or {} when unset. A hand-edited invalid value is
+    ignored with a warning, so collection still runs and the other alerts still fire."""
+    raw = _read_config().get("alert_at")
+    if raw is None:
+        return {}
+    try:
+        return _parse_alert_at(raw)
+    except ValueError as e:
+        print(f"cmon: ignoring alert_at from config: {e}", file=sys.stderr)
+        return {}
+
+
 CONFIG_VALIDATORS = {"timezone": _validate_timezone, "quiet_hours": _validate_quiet_hours,
                      "keepalive": _validate_keepalive, "sync_dir": _validate_sync_dir,
-                     "device_name": _validate_device_name}
+                     "device_name": _validate_device_name, "alert_at": _validate_alert_at}
 
 
 def _read_config() -> dict:
@@ -678,14 +747,14 @@ def _resolve_tz():
     """Effective ZoneInfo for display, in precedence order: CMON_TZ env (quick override,
     doesn't persist) -> ~/.cmon/config.json {"timezone": ...} -> UTC. An invalid value at
     either source is skipped with a stderr warning, falling through."""
-    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    from zoneinfo import ZoneInfo
     for source, name in (("env CMON_TZ", os.environ.get("CMON_TZ")),
                          ("config", _read_config().get("timezone"))):
         if not name:
             continue
         try:
             return ZoneInfo(name)
-        except ZoneInfoNotFoundError:
+        except _tz_errors():
             print(f"cmon: ignoring invalid timezone {name!r} from {source} "
                  "(run 'cmon config set timezone <IANA name>').", file=sys.stderr)
     return ZoneInfo("UTC")
@@ -753,6 +822,17 @@ def _retry_after(r) -> float | None:
         return None
 
 
+def _without_token(text: str, tok: str | None) -> str:
+    """TEXT with the token and any Bearer value taken out. requests quotes the whole Authorization
+    header in some errors (a token ending in CR or LF fails its header check, with the value's repr
+    in the message), and that text reaches the terminal and the report doctor prints for assistants."""
+    import re
+    if tok:
+        for form in sorted({tok, tok.strip(), repr(tok)[1:-1]} - {""}, key=len, reverse=True):
+            text = text.replace(form, "<token>")
+    return re.sub(r"(Bearer\s+)[^\s'\"]+", r"\1<token>", text)
+
+
 def fetch(retries: int = RETRIES, timeout: float = 30) -> dict:
     """Query usage endpoint with retry/backoff. Raises FetchError with user-readable message —
     401/403 fail immediately (no point retrying); 429 and 5xx and network errors retry
@@ -789,7 +869,7 @@ def fetch(retries: int = RETRIES, timeout: float = 30) -> dict:
                 r.raise_for_status()
                 return r.json()
         except requests.RequestException as e:
-            last, wait = f"network: {e}", 2 ** attempt
+            last, wait = f"network: {_without_token(str(e), tok)}", 2 ** attempt
         attempt += 1
         if attempt < retries:
             time.sleep(wait)
@@ -1252,6 +1332,12 @@ def now(args):
         _advice(rows, _read_db(), no_ai=getattr(args, "no_ai", False))
         return
 
+    con = None
+    if any(r[0] == "weekly_all" and r[3] for r in rows):  # daily budget of the weekly limit
+        con = _read_db()
+        if line := _day_budget_line(con, rows, _ts, _resolve_tz()):
+            print(f"\n{line}")
+
     sess = next((r for r in rows if r[0] == "session"), None)
     if not sess:
         return
@@ -1260,9 +1346,11 @@ def now(args):
 
     if not reset:
         return
-    con = _read_db()  # lazy: only import/open DuckDB once we know the projection is needed (F10)
+    if con is None:
+        con = _read_db()  # lazy: only import/open DuckDB once we know the projection is needed (F10)
     if con is None:
         return
+    _refresh_projection(con, rows, _ts, quiet=True)  # status --json and cmon Bar read it
     end = datetime.fromisoformat(reset)
     rate = _rate(con, "session")  # unified EWMA rate: same source as watch/advice/alerts
     if rate is None:
@@ -1376,9 +1464,12 @@ def collect(args):
         print(f"  {lbl:16} {pct:4.0f}%  reset {reset[:16] if reset else '-'}")
     _collect_sync(con)
     _refresh_client_share(con, rows, ts)
+    _refresh_session_cost(con, rows, ts)
+    _refresh_projection(con, rows, ts)
     if getattr(args, "alert", False):
         _fire_rate_alerts(rows, con)  # rate-based: at current pace hits 100% before reset
-        _fire_lead_alert(rows)  # time-based: 5h window resets in <= CMON_ALERT_LEAD min (+ hook)
+        _fire_lead_alert(rows)  # time-based: 5h window resets in <= CMON_ALERT_LEAD min
+        _fire_threshold_alerts(rows)  # percent-based: a window reached one of config alert_at
 
 
 def _collect_sync(con) -> None:
@@ -2047,6 +2138,141 @@ def _project(con, pct, rate, rem_h, now_utc, tz, key=None, replay=False) -> tupl
     return pct + acc, eta, src
 
 
+def _day_budget(base_pct: float, base_at: datetime, reset_at: datetime, tz, intensity=None) -> float:
+    """Points of the weekly limit the local day of base_at may spend: what was left at base_at
+    (100 - base_pct), split over the time from base_at to reset_at, summed over the slices that
+    still fall on that local day. intensity(local datetime) weighs each slice (the learned
+    profile: hour shape × weekday multiplier); without it every hour counts the same, so the day
+    of the reset counts only up to the reset and a day already under way only from base_at.
+    Slices are cut at local midnight and measured in UTC, so a 23h or 25h DST day keeps its real
+    length. Pure: no clock, no database."""
+    remaining = max(100.0 - base_pct, 0.0)
+    start, end = base_at.astimezone(UTC), reset_at.astimezone(UTC)
+    if end <= start or remaining <= 0:
+        return remaining
+    local = start.astimezone(tz)
+    midnight = (local.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).astimezone(UTC)
+    today = total = 0.0
+    t = start
+    while t < end:  # 15-min slices: a week is ~700 of them
+        nxt = min(t + timedelta(minutes=15), end)
+        if t < midnight < nxt:
+            nxt = midnight
+        w = (nxt - t).total_seconds()
+        if intensity is not None:
+            w *= intensity((t + (nxt - t) / 2).astimezone(tz))
+        total += w
+        if nxt <= midnight:
+            today += w
+        t = nxt
+    if total <= 0:  # a profile that is zero everywhere can't split anything: fall back to hours
+        return _day_budget(base_pct, base_at, reset_at, tz)
+    return remaining * today / total
+
+
+def _day_baseline(readings, day_start, cycle_start, now_utc, pct_now, max_gap_h=None):
+    """(at, percent, kind): the reading today's use of the weekly limit is counted from.
+    readings are this cycle's (observed_at UTC, percent) before now; the cycle stood at 0 at
+    cycle_start (None when unknown) and pct_now is the live value. kind is
+      'day'   — local midnight, interpolated between the readings either side of it (exact
+                when the percent didn't move between them);
+      'reset' — the cycle began today, at 0;
+      'first' — the readings around midnight are more than max_gap_h apart and the percent
+                moved, so nothing says how much of that rise was today's: count from the first
+                reading today instead (same reasoning as PROFILE_PAIR_MAX_H);
+      'none'  — no reading today before the live one, so today's use can't be measured."""
+    gap_s = (PROFILE_PAIR_MAX_H if max_gap_h is None else max_gap_h) * 3600
+    if cycle_start is not None and cycle_start >= day_start:
+        return cycle_start, 0.0, "reset"
+    pts = sorted(((t, p) for t, p in readings
+                  if t < now_utc and (cycle_start is None or t >= cycle_start)), key=lambda x: x[0])
+    pts = ([(cycle_start, 0.0)] if cycle_start is not None else []) + pts + [(now_utc, pct_now)]
+    before = [x for x in pts if x[0] <= day_start]
+    after = [x for x in pts if x[0] > day_start]
+    if not after:  # now is exactly local midnight
+        return day_start, pct_now, "day"
+    t1, p1 = after[0]
+    later = "none" if t1 >= now_utc else "first"
+    if not before:
+        return t1, p1, later
+    t0, p0 = before[-1]
+    if p1 <= p0:
+        return day_start, p1, "day"
+    if (t1 - t0).total_seconds() <= gap_s:
+        return day_start, p0 + (p1 - p0) * ((day_start - t0) / (t1 - t0)), "day"
+    return t1, p1, later
+
+
+def _fmt_until(td: timedelta) -> str:
+    """'3d 22h', '5h 10m' or '40m'."""
+    mins = max(int(td.total_seconds() // 60), 0)
+    d, rem = divmod(mins, 1440)
+    h, m = divmod(rem, 60)
+    return f"{d}d {h}h" if d else (f"{h}h {m}m" if h else f"{m}m")
+
+
+def _day_budget_line(con, rows, now_utc, tz) -> str | None:
+    """The 'Today: …' line of cmon now: points of the weekly limit used today against today's
+    share of what was left at the start of the day, or None without a weekly window that has a
+    reset ahead. con may be None (no or busy database): the line then has no reading to count
+    from and gives only the budget."""
+    row = next((r for r in rows if r[0] == "weekly_all"), None)
+    if row is None or not row[3]:
+        return None
+    pct = float(row[2])
+    reset_at = datetime.fromisoformat(row[3]).astimezone(UTC)
+    if reset_at <= now_utc:
+        return None
+    eta = _fmt_until(reset_at - now_utc)
+    if pct >= 100:
+        return f"Today: weekly limit used up — resets in {eta}."
+    local = now_utc.astimezone(tz)
+    midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_start = midnight.astimezone(UTC)
+    day_end = (midnight + timedelta(days=1)).astimezone(UTC)
+    cycle_start = reset_at - timedelta(minutes=10080)  # same cycle start as _plan_share
+    if cycle_start > now_utc:  # a reset more than a week out: the cycle's start is unknown
+        cycle_start = None
+    readings, prof = [], None
+    if con is not None:
+        try:
+            got = con.execute(
+                "SELECT observed_at, percent, resets_at FROM snapshots WHERE provider='claude' "
+                "AND key='weekly_all' AND observed_at < ? AND observed_at >= ? AND resets_at IS NOT NULL",
+                [now_utc, cycle_start or now_utc - timedelta(minutes=10080)]).fetchall()
+            # resets_at jitters by milliseconds between reads; a different value is another cycle
+            readings = [(t.astimezone(UTC), float(p)) for t, p, r in got
+                        if abs((r - reset_at).total_seconds()) <= CYCLE_JITTER_S]
+        except Exception:
+            readings = []
+    try:
+        prof = _hour_profile(con, tz)
+    except Exception:
+        prof = None
+    at, base, kind = _day_baseline(readings, day_start, cycle_start, now_utc, pct)
+    intensity = None
+    weighted = prof is not None and prof[3] == "learned"
+    if weighted:
+        hour_rate, dow = prof[0], prof[1]
+
+        def intensity(t_local):
+            return hour_rate[t_local.hour] * dow[t_local.weekday()]
+    budget = round(_day_budget(base, at, reset_at, tz, intensity))
+    if reset_at <= day_end:
+        note = " (all that's left)"
+    else:
+        note = PROJ_NOTE_SHORT["learned"] if weighted else " (equal split)"
+    tail = f"week at {pct:.0f}%, resets in {eta}."
+    if kind == "none":
+        return f"Today: ~{budget} pp budget for the rest of the day{note}, no earlier reading to measure use — {tail}"
+    lead = {"day": "Today", "reset": f"Today since the {at.astimezone(tz):%H:%M} reset",
+            "first": f"Today since {at.astimezone(tz):%H:%M}"}[kind]
+    used = round(max(pct - base, 0.0))
+    left = budget - used
+    state = f"{left} pp left" if left > 0 else (f"{-left} pp over" if left < 0 else "budget reached")
+    return f"{lead}: {used} pp used of ~{budget} pp budget{note}, {state} — {tail}"
+
+
 def _log_forecasts(con, rows, tz, now_utc=None) -> None:
     """Record what we predict right now so it can be scored later (see _reconcile_forecasts).
     Both the active model *and* the plain linear baseline are stored for each horizon, which
@@ -2358,16 +2584,30 @@ def _notify(title: str, body: str) -> None:
         pass
 
 
-def _run_hook(msg: str) -> None:
-    """Run the user's CMON_HOOK command on an alert (best-effort), with the alert text in the
-    CMON_ALERT_MSG env var. Shell command, so it can be anything. Never raises — a broken hook
-    must not break collection."""
+def _hook_env(msg: str, kind: str, key: str, percent=None, resets_at=None) -> dict:
+    """The alert as CMON_ALERT_* strings. Every variable is always set, empty when unknown, so
+    a hook under `set -u` doesn't die on a missing one. resets_at (ISO string or aware
+    datetime) is normalized to ISO UTC, so hooks never parse the API's own offsets."""
+    reset = ""
+    if resets_at:
+        dt = datetime.fromisoformat(resets_at) if isinstance(resets_at, str) else resets_at
+        reset = dt.astimezone(UTC).isoformat(timespec="seconds")
+    return {"CMON_ALERT_MSG": msg, "CMON_ALERT_KIND": kind, "CMON_ALERT_KEY": key,
+            "CMON_ALERT_PERCENT": "" if percent is None else f"{round(float(percent), 1):g}",
+            "CMON_ALERT_RESETS_AT": reset}
+
+
+def _run_hook(msg: str, *, kind: str, key: str, percent=None, resets_at=None) -> None:
+    """Run the user's CMON_HOOK command for an alert that fired (best-effort; callers dedup
+    first, so a hook never sees a repeat). The alert travels in the environment (_hook_env):
+    kind is the alert's family (lead, rate, threshold) and a new family only passes its own name. Shell
+    command, so it can be anything. Never raises — a broken hook must not break collection."""
     hook = os.environ.get("CMON_HOOK")
     if not hook:
         return
     try:
-        subprocess.run(hook, shell=True, timeout=30,
-                       env=_child_env(CMON_ALERT_MSG=msg), capture_output=True)
+        env = _child_env(**_hook_env(msg, kind, key, percent, resets_at))
+        subprocess.run(hook, shell=True, timeout=30, env=env, capture_output=True)
     except Exception:
         pass
 
@@ -2420,27 +2660,57 @@ def _fire_lead_alert(rows) -> None:
     native desktop notification + CMON_HOOK. Deduped per window on its own reset bucketed to the
     nearest minute — the API's resets_at jitters ~1s between calls, so an exact-string marker
     would re-fire every collect."""
+    pct = {r[0]: r[2] for r in rows}
     for key, reset, msg in _lead_alerts(rows):
         marker = round(reset.timestamp() / 60)  # nearest-minute bucket, robust to ~1s API jitter
         if _alert_fired(f"lead_{key}", marker):
             continue
         print(f"⚠ {msg}", file=sys.stderr)
         _notify(f"cmon — {LEAD_LABEL_BY_KEY.get(key, key)}", msg)
-        _run_hook(msg)
+        _run_hook(msg, kind="lead", key=key, percent=pct.get(key), resets_at=reset)
         _mark_alert(f"lead_{key}", marker)
 
 
 def _fire_rate_alerts(rows, con) -> None:
-    """Notify once per window cycle that the pace will exhaust it before reset. Without the
-    dedup, every scheduled collect (default 20 min) re-notified for as long as the projection
-    stayed above 100%. Same per-cycle marker as the lead alert (reset to the nearest minute)."""
+    """Notify once per window cycle that the pace will exhaust it before reset: desktop
+    notification + CMON_HOOK. Without the dedup, every scheduled collect (default 20 min)
+    re-notified for as long as the projection stayed above 100%. Same per-cycle marker as the
+    lead alert (reset to the nearest minute). stderr still gets every collect's warning."""
+    pct = {r[0]: r[2] for r in rows}
     for key, reset, msg in _rate_alerts(rows, con):
         marker = round(datetime.fromisoformat(reset).timestamp() / 60)
         print(f"⚠ {msg}", file=sys.stderr)
         if _alert_fired(f"rate_{key}", marker):
             continue
         _notify("cmon — Claude limit", msg)
+        _run_hook(msg, kind="rate", key=key, percent=pct.get(key), resets_at=reset)
         _mark_alert(f"rate_{key}", marker)
+
+
+def _fire_threshold_alerts(rows) -> None:
+    """Fire the config's alert_at percent thresholds: stderr + desktop notification + CMON_HOOK.
+    Each threshold fires once per window cycle, deduped like the lead alert on the reset rounded
+    to the minute. Collects are 20 min apart, so one can find 80 and 95 both newly crossed: only
+    the highest notifies, and the lower ones are marked with it so they don't fire next time."""
+    spec = _alert_at()
+    if not spec:
+        return
+    for key, lbl, pct, reset, _a in rows:
+        if not reset:
+            continue  # no cycle to dedup on; an idle window without a reset sits at 0% anyway
+        k = key.lower()
+        pcts = sorted({p for w, ps in spec.items() if w.lower() in (k, k.rsplit(":", 1)[-1]) for p in ps})
+        marker = round(datetime.fromisoformat(reset).timestamp() / 60)
+        new = [p for p in pcts if pct >= p and not _alert_fired(f"threshold_{key}_{p}", marker)]
+        if not new:
+            continue
+        name = LEAD_LABEL_BY_KEY.get(key, lbl)
+        msg = f"{name} reached {new[-1]}% (now {round(pct, 1):g}%), resets in ~{fmt_eta(reset)}."
+        print(f"⚠ {msg}", file=sys.stderr)
+        _notify(f"cmon — {name}", msg)
+        _run_hook(msg, kind="threshold", key=key, percent=pct, resets_at=reset)
+        for p in new:
+            _mark_alert(f"threshold_{key}_{p}", marker)
 
 
 def _ai_tip(summary: str) -> str | None:
@@ -2567,7 +2837,12 @@ def _cache_payload() -> dict:
     if not os.path.exists(CACHE):
         return {"version": CACHE_VERSION, "providers": {}}
     with open(CACHE, encoding="utf-8") as f:
-        data = json.load(f)
+        try:
+            data = json.load(f)
+        except RecursionError:  # nested past the parser's limit: as unreadable as broken JSON
+            raise ValueError("cache nested too deeply") from None
+    if not isinstance(data, dict):  # every reader calls .get on it
+        raise ValueError("cache is not a JSON object")
     if data.get("version") == CACHE_VERSION and isinstance(data.get("providers"), dict):
         return data
     if "ts" in data and isinstance(data.get("rows"), list):
@@ -2843,6 +3118,11 @@ def _status_json(got) -> dict:
         w = {"key": key, "label": label, "percent": percent, "resets_at": resets_at, "active": bool(active)}
         if resets_at and (split := _client_share_for(key, resets_at)):
             w["by_client"] = split  # optional, from the last 'collect'
+        proj = _projection_for(key, resets_at) if resets_at else None
+        # The reading shown contradicts a cached projection that predates it reaching 100%, or that
+        # it already passed: usage can't fall inside a cycle, so that pace is out of date.
+        if proj and not (_is_number(percent) and (percent >= 100 or proj["projected_percent"] < percent)):
+            w.update(proj)  # optional: projected_percent, exhausts_at, projection_at
         windows.append(w)
     return {"version": 1, "offline": False, "observed_at": observed.isoformat(),
             "age_s": round(age), "providers": {"claude": {"windows": windows}}}
@@ -2896,6 +3176,68 @@ def _client_share_for(key, resets_at):
         return None
 
 
+PROJ_CAP = 999.0  # what every other surface prints at most; early in a window the pace can say 2000%
+
+
+def _projection_cache() -> str:
+    return os.path.join(CMON_HOME, "projection.json")
+
+
+def _projections(con, rows, now_utc, tz) -> dict:
+    """Projection at reset and the moment of reaching 100%, per window, from the same rate and
+    model as 'now --advice' and watch. Left out where there is nothing to project: no reset ahead,
+    no measurable rate yet, or a window already at 100%."""
+    out = {}
+    for key, _lbl, pct, reset, _a in rows:
+        if not reset or pct >= 100:
+            continue
+        rem_h = (datetime.fromisoformat(reset) - now_utc).total_seconds() / 3600
+        rate = _rate(con, key) if rem_h > 0 else None
+        if not rate:
+            continue
+        proj, eta, _src = _project(con, pct, rate, rem_h, now_utc, tz, key)
+        if not math.isfinite(proj):
+            continue  # NaN would make the whole status --json invalid for strict decoders
+        out[key] = {"resets_at": reset, "projected_percent": round(min(proj, PROJ_CAP), 1),
+                    "exhausts_at": None if eta is None else (now_utc + timedelta(hours=eta)).isoformat()}
+    return out
+
+
+def _refresh_projection(con, rows, now_utc, tz=None, quiet=False) -> None:
+    """Cache each window's projection for 'status --json' and cmon Bar, the way
+    _refresh_client_share caches the split: status must stay a file read, and the rate needs
+    the database. Best-effort; quiet for callers that own the screen (watch) or print their own
+    projection (now)."""
+    try:
+        windows = _projections(con, rows, now_utc, tz or _resolve_tz())
+        _atomic_write_json(_projection_cache(),
+                           {"version": 1, "computed_at": now_utc.isoformat(), "windows": windows})
+    except Exception as e:
+        if not quiet:
+            print(f"cmon: projection skipped: {e}", file=sys.stderr)
+
+
+def _projection_for(key, resets_at):
+    """Cached projection of `key` as status --json fields, if it was computed for the same
+    cycle. Types are checked here: one bad value would fail the menu bar's whole decode."""
+    try:
+        with open(_projection_cache(), encoding="utf-8") as f:
+            data = json.load(f)
+        w = data["windows"][key]
+        if abs((datetime.fromisoformat(w["resets_at"]) - datetime.fromisoformat(resets_at)).total_seconds()) \
+                > CYCLE_JITTER_S:
+            return None  # a new cycle began since: the old pace says nothing about it
+        proj, eta, at = w["projected_percent"], w["exhausts_at"], data["computed_at"]
+        if isinstance(proj, bool) or not isinstance(proj, int | float) or not math.isfinite(proj):
+            return None
+        datetime.fromisoformat(at)
+        if eta is not None:
+            datetime.fromisoformat(eta)
+        return {"projected_percent": float(proj), "exhausts_at": eta, "projection_at": at}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+
+
 def status(args):
     """Single line for statusline/tmux/prompt (or --json for the menu bar/scripts). Reads
     the local cache by default (~sub-20ms, no network); --live forces API."""
@@ -2918,6 +3260,290 @@ def status(args):
     if age > 1800:  # stale data: signal without noise
         parts.append(f"{age / 60:.0f}m ago")
     print(" · ".join(parts))
+
+
+GUARD_STALE_MIN = 60  # default --stale-min: three missed 20-min collections
+GUARD_EXIT = {"under": 0, "over": 1}  # anything else (no_data, missing, stale, malformed) exits 3
+
+
+def _guard_number(hi: float | None = None):
+    """argparse type for guard's --max (0 < N <= 100) and --stale-min (N > 0). NaN fails both."""
+    def parse(value: str) -> float:
+        try:
+            n = float(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{value!r} is not a number") from None
+        if not n > 0 or (hi is not None and n > hi):
+            raise argparse.ArgumentTypeError(
+                f"{value!r} must be above 0" + (f" and at most {hi:g}" if hi is not None else ""))
+        return n
+    return parse
+
+
+def _guard_row(rows, name: str):
+    """The cached row for NAME: a key, an alias (5h, weekly) or a scoped model (fable for
+    weekly_scoped:Fable), case-insensitive, matched the way 'burn --plan' matches it."""
+    want = PLAN_ALIASES.get(name.lower(), name).lower()
+    return next((r for r in rows if want in (r[0].lower(), r[0].lower().rsplit(":", 1)[-1])), None)
+
+
+def guard(args):
+    """Exit code against a percent ceiling, for scripts and Claude Code hooks: 0 under --max, 1 at
+    or above it, 3 when there's nothing fresh to judge by. Unknown gets its own code or an empty
+    cache would pass for a free window, and it isn't 2, which argparse uses for a usage error.
+    Reads only the status cache, never the API or DuckDB: unlike 'status' it doesn't refresh a
+    cycle that already reset, so a hook never waits on the network or on a collect's write lock."""
+    out = {"window": PLAN_ALIASES.get(args.window.lower(), args.window), "percent": None,
+           "max": args.max, "resets_at": None, "age_s": None, "result": "no_data"}
+    try:
+        msg = _guard_verdict(args, out)
+    except Exception as e:  # Python's own exit code here would be 1, which says "at or above --max"
+        out |= {"percent": None, "resets_at": None, "result": "no_data"}
+        msg = f"couldn't read the cache ({_safe(e)})"
+    if args.json:
+        print(json.dumps(out))
+    if not args.quiet:
+        print(f"cmon guard: {msg}.", file=sys.stderr)
+    sys.exit(GUARD_EXIT.get(out["result"], 3))
+
+
+def _guard_verdict(args, out: dict) -> str:
+    """Fill OUT with guard's verdict from the status cache and return the one-line explanation."""
+    if _ENV_ERRORS:  # main() lets guard run anyway, so a bad variable reads as unknown, not as over
+        return "; ".join(_ENV_ERRORS)
+    got = _read_cache()
+    rows = [r for r in got[0] if len(r) >= 5 and isinstance(r[0], str)] if got else []
+    if not rows:
+        msg = "no cached usage; run 'cmon collect', or 'cmon install' to collect in the background"
+    else:
+        age = got[1]
+        out["age_s"] = round(age)
+        row = _guard_row(rows, args.window)
+        pct = row[2] if row else None
+        if row:
+            out["window"] = row[0]
+        label = (LEAD_LABEL_BY_KEY.get(row[0]) or _safe(row[1] or row[0])) if row else None
+        if age > args.stale_min * 60:
+            out["result"] = "stale"
+            msg = (f"cached usage is {age / 60:.0f} min old, over --stale-min {args.stale_min:g}; "
+                   "is 'cmon collect' running? ('cmon install' schedules it)")
+        elif row is None:
+            out["result"] = "missing"
+            known = ", ".join(_safe(r[0], 60) for r in rows)
+            msg = f"no window {args.window!r} in the cache (known: {known})"
+        elif not _finite(pct):  # NaN compared as "under", Infinity as "over", and neither is JSON
+            msg = f"the cached {label} has no usable percent"
+        else:
+            reset = row[3] if isinstance(row[3], str) and row[3] else None
+            try:
+                ended = reset is not None and datetime.fromisoformat(reset) <= datetime.now(UTC)
+            except (ValueError, TypeError):  # unreadable or without an offset: judge the percent alone
+                reset, ended = None, False
+            if ended:  # the cycle rolled over since the last read: nothing used in the new one yet
+                pct, reset = 0.0, None
+            out |= {"percent": float(pct), "resets_at": reset,
+                    "result": "over" if pct >= args.max else "under"}
+            verdict = "at or above" if out["result"] == "over" else "under"
+            if ended:
+                msg = f"{label} already reset; counting it as 0%, {verdict} --max {args.max:g}"
+            else:
+                msg = f"{label} at {pct:g}%, {verdict} --max {args.max:g}"
+                if reset:
+                    msg += f"; resets in {fmt_eta(reset)}"
+    return msg
+
+
+SESSIONS_KEEP = 300  # sessions in sessions.json: the most recently active of the weekly cycle
+STATUSLINE_STALE_S = 1800  # cache older than this: 'status' adds "Nm ago"; statusline prefers stdin
+STATUSLINE_STDIN_MAX = 1 << 20  # Claude Code's payload is a few KB; never buffer an unbounded pipe
+
+
+def _sessions_cache() -> str:
+    return os.path.join(CMON_HOME, "sessions.json")
+
+
+def _refresh_session_cost(con, rows, now_utc) -> None:
+    """Cache, per session_id, the cost of each recently active session and its points of each
+    window's current cycle, for 'statusline'. Claude Code runs that command on every redraw, so
+    it can't scan transcripts or wait on DuckDB's lock: like the client split, the numbers are
+    computed here and read from a file there. Cost covers the whole session (it may have begun
+    in an earlier cycle); points cover only the current cycle. Best-effort."""
+    try:
+        cycles = {}
+        for key, _lbl, _pct, reset, _a in rows:
+            if key in SHARE_WINDOWS and reset:
+                cycles[key] = (reset, datetime.fromisoformat(reset) - timedelta(minutes=SHARE_WINDOWS[key]))
+        if not cycles:
+            return
+        since = min(start for _r, start in cycles.values())
+        scan_logs(con, since=since, quiet=True)
+        sessions = {}
+        for sid, model, i, o, r, c, last in con.execute(
+                "SELECT session_id, model, sum(input_tokens), sum(output_tokens), sum(cache_read_tokens), "
+                "sum(cache_write_tokens), max(observed_at) FROM token_terminal WHERE session_id IN "
+                "(SELECT session_id FROM token_terminal WHERE observed_at >= ?) GROUP BY ALL",
+                [since]).fetchall():
+            if sid == "?":  # transcript lines without a sessionId: no statusline can ask for them
+                continue
+            s = sessions.setdefault(sid, {"cost": 0.0, "last": last, "pp": {}})
+            s["cost"] += _cost(model, i, o, r, c)
+            s["last"] = max(s["last"], last)
+        for key, (_reset, start) in cycles.items():
+            got = _plan_share(con, key, since=start, col="session_id")
+            for sid, v in (got["groups"] if got else {}).items():
+                if sid in sessions and v > 0:
+                    sessions[sid]["pp"][key] = round(v, 2)
+        recent = sorted(sessions.items(), key=lambda kv: kv[1]["last"], reverse=True)[:SESSIONS_KEEP]
+        _atomic_write_json(_sessions_cache(), {
+            "version": 1, "computed_at": now_utc.isoformat(),
+            "windows": {key: {"resets_at": reset} for key, (reset, _s) in cycles.items()},
+            "sessions": {sid: {"cost_usd": round(s["cost"], 4), "pp": s["pp"], "last_at": s["last"].isoformat()}
+                         for sid, s in recent}})
+    except Exception as e:
+        print(f"cmon: session cost skipped: {e}", file=sys.stderr)
+
+
+def _finite(value) -> bool:
+    """A number a float can hold: not a bool, NaN, an infinity or an int past float range."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:  # an int too large for a float, such as a 400-digit JSON literal
+        return False
+
+
+def _statusline_input() -> dict:
+    """Claude Code's statusLine JSON from stdin, or {} when there's none (a terminal, an empty or
+    closed pipe) or it isn't a JSON object: then only the plan part prints.
+    Format checked on 2026-11-11 against https://code.claude.com/docs/en/statusline: an object
+    with `session_id`, `cost.total_cost_usd` (Claude Code's own list-price estimate, reset by
+    /clear along with the session id) and, for Pro/Max subscribers after the session's first API
+    response only, `rate_limits.five_hour` / `rate_limits.seven_day`, each optional, with
+    `used_percentage` (0-100) and `resets_at` (Unix epoch seconds). Every field is treated as
+    optional and type-checked where it's read."""
+    try:
+        stdin = sys.stdin
+        if stdin is None or stdin.isatty():
+            return {}  # run by hand: don't wait for input that won't come
+        raw = stdin.buffer.read(STATUSLINE_STDIN_MAX) if hasattr(stdin, "buffer") else stdin.read(STATUSLINE_STDIN_MAX)
+        data = json.loads(raw) if raw.strip() else {}
+    except (OSError, ValueError, TypeError, AttributeError, RecursionError):  # deep nesting overflows the parser
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _stdin_windows(data: dict, now_utc) -> dict:
+    """Rows by key from the stdin's rate_limits (five_hour -> session, seven_day -> weekly_all),
+    the same tuples the status cache holds. A window without a usable percent, or whose reset
+    already passed, is left out."""
+    limits_in = data.get("rate_limits")
+    if not isinstance(limits_in, dict):
+        return {}
+    out = {}
+    for name, key in (("five_hour", "session"), ("seven_day", "weekly_all")):
+        w = limits_in.get(name)
+        if not isinstance(w, dict) or not _finite(pct := w.get("used_percentage")):
+            continue
+        reset = None
+        if _finite(at := w.get("resets_at")):
+            try:
+                when = datetime.fromtimestamp(at, UTC)
+            except (OverflowError, OSError, ValueError):
+                continue
+            if when <= now_utc:
+                continue
+            reset = when.isoformat()
+        out[key] = (key, LABELS.get(key, key), float(pct), reset, True)
+    return out
+
+
+def _reset_time(value):
+    """A row's resets_at as an aware datetime, or None when absent or unparseable."""
+    try:
+        when = datetime.fromisoformat(value) if isinstance(value, str) and value else None
+    except ValueError:
+        return None
+    return when if when is not None and when.tzinfo is not None else None
+
+
+def _session_usage(sid: str, windows: dict) -> tuple[float | None, dict]:
+    """(cost_usd, {window key: pp}) of session `sid` from the last collect's sessions.json, or
+    (None, {}). Points are kept only for a window whose shown cycle is the one they were
+    computed for: after a reset the old cycle's points would be read as this one's."""
+    try:
+        with open(_sessions_cache(), encoding="utf-8") as f:
+            data = json.load(f)
+        s = data["sessions"][sid]
+        cost = s.get("cost_usd")
+        pp = {}
+        for key, value in s.get("pp", {}).items():
+            shown = _reset_time(windows[key][3]) if key in windows else None
+            computed = _reset_time(data["windows"].get(key, {}).get("resets_at"))
+            if shown and computed and _finite(value) and value >= 0 \
+                    and abs((shown - computed).total_seconds()) <= CYCLE_JITTER_S:
+                pp[key] = float(value)
+        return (float(cost) if _finite(cost) and cost >= 0 else None), pp
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError):
+        return None, {}
+
+
+def _statusline_text(data: dict, now_utc) -> str:
+    got = _read_cache()
+    age = got[1] if got else None
+    fresh = age is not None and age <= STATUSLINE_STALE_S
+    cached = {r[0]: r for r in got[0] if len(r) >= 5 and isinstance(r[0], str) and _finite(r[2])} if got else {}
+    live = _stdin_windows(data, now_utc)
+    windows, from_cache = {}, False
+    for key in ("session", "weekly_all"):
+        row = cached.get(key)
+        reset = _reset_time(row[3]) if row else None
+        ended = reset is not None and reset <= now_utc
+        # A row with no reset time is parked (the window rolled over, see _window_parked): a
+        # stdin window with a reset ahead is running now, so it's the newer of the two.
+        parked = row is not None and reset is None and key in live and live[key][3] is not None
+        if key in live and (row is None or ended or parked or not fresh):
+            windows[key] = live[key]  # fresher than a missing, stale or rolled-over cache row
+        elif row is not None:
+            # A cycle that already reset counts as 0%, as in 'guard': nothing used in the new one yet.
+            windows[key] = (key, row[1], 0.0, None, row[4]) if ended else row
+            from_cache = True
+    parts = []
+    for key, short in (("session", "5h"), ("weekly_all", "wk")):
+        if row := windows.get(key):
+            text = f"{short} {row[2]:.0f}%"
+            if key == "session" and (reset := _reset_time(row[3])) and reset > now_utc:
+                text += " " + _fmt_until(reset - now_utc).replace(" ", "")
+            parts.append(text)
+    if from_cache and not fresh:
+        parts.append(f"{age / 60:.0f}m ago")
+    sid = data.get("session_id")
+    cost, pp = _session_usage(sid, windows) if isinstance(sid, str) and sid else (None, {})
+    cost_in = data.get("cost")
+    if isinstance(cost_in, dict) and _finite(live_cost := cost_in.get("total_cost_usd")) and live_cost >= 0:
+        cost = float(live_cost)  # Claude Code's own running total: no collect lag
+    points = ", ".join(f"{short} {round(pp[key], 1):g}pp" for key, short in (("session", "5h"), ("weekly_all", "wk"))
+                       if key in pp)
+    if cost is not None:
+        parts.append(f"session ${cost:.2f}" + (f" ({points})" if points else ""))
+    elif points:
+        parts.append(f"session {points}")
+    return " · ".join(parts) or "cmon offline"
+
+
+def statusline(_args):
+    """One line for Claude Code's statusLine command: the plan from the status cache and what this
+    session cost and took of each window. Never calls the API or opens DuckDB, and always exits 0:
+    Claude Code blanks the status row when the command fails, and cancels it when a new redraw
+    comes first. The session's points come from the last collect, so they lag by up to one
+    collection interval; the cost is Claude Code's live figure when stdin carries it."""
+    data = _statusline_input()
+    try:
+        line = _statusline_text(data, datetime.now(UTC))
+    except Exception as e:  # a bug here must not blank the row with a traceback
+        print(f"cmon: statusline: {e}", file=sys.stderr)
+        line = "cmon error"
+    print(line)
 
 
 def wait(args):
@@ -2985,16 +3611,22 @@ def wait(args):
         print("\ncanceled.")
 
 
-def _cycles(con, key: str) -> list:
+def _cycles(con, key: str, by_reset: bool = False) -> list:
     """Segment snapshots for a window into cycles, cutting at each reset
-    (percent drop). Returns a list of Cycle(ts, percent) named tuples."""
+    (percent drop). Returns a list of Cycle(ts, percent) named tuples.
+    by_reset also cuts where resets_at moves by more than CYCLE_JITTER_S, so a reset the
+    readings never saw drop (machine off across it, new cycle already higher) still splits."""
     if con is None:
         return []
-    rows = con.execute("SELECT observed_at,percent FROM snapshots "
+    rows = con.execute("SELECT observed_at,percent,resets_at FROM snapshots "
                        "WHERE provider='claude' AND key=? ORDER BY observed_at", [key]).fetchall()
     if not rows:
         return []
-    cuts = [i for i in range(1, len(rows)) if rows[i][1] - rows[i - 1][1] < 0]  # reset boundaries
+
+    def moved(a, b):
+        return by_reset and a is not None and b is not None and abs((b - a).total_seconds()) > CYCLE_JITTER_S
+    cuts = [i for i in range(1, len(rows))  # reset boundaries
+            if rows[i][1] - rows[i - 1][1] < 0 or moved(rows[i - 1][2], rows[i][2])]
     bounds = [0, *cuts, len(rows)]
     segs = []
     for a, b in zip(bounds, bounds[1:], strict=False):
@@ -3004,6 +3636,73 @@ def _cycles(con, key: str) -> list:
     return segs
 
 
+SCOREBOARD_CYCLES = 8  # weekly cycles shown by 'trends --scoreboard'
+
+
+def _scoreboard(con, now: datetime) -> list[dict]:
+    """The last SCOREBOARD_CYCLES weekly_all cycles, oldest first: start, peak, what was left
+    at the reset (100 minus the cycle's last reading), hours the 5h window sat at 100% inside
+    the cycle and how many 5h cycles reached 100%.
+
+    A weekly cycle runs from its first reading to the next cycle's first reading. Blocked time
+    is the sum of the gaps between consecutive readings of one 5h cycle that start at 100%, so
+    it only sees what the collection interval sees: the stretch before the first 100% reading
+    and after the last one is not counted, and a 5h cycle with one 100% reading counts as a hit
+    with no hours. A gap longer than the 5h window hides a reset and is left out. The last
+    cycle is in progress unless its latest reading says it already reset. Cycles of both windows
+    also split where resets_at moves: a light week can start at or above the last week's final
+    reading, and two 5h cycles both read at 100% across an unseen reset have no drop to cut at."""
+    weeks = _cycles(con, "weekly_all", by_reset=True)[-SCOREBOARD_CYCLES:]
+    if not weeks:
+        return []
+    window = timedelta(minutes=300)
+    hits, blocked = [], []  # first 100% reading of each 5h cycle; (from, to) spans at 100%
+    for s in _cycles(con, "session", by_reset=True):  # percent never drops inside a cycle: 100% holds
+        first = next((i for i, p in enumerate(s.percent) if p >= 100), None)
+        if first is None:
+            continue
+        hits.append(s.ts[first])
+        blocked += [(a, b) for a, b in zip(s.ts[first:], s.ts[first + 1:], strict=False) if b - a <= window]
+    last = con.execute("SELECT resets_at FROM snapshots WHERE provider='claude' AND key='weekly_all' "
+                       "ORDER BY observed_at DESC LIMIT 1").fetchone()
+    still_open = last is None or last[0] is None or last[0] > now
+    out = []
+    for i, w in enumerate(weeks):
+        lo = w.ts[0]
+        hi = weeks[i + 1].ts[0] if i + 1 < len(weeks) else None
+        secs = 0.0
+        for a, b in blocked:
+            a, b = max(a, lo), b if hi is None else min(b, hi)
+            if b > a:
+                secs += (b - a).total_seconds()
+        out.append({"start": lo, "peak_pct": round(max(w.percent), 1),
+                    "leftover_pct": round(100 - w.percent[-1], 1),
+                    "in_progress": hi is None and still_open,
+                    "blocked_h": round(secs / 3600, 2),
+                    "blocked_5h_cycles": sum(1 for t in hits if t >= lo and (hi is None or t < hi))})
+    return out
+
+
+def _print_scoreboard(rows: list[dict]) -> None:
+    tz = _resolve_tz()
+    head = ("start", "peak", "left at reset", "5h blocked", "5h cycles at 100%")
+    cells = [(f"{r['start'].astimezone(tz):%Y-%m-%d %H:%M %Z}", f"{r['peak_pct']:.0f}%",
+              f"{r['leftover_pct']:.0f}%", f"{r['blocked_h']:.1f}h", str(r["blocked_5h_cycles"]),
+              "in progress" if r["in_progress"] else "") for r in rows]
+    widths = [max(len(h), *(len(c[j]) for c in cells)) for j, h in enumerate(head)]
+
+    def line(vals):
+        first = f"{vals[0]:<{widths[0]}}"
+        return "  " + "  ".join([first, *(f"{v:>{w}}" for v, w in zip(vals[1:], widths[1:], strict=False))])
+
+    print(f"Weekly (All models) — last {len(rows)} cycle(s):")
+    print(line(head))
+    for c in cells:
+        print((line(c[:5]) + (f"  {c[5]}" if c[5] else "")).rstrip())
+    print("Blocked time is measured between snapshots: a block shorter than the collection interval "
+          "doesn't show.")
+
+
 def trends(args):
     """Consumption history: a per-label summary (snapshots/peak/total consumed over --since,
     --json for scripts) followed by the reset-aware per-cycle breakdown — peak per cycle,
@@ -3011,6 +3710,16 @@ def trends(args):
     con = db(create=False)
     if con is None:
         sys.exit("No history — run 'cmon collect' a few times first.")
+    if getattr(args, "scoreboard", False):
+        rows = _scoreboard(con, datetime.now(UTC))
+        if getattr(args, "json", False):
+            print(json.dumps([{**r, "start": r["start"].astimezone(UTC).isoformat(timespec="seconds")}
+                              for r in rows], ensure_ascii=False))
+            return
+        if not rows:
+            sys.exit("No weekly cycles yet — run 'cmon collect' a few times first.")
+        _print_scoreboard(rows)
+        return
     g = _summary(con, _parse_since(getattr(args, "since", None)))
     if getattr(args, "json", False):
         print(json.dumps(g, ensure_ascii=False))
@@ -3042,7 +3751,8 @@ def trends(args):
 
 # --- Logs layer: mines ~/.claude/projects/**/*.jsonl for tokens & cost ---
 LOGS_ROOT = os.path.expanduser("~/.claude/projects")
-# USD per million tokens: (input, output, cache_read, cache_write). Estimate — adjust here.
+# USD per million tokens: (input, output, cache_read, cache_write). Estimate: built-in defaults,
+# which ~/.cmon/prices.json overrides and extends (see _price_table).
 # cache_read ≈ 0.1× input; cache_write = 2× input (1h TTL, what Claude Code uses).
 PRICES = {
     "fable":  (10.0, 50.0, 1.00, 20.0),
@@ -3050,14 +3760,70 @@ PRICES = {
     "sonnet": (3.0, 15.0, 0.30, 6.0),
     "haiku":  (1.0, 5.0, 0.10, 2.0),
 }
+_price_cache: tuple | None = None  # (file signature, table) of the last _price_table load
+
+
+def _prices_file() -> str:
+    return os.path.join(CMON_HOME, "prices.json")
+
+
+def _validate_prices(raw) -> dict:
+    """prices.json content -> {lowercase substring: 4-tuple}, or ValueError naming the problem."""
+    if not isinstance(raw, dict):
+        raise ValueError("expected an object of model substring -> [input, output, cache_read, cache_write]")
+    out = {}
+    for k, v in raw.items():
+        key = k.strip().lower()
+        if not key:
+            raise ValueError("empty model substring")
+        if key in out:
+            raise ValueError(f"{k!r} appears twice (substrings are case-insensitive)")
+        if not (isinstance(v, list) and len(v) == 4 and all(
+                isinstance(x, int | float) and not isinstance(x, bool) and math.isfinite(x) and x >= 0
+                for x in v)):
+            raise ValueError(f"{k!r} needs [input, output, cache_read, cache_write]: 4 numbers >= 0, "
+                             "US$ per million tokens")
+        out[key] = tuple(float(x) for x in v)
+    return out
+
+
+def _price_table() -> list[tuple[str, tuple]]:
+    """PRICES merged with ~/.cmon/prices.json, longest substring first (ties alphabetical), so
+    'opus-4-1' wins over 'opus' whatever the file's order. A missing file is the defaults; an
+    invalid one is ignored as a whole with one stderr warning. Reloaded when the file changes."""
+    global _price_cache
+    path = _prices_file()
+    try:
+        st = os.stat(path)
+        sig = (path, st.st_mtime_ns, st.st_size)
+    except OSError:
+        sig = (path, None, None)
+    if _price_cache is not None and _price_cache[0] == sig:
+        return _price_cache[1]
+    table = dict(PRICES)
+    if sig[1] is not None:
+        try:
+            with open(path, encoding="utf-8") as f:
+                table.update(_validate_prices(json.load(f)))
+        except (OSError, ValueError, OverflowError, RecursionError) as e:  # bad JSON/encoding; an int
+            # too big for a float; nesting past the parser's limit
+            print(f"cmon: ignoring {path} ({e}); using the built-in prices.", file=sys.stderr)
+    ordered = sorted(table.items(), key=lambda kv: (-len(kv[0]), kv[0]))
+    _price_cache = (sig, ordered)
+    return ordered
+
+
+def _price_match(model: str):
+    """Price 4-tuple of `model`, or None when no substring of the table matches it."""
+    m = (model or "").lower()
+    for k, p in _price_table():
+        if k in m:
+            return p
+    return None
 
 
 def _price(model: str):
-    m = (model or "").lower()
-    for k, p in PRICES.items():
-        if k in m:
-            return p
-    return (0.0, 0.0, 0.0, 0.0)
+    return _price_match(model) or (0.0, 0.0, 0.0, 0.0)
 
 
 def _short_model(model: str) -> str:
@@ -3483,6 +4249,8 @@ def _cost(model, i, o, r, c) -> float:
 
 CYCLE_JITTER_S = 3600  # resets_at moves by milliseconds between reads; more than this = new cycle
 _REST = "\x00rest"  # group of the rows a plan-share filter leaves out
+# The same value as SQL: DuckDB 1.1's parser ends a quoted literal at a NUL byte.
+_REST_SQL = "chr(0) || 'rest'"
 
 
 def _plan_share(con, key, since=None, until=None, col="surface", src="token_terminal",
@@ -3497,11 +4265,13 @@ def _plan_share(con, key, since=None, until=None, col="surface", src="token_term
     `where`/`params` select the rows to group (callers build them from fixed choices); the
     rows they leave out still take their part of each rise, reported as 'rest', so a filter
     narrows the view without inflating what's left.
-    Returns {'groups': {grp: pp}, 'rest': pp, 'other': pp, 'total': pp, 'cycles': n} or None
-    without snapshots in the period."""
+    Returns {'groups': {grp: pp}, 'rest': pp, 'other': pp, 'total': pp, 'cycles': n,
+    'rest_unpriced': {model: tokens}} or None without snapshots in the period. rest_unpriced holds
+    the models of the left-out rows that had no price: costed at zero here, they hand their part of
+    the percent to the groups shown, and the caller never sees those rows to warn about them."""
     scoped = key.split(":", 1)[1].lower() if ":" in key else None
     tok_where = "provider='claude'" + (" AND lower(model) LIKE ?" if scoped else "")
-    grp = f"CASE WHEN true{where} THEN {col} ELSE '{_REST}' END" if where else col
+    grp = f"CASE WHEN true{where} THEN {col} ELSE {_REST_SQL} END" if where else col
     tok_params = [*params, f"%{scoped}%"] if scoped else list(params)
     bounds, bparams = "", []
     if since:
@@ -3528,7 +4298,7 @@ def _plan_share(con, key, since=None, until=None, col="surface", src="token_term
         [key, CYCLE_JITTER_S, *bparams, *tok_params]).fetchall()
     if not rows:
         return None
-    groups, other, cycles = {}, 0.0, 0
+    groups, other, cycles, rest_unpriced = {}, 0.0, 0, {}
     pending = {}  # grp -> cost logged since the last tick
     cur, cur_cost = None, {}
 
@@ -3555,10 +4325,12 @@ def _plan_share(con, key, since=None, until=None, col="surface", src="token_term
             cur, cur_cost = (ts, new_cycle, d), {}
         if grp is not None:
             cur_cost[grp] = cur_cost.get(grp, 0.0) + _cost(model, i or 0, o or 0, cr or 0, cw or 0)
+            if grp == _REST and _price_match(model) is None and (n := (i or 0) + (o or 0) + (cr or 0) + (cw or 0)):
+                rest_unpriced[model or "?"] = rest_unpriced.get(model or "?", 0) + n
     settle(cur[1], cur[2], cur_cost)
     rest = groups.pop(_REST, 0.0)
     return {"groups": groups, "rest": rest, "other": other, "total": sum(groups.values()) + rest + other,
-            "cycles": cycles}
+            "cycles": cycles, "rest_unpriced": rest_unpriced}
 
 
 PLAN_ALIASES = {"weekly": "weekly_all", "week": "weekly_all", "5h": "session"}
@@ -3599,9 +4371,182 @@ def _plan_window(con, name: str):
     sys.exit(f"No snapshots for window {name!r}. Known: {', '.join(k for k, _l, _s in known)}.")
 
 
+CACHE_TTL_S = 3600  # assumed prompt-cache TTL: Claude Code's 1h, the one PRICES charges (2x input)
+COMPACT_MIN_TURNS = 10  # shorter sessions aren't /compact candidates: little left to save
+COMPACT_MIN_CONTEXT = 50_000  # floor under the top tier, so a base of small sessions flags none
+COMPACT_TIER = 0.9  # /compact candidates: the sessions above this share, the top 10% by average context
+CACHE_TOP = 10  # sessions listed per table, and projects in the text form
+
+
+def _cache_report(con, since, src: str, filt: str, fparams: list):
+    """Cache efficiency of `src` rows since `since`: hit rate, cache writes paid again after idle,
+    and sessions living with a large context. A turn whose session was idle longer than
+    CACHE_TTL_S before it found its cache expired, so its cache write counts as a rewrite. The
+    gap is measured over the session's whole history, before `since` and the filters apply, so
+    the first turn of the period still sees the turn before it. Zero-token rows ('<synthetic>',
+    written locally, no API call) are neither turns nor activity. Returns (report, tokens,
+    {unpriced model: tokens}), or None without rows."""
+    rows = con.execute(
+        "WITH t AS (SELECT *, epoch(observed_at) - epoch(lag(observed_at) OVER "
+        "  (PARTITION BY session_id ORDER BY observed_at)) > ? AS idle "
+        f"  FROM {src} WHERE provider='claude' "
+        "  AND input_tokens + output_tokens + cache_read_tokens + cache_write_tokens > 0) "
+        "SELECT session_id, project, model, count(*), sum(input_tokens), sum(output_tokens), "
+        "  sum(cache_read_tokens), sum(cache_write_tokens), count(*) FILTER (WHERE idle), "
+        "  coalesce(sum(cache_write_tokens) FILTER (WHERE idle), 0) "
+        f"FROM t WHERE true{' AND observed_at >= ?' if since else ''}{filt} GROUP BY ALL",
+        [CACHE_TTL_S, *([since] if since else []), *fparams]).fetchall()
+    if not rows:
+        return None
+
+    def acc():
+        return {"turns": 0, "input": 0, "cache_read": 0, "cache_write": 0, "tok": 0, "cost": 0.0,
+                "cache_read_cost": 0.0, "cache_write_cost": 0.0, "idle_rewrites": 0, "idle_tok": 0,
+                "idle_cost": 0.0}
+    total, projects, sessions, unpriced = acc(), {}, {}, {}
+    for sid, project, model, n, i, o, r, w, idle_n, idle_w in rows:
+        p = _price_match(model)
+        if p is None:
+            p = (0.0, 0.0, 0.0, 0.0)
+            unpriced[model or "?"] = unpriced.get(model or "?", 0) + i + o + r + w
+        s = sessions.setdefault(sid, {**acc(), "projects": {}})
+        s["projects"][project] = s["projects"].get(project, 0) + n
+        pj = projects.setdefault(project, {**acc(), "sessions": set()})
+        pj["sessions"].add(sid)
+        for a in (total, pj, s):
+            a["turns"] += n
+            a["input"] += i
+            a["cache_read"] += r
+            a["cache_write"] += w
+            a["tok"] += i + o + r + w
+            a["cost"] += (i * p[0] + o * p[1] + r * p[2] + w * p[3]) / 1e6
+            a["cache_read_cost"] += r * p[2] / 1e6
+            a["cache_write_cost"] += w * p[3] / 1e6
+            a["idle_rewrites"] += idle_n
+            a["idle_tok"] += idle_w
+            a["idle_cost"] += idle_w * p[3] / 1e6
+
+    def hit(a):
+        seen = a["cache_read"] + a["cache_write"] + a["input"]
+        return a["cache_read"] / seen if seen else None
+
+    def main_project(s):  # a session's cwd can change; it belongs where most of its turns ran
+        return max(s["projects"].items(), key=lambda kv: (kv[1], kv[0]))[0]
+
+    proj_out = [{"project": k, "turns": v["turns"], "sessions": len(v["sessions"]), "hit_rate": hit(v),
+                 "cache_write_cost_usd": v["cache_write_cost"], "idle_rewrites": v["idle_rewrites"],
+                 "idle_rewrite_cost_usd": v["idle_cost"], "cost_usd": v["cost"]}
+                for k, v in sorted(projects.items(), key=lambda kv: (-kv[1]["idle_cost"], -kv[1]["cost"], kv[0]))]
+    idle_out = [{"session": k, "project": main_project(v), "turns": v["turns"], "idle_rewrites": v["idle_rewrites"],
+                 "idle_rewrite_cost_usd": v["idle_cost"], "cost_usd": v["cost"]}
+                for k, v in sorted(sessions.items(), key=lambda kv: (-kv[1]["idle_cost"], kv[0]))
+                if v["idle_rewrites"]][:CACHE_TOP]
+    ctx = {k: (v["input"] + v["cache_read"] + v["cache_write"]) / v["turns"]
+           for k, v in sessions.items() if v["turns"] >= COMPACT_MIN_TURNS}
+    threshold = None
+    if ctx:  # the top (1 - tier) of sessions, at least one; ties at the cutoff are kept
+        ranked = sorted(ctx.values(), reverse=True)
+        top = max(1, math.ceil(round((1 - COMPACT_TIER) * len(ranked), 9)))  # round: (1 - 0.9) * 10 is 0.99..
+        threshold = max(ranked[top - 1], COMPACT_MIN_CONTEXT)
+    compact = [{"session": k, "project": main_project(sessions[k]), "turns": sessions[k]["turns"],
+                "avg_context_tok": c, "cost_usd": sessions[k]["cost"]}
+               for k, c in ctx.items() if c >= threshold]
+    compact.sort(key=lambda d: (-d["cost_usd"], d["session"]))
+    return {"since": since.isoformat() if since else None, "estimate": True, "ttl_s": CACHE_TTL_S,
+            "turns": total["turns"], "sessions": len(sessions), "hit_rate": hit(total),
+            "tokens": {"input": total["input"], "cache_read": total["cache_read"],
+                       "cache_write": total["cache_write"]},
+            "cost_usd": {"total": total["cost"], "cache_read": total["cache_read_cost"],
+                         "cache_write": total["cache_write_cost"]},
+            "idle_rewrites": {"turns": total["idle_rewrites"], "tok": total["idle_tok"],
+                              "cost_usd": total["idle_cost"]},
+            "projects": proj_out, "idle_sessions": idle_out,
+            "compact": {"min_turns": COMPACT_MIN_TURNS, "min_context_tok": COMPACT_MIN_CONTEXT,
+                        "tier": COMPACT_TIER, "threshold_tok": threshold, "sessions": compact[:CACHE_TOP]},
+            "unpriced_models": sorted(unpriced)}, total["tok"], unpriced
+
+
+def _burn_cache(con, args, since) -> None:
+    """'burn --cache': where the cache part of the cost could have been avoided (estimate)."""
+    filt, fparams, fdesc = _burn_filters(args)
+    src = "token_log" if getattr(args, "all_accounts", False) else "token_terminal"
+    got = _cache_report(con, since, src, filt, fparams)
+    if got is None:
+        sys.exit("No Claude Code log data in period.")
+    rep, tok, unpriced = got
+    if getattr(args, "json", False):
+        print(json.dumps(rep, ensure_ascii=False))
+        return
+    if unpriced:
+        names = ", ".join(f"{m} ({t / 1e6:.1f}M tok)" for m, t in sorted(unpriced.items()))
+        print(f"cmon: no price for {names}: counted as US$ 0. Add it to {_prices_file()} (see README).",
+              file=sys.stderr)
+    excluded = 0 if src == "token_log" else con.execute(
+        "SELECT coalesce(sum(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens), 0) "
+        f"FROM token_log WHERE provider='claude'{' AND observed_at >= ?' if since else ''}{filt}",
+        ([since] if since else []) + fparams).fetchone()[0] - tok
+
+    def pct(v):
+        return f"{v * 100:5.1f}%" if v is not None else "    -"
+
+    def short(s, n=24):
+        return s if len(s) <= n else s[:n - 1] + "…"
+    hours = CACHE_TTL_S / 3600
+    since_local = since.astimezone(_resolve_tz()) if since else None
+    window = f" since {since_local:%Y-%m-%d %H:%M %Z}" if since_local else ""
+    only = "".join(f" · {d}" for d in fdesc)
+    c, t, idle = rep["cost_usd"], rep["tokens"], rep["idle_rewrites"]
+    print(f"Cache efficiency{window}{only} (API equivalent, estimate):")
+    print(f"  hit rate      {pct(rep['hit_rate']):>10}   of the input context came from cache "
+          f"({rep['turns']} turn{'s' * (rep['turns'] != 1)}, {rep['sessions']} "
+          f"session{'s' * (rep['sessions'] != 1)})")
+    print(f"  cache read    {t['cache_read'] / 1e6:9.1f}M tok   US$ {c['cache_read']:9.2f}")
+    print(f"  cache write   {t['cache_write'] / 1e6:9.1f}M tok   US$ {c['cache_write']:9.2f}")
+    share = f"   {idle['cost_usd'] / c['cache_write'] * 100:3.0f}% of cache write" if c["cache_write"] else ""
+    print(f"  idle rewrites {idle['turns']:9d} turns  US$ {idle['cost_usd']:9.2f}{share}")
+
+    print(f"\nBy project (rewrite = cache write of the first turn after > {hours:g}h idle in a session):")
+    w = max(len("project"), *(len(short(p["project"])) for p in rep["projects"][:CACHE_TOP]))
+    print(f"  {'project':<{w}}  {'turns':>7}  hit rate  rewrites  US$ rewrites  US$ cache write")
+    for p in rep["projects"][:CACHE_TOP]:
+        print(f"  {short(p['project']):<{w}}  {p['turns']:7d}    {pct(p['hit_rate'])}  {p['idle_rewrites']:8d}  "
+              f"{p['idle_rewrite_cost_usd']:12.2f}  {p['cache_write_cost_usd']:15.2f}")
+    if len(rep["projects"]) > CACHE_TOP:
+        print(f"  … {len(rep['projects']) - CACHE_TOP} more (--json lists all)")
+
+    print("\nSessions that paid the most to rewrite their cache after idle:")
+    if not rep["idle_sessions"]:
+        print(f"  none: no session went on after more than {hours:g}h idle.")
+    for s in rep["idle_sessions"]:
+        print(f"  {s['session']}  {short(s['project'], 20):<20} {s['idle_rewrites']:4d} "
+              f"{'rewrite' if s['idle_rewrites'] == 1 else 'rewrites':<8}   "
+              f"US$ {s['idle_rewrite_cost_usd']:8.2f} of {s['cost_usd']:.2f}")
+
+    cp = rep["compact"]
+    print(f"\n/compact candidates (≥ {cp['min_turns']} turns, average context per turn in the top "
+          f"{(1 - cp['tier']) * 100:.0f}% and ≥ {cp['min_context_tok'] / 1e3:.0f}k tok):")
+    if not cp["sessions"]:
+        print("  none in the period.")
+    for s in cp["sessions"]:
+        print(f"  {s['session']}  {short(s['project'], 20):<20} {s['turns']:5d} turns   "
+              f"avg {s['avg_context_tok'] / 1e3:6.0f}k tok   US$ {s['cost_usd']:9.2f}")
+
+    print(f"\nEstimate. Transcripts don't say which cache TTL applied: cmon assumes {hours:g}h, as its prices do,\n"
+          f"so the cache write of a turn after more than {hours:g}h idle counts as a rewrite (it also holds\n"
+          "that turn's new content). Going back to an old session pays that rewrite; a new session or\n"
+          "/compact writes less. API EQUIVALENT cost: you pay the subscription, not this.")
+    if excluded:
+        print(f"Excluded {excluded / 1e6:.1f}M tok from Claude Desktop sessions of another or unknown "
+              f"account (--all-accounts to include).")
+
+
 def burn(args):
     """Report tokens & estimated US$ from local Claude Code logs; with --plan, also each
     group's share of the official percent."""
+    cache = getattr(args, "cache", False)
+    if cache and (getattr(args, "plan", None) or getattr(args, "by", None)):
+        sys.exit("--cache is a report of its own: it doesn't take --by or --plan.")
+    by = getattr(args, "by", None) or "model"
     con = db()
     raw_since = getattr(args, "since", None)
     plan = _plan_window(con, args.plan) if getattr(args, "plan", None) else None
@@ -3610,8 +4555,12 @@ def burn(args):
     else:
         since = _parse_since(raw_since)
     scan_logs(con, since)
-    col = {"model": "model", "surface": "surface", "day": "CAST(observed_at AS DATE)",
-           "project": "project", "session": "session_id", "device": _device_col()}[args.by]
+    if cache:
+        return _burn_cache(con, args, since)
+    # day as text: _plan_share's CASE puts filtered-out rows in a string group, which DuckDB won't
+    # mix with a DATE. ISO text prints and serializes as the date did.
+    col = {"model": "model", "surface": "surface", "day": "CAST(CAST(observed_at AS DATE) AS VARCHAR)",
+           "project": "project", "session": "session_id", "device": _device_col()}[by]
     filt, fparams, fdesc = _burn_filters(args)
     where = "WHERE provider='claude'" + (" AND observed_at >= ?" if since else "") + filt
     wparams = ([since] if since else []) + fparams
@@ -3631,8 +4580,15 @@ def burn(args):
     agg = {}  # grp -> [tok, custo]
     ctok = {"input": 0, "output": 0, "cache read": 0, "cache write": 0}
     ccost = {"input": 0.0, "output": 0.0, "cache read": 0.0, "cache write": 0.0}
+    unpriced, unpriced_by_grp = {}, {}  # model -> tokens; grp -> {models}: priced at zero below
     for grp, model, i, o, r, c in rows:
-        p = _price(model)
+        p = _price_match(model)
+        if p is None:
+            p = (0.0, 0.0, 0.0, 0.0)
+            if i + o + r + c > 0:  # '<synthetic>' rows carry no tokens: nothing to price
+                name = model or "?"
+                unpriced[name] = unpriced.get(name, 0) + i + o + r + c
+                unpriced_by_grp.setdefault(grp, set()).add(name)
         cost = (i * p[0] + o * p[1] + r * p[2] + c * p[3]) / 1e6
         a = agg.setdefault(grp, [0, 0.0])
         a[0] += i + o + r + c
@@ -3648,28 +4604,40 @@ def burn(args):
     share = _plan_share(con, plan[0], since=since, col=col, src=src, where=filt, params=fparams) if plan else None
     if plan and share is None:
         sys.exit(f"No '{plan[0]}' snapshots in period: run 'cmon collect', or 'cmon install' to collect them.")
+    for name, n in (share["rest_unpriced"] if share else {}).items():  # filtered out, but skewing the split
+        unpriced[name] = unpriced.get(name, 0) + n
     pp = share["groups"] if share else {}
     for g in pp:
         agg.setdefault(g, [0, 0.0])  # a period starting mid-cycle can charge a group outside it
     ordered = sorted(agg.items(), key=lambda kv: (-pp.get(kv[0], 0.0), -kv[1][1]))  # share, then cost
     if getattr(args, "json", False):
+        # The plain form is a bare array, so its unpriced models ride on each group, and only when
+        # there are some: a top-level key would turn the array into an object.
         items = [{"grp": g.isoformat() if hasattr(g, "isoformat") else g, "tok": int(v[0]), "custo": v[1],
-                  **({"plan_pp": pp.get(g, 0.0)} if share else {})} for g, v in ordered]
+                  **({"plan_pp": pp.get(g, 0.0)} if share else {}),
+                  **({"unpriced_models": sorted(unpriced_by_grp[g])} if g in unpriced_by_grp else {})}
+                 for g, v in ordered]
         if share:
             print(json.dumps({"window": plan[0], "since": since.isoformat() if since else None,
                               "cycles": share["cycles"], "total_pp": share["total"],
                               "other_pp": share["other"], **({"rest_pp": share["rest"]} if filt else {}),
-                              "groups": items}, ensure_ascii=False))
+                              "unpriced_models": sorted(unpriced), "groups": items}, ensure_ascii=False))
         else:
             print(json.dumps(items, ensure_ascii=False))
         return
+    if unpriced:
+        names = ", ".join(f"{m} ({t / 1e6:.1f}M tok)" for m, t in sorted(unpriced.items()))
+        one = len(unpriced) == 1
+        print(f"cmon: no price for {names}: {'its' if one else 'their'} cost counts as US$ 0, and burn --plan "
+              f"gives the percent {'it' if one else 'they'} used to other groups (or to 'other'). "
+              f"Add {'it' if one else 'them'} to {_prices_file()} (see README).", file=sys.stderr)
     per = {"model": "model", "surface": "surface", "day": "day",
-           "project": "project", "session": "session", "device": "device"}[args.by]
+           "project": "project", "session": "session", "device": "device"}[by]
     since_local = since.astimezone(_resolve_tz()) if since else None
     window = f" since {since_local:%Y-%m-%d %H:%M %Z}" if since_local else ""
     only = "".join(f" · {d}" for d in fdesc)
     print(f"Consumption by {per}{window}{only} (API equivalent):")
-    lines = [(_surface(g) if args.by == "surface" else str(g), v[0] / 1e6, v[1], pp.get(g, 0.0))
+    lines = [(_surface(g) if by == "surface" else str(g), v[0] / 1e6, v[1], pp.get(g, 0.0))
              for g, v in ordered]
     other_lbl, rest_lbl = "other (no local log)", "rest (filtered out)"
     w = max([len(lbl) for lbl, *_ in lines] + [len(other_lbl) if share else len("TOTAL")])
@@ -3730,6 +4698,7 @@ def watch(args):
 
     tz = _resolve_tz()  # resolved once, before Live(screen=True) takes over — any invalid-tz
                        # warning must print here, never inside render() (would corrupt the TUI)
+    _price_table()  # same for an invalid prices.json: warn now; the load is cached while the file is unchanged
     show_bar = getattr(args, "usage", False)
     base = float(args.interval)
     cur = base  # adaptive poll interval: grows on 403/errors, eases back on sustained success
@@ -3808,6 +4777,7 @@ def watch(args):
         scan_logs(con, since=win, quiet=True)
         _log_forecasts(con, rows, tz, now_utc)  # deduped internally to FORECAST_EVERY_S
         _reconcile_forecasts(con)
+        _refresh_projection(con, rows, now_utc, tz, quiet=True)  # quiet: stderr would tear the TUI
         bs = _burn_summary(_burn_rows(con, win))
         if bs:
             tok, cost, mix = bs
@@ -3995,6 +4965,433 @@ def uninstall(args):
         sys.exit(f"OS not supported: {sys.platform}")
 
 
+# --- doctor: what's wrong with this installation, and the fix for each item ---
+DOCTOR_VERSION = 1  # schema of 'doctor --json'; additive changes keep it
+DOCTOR_LOCK_WAIT_S = 2.0  # a scheduled collect holds the lock ~1 s: wait that out before calling it held
+DOCTOR_TAGS = {"ok": "ok", "warn": "warn", "fail": "FAIL", "skip": "skip"}  # same columns as make doctor
+UPDATE_FIX = "update cmon: uv tool upgrade cmon-cli, or make install in a fresh clone"
+
+
+def _check(key: str, name: str, status: str, detail: str = "", fix: str | None = None) -> dict:
+    return {"key": key, "name": name, "status": status, "detail": detail, "fix": fix}
+
+
+def _doctor_token() -> dict:
+    """Same resolution as 'token status'. The token itself never reaches the report, not even
+    masked: assistants read this output, and the source is what tells them what to fix."""
+    import time
+    name = "token source found"
+    try:
+        src, tok, exp = _resolve_token()
+    except Exception as e:
+        return _check("token", name, "fail", f"token lookup failed: {_safe(e)}", "cmon token status")
+    if not tok:
+        return _check("token", name, "fail", "no token in CLAUDE_OAUTH_TOKEN, the OS vault or Claude Code's login",
+                      "log in to Claude Code, or run: cmon token set")
+    detail = src
+    if exp is not None:
+        left = exp / 1000 - time.time()
+        if left <= 0:
+            return _check("token", name, "warn", f"{src}: the access token has expired",
+                          "run any prompt in Claude Code; it renews its own login")
+        detail += f", expires in {_fmt_until(timedelta(seconds=left))}"
+    if src.startswith("env "):
+        detail += ", which scheduled collection doesn't inherit: cmon token set covers that"
+    return _check("token", name, "ok", detail)
+
+
+def _doctor_api(offline: bool) -> dict:
+    """One fetch with the budget of 'status --live', which make doctor used before. Nothing is
+    stored: a diagnosis shouldn't write history or the cache."""
+    name = "usage API reachable and logged in"
+    if offline:
+        return _check("api", name, "skip", "--offline")
+    try:
+        rows = limits(fetch(retries=2, timeout=10))
+    except FetchError as e:
+        msg = str(e)
+        if msg.startswith("403"):
+            fix = f"{UPDATE_FIX} (the private endpoint may have changed)"
+        elif msg.startswith(("401", "no token")) or "expired" in msg:
+            fix = "run Claude Code once to log in, then: cmon token status"
+        else:
+            fix = "check the network connection, then run: cmon doctor"
+        return _check("api", name, "fail", msg, fix)
+    except Exception as e:  # a reply limits() can't read: the endpoint changed shape
+        return _check("api", name, "fail", f"unexpected reply: {_safe(e)}", UPDATE_FIX)
+    detail = ", ".join(f"{label} {pct:.0f}%" for _k, label, pct, _r, _a in rows)
+    return _check("api", name, "ok", detail or "logged in; no limits in the reply")
+
+
+def _doctor_run(cmd: list[str], raw: bool = False):
+    """CompletedProcess, or None when the tool is missing or hangs. raw keeps the output as bytes."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=not raw, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _sched_issue(argv: list[str]) -> tuple[str, str] | None:
+    """(status, detail) when the scheduled command can't run or feeds another database, else
+    None. A clone deleted after 'uv run cmon install' leaves a job pointing at nothing."""
+    if len(argv) < 2:
+        return "fail", "the scheduled command is empty"
+    for path in argv[:2]:
+        if os.path.isabs(path) and not os.path.exists(path):
+            return "fail", f"the scheduled command points to a missing file: {path}"
+    if "--db" in argv[:-1]:
+        target = os.path.abspath(argv[argv.index("--db") + 1])
+        if os.path.normcase(target) != os.path.normcase(os.path.abspath(DB)):  # Windows ignores case
+            return "warn", f"it collects into {target}, but this cmon reads {os.path.abspath(DB)}"
+    return None
+
+
+def _doctor_schedule_macos(name: str) -> dict:
+    import plistlib
+    plist = os.path.expanduser(f"~/Library/LaunchAgents/{AGENT}.plist")
+    if not os.path.exists(plist):
+        return _check("schedule", name, "warn", "not scheduled", "cmon install")
+    try:
+        with open(plist, "rb") as f:
+            data = plistlib.load(f)
+        argv = [str(a) for a in data.get("ProgramArguments") or []]
+    except Exception as e:
+        return _check("schedule", name, "fail", f"unreadable {plist}: {_safe(e)}", "cmon install")
+    r = _doctor_run(["launchctl", "print", f"gui/{os.getuid()}/{AGENT}"])
+    if r is None:
+        return _check("schedule", name, "warn", "could not run launchctl to check the LaunchAgent")
+    if r.returncode != 0:
+        return _check("schedule", name, "warn", f"{plist} exists but isn't loaded", "cmon install")
+    if issue := _sched_issue(argv):
+        return _check("schedule", name, *issue, fix="cmon install")
+    every = data.get("StartInterval")
+    return _check("schedule", name, "ok", f"LaunchAgent {AGENT}" +
+                  (f", every {every // 60} min" if isinstance(every, int) and every >= 60 else ""))
+
+
+def _doctor_schedule_linux(name: str) -> dict:
+    import shlex
+    import shutil
+    timer = os.path.expanduser("~/.config/systemd/user/cmon-collect.timer")
+    if shutil.which("systemctl") and os.path.exists(timer):
+        r = _doctor_run(["systemctl", "--user", "is-active", "cmon-collect.timer"])
+        if r is None or r.stdout.strip() != "active":
+            return _check("schedule", name, "warn", "the systemd timer exists but isn't active", "cmon install")
+        try:
+            with open(timer.removesuffix(".timer") + ".service", encoding="utf-8") as f:
+                line = next((ln for ln in f if ln.startswith("ExecStart=")), "")
+            argv = shlex.split(line.removeprefix("ExecStart="))
+        except (OSError, ValueError) as e:
+            return _check("schedule", name, "fail", f"unreadable cmon-collect.service: {_safe(e)}", "cmon install")
+        if issue := _sched_issue(argv):
+            return _check("schedule", name, *issue, fix="cmon install")
+        return _check("schedule", name, "ok", "systemd timer cmon-collect.timer")
+    r = _doctor_run(["crontab", "-l"])
+    lines = r.stdout.splitlines() if r is not None and r.returncode == 0 else []
+    if line := next((ln for ln in lines if "# cmon-collect" in ln), None):
+        fields = line.split("# cmon-collect")[0].split(None, 5)
+        try:
+            argv = shlex.split(fields[5]) if len(fields) == 6 else []
+        except ValueError:
+            argv = []
+        if issue := _sched_issue(argv):
+            return _check("schedule", name, *issue, fix="cmon install")
+        return _check("schedule", name, "ok", "crontab entry # cmon-collect")
+    return _check("schedule", name, "warn", "not scheduled", "cmon install")
+
+
+def _schtasks_argv(raw) -> list[str] | None:
+    """The task's command from `schtasks /query /xml` output, as argv, or None when it can't be read
+    for sure. Bytes, because the tool may write UTF-16 or the console code page: a path decoded with
+    the wrong guess would read as a deleted clone. Only UTF-16 and strict UTF-8 (ASCII included) are
+    trusted. The arguments are the quoted words _install_windows wrote, which can't hold a quote."""
+    import re
+    from xml.sax.saxutils import unescape
+    if not isinstance(raw, bytes):
+        return None
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        encoding = "utf-16"
+    else:
+        encoding = "utf-16-le" if b"\x00" in raw else "utf-8-sig"
+    try:
+        text = raw.decode(encoding)
+    except UnicodeDecodeError:
+        return None
+    m = re.search(r"<Exec>.*?<Command>(.*?)</Command>\s*(?:<Arguments>(.*?)</Arguments>)?", text, re.S)
+    if not m:
+        return None
+    entities = {"&quot;": '"', "&apos;": "'"}
+    command = unescape(m.group(1), entities).strip()
+    args = unescape(m.group(2) or "", entities)
+    words = [a or b for a, b in re.findall(r'"([^"]*)"|(\S+)', args)]
+    return [command.strip('"'), *words] if command else None
+
+
+def _doctor_schedule_windows(name: str) -> dict:
+    r = _doctor_run(["schtasks", "/query", "/tn", "cmon-collect", "/xml"], raw=True)
+    if r is None:
+        return _check("schedule", name, "warn", "could not run schtasks to check the task")
+    if r.returncode != 0:
+        return _check("schedule", name, "warn", "not scheduled", "cmon install")
+    argv = _schtasks_argv(r.stdout)
+    if argv is None:
+        return _check("schedule", name, "ok", "Task Scheduler task cmon-collect; its command couldn't be read")
+    if issue := _sched_issue(argv):
+        return _check("schedule", name, *issue, fix="cmon install")
+    return _check("schedule", name, "ok", "Task Scheduler task cmon-collect")
+
+
+def _doctor_schedule(platform: str | None = None) -> dict:
+    """Looks where 'cmon install' puts the job on each OS. Not scheduled is a warning, not a
+    failure: background collection is optional for the CLI alone."""
+    name = "background collection scheduled"
+    platform = platform or sys.platform
+    if platform == "darwin":
+        return _doctor_schedule_macos(name)
+    if platform.startswith("linux"):
+        return _doctor_schedule_linux(name)
+    if platform.startswith("win"):
+        return _doctor_schedule_windows(name)
+    return _check("schedule", name, "skip", f"no scheduler support on {platform}")
+
+
+def _doctor_schema(con) -> dict:
+    name = "database schema is current"
+    keep = f"nothing to do; if you may go back to an older cmon, copy {os.path.abspath(DB)} first"
+    try:
+        version = None
+        if _table_exists(con, "meta") and "key" in _table_columns(con, "meta"):
+            row = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+            version = row[0] if row else None
+        if version is None:
+            if not any(_table_exists(con, t) for t in _SCHEMA_TABLES):
+                return _check("schema", name, "warn", "empty database; the next collect creates the tables",
+                              "cmon collect")
+            return _check("schema", name, "warn", f"no schema version; the next write migrates it to "
+                          f"v{SCHEMA_VERSION}", keep)
+        try:
+            v = int(version)
+        except (TypeError, ValueError):
+            return _check("schema", name, "fail", f"invalid schema version {version!r}",
+                          "restore a copy of the database, or move it aside to start a new one")
+        if v > SCHEMA_VERSION:
+            return _check("schema", name, "fail", f"schema v{v} is newer than this cmon reads "
+                          f"(v{SCHEMA_VERSION})", UPDATE_FIX)
+        if v < SCHEMA_VERSION:
+            return _check("schema", name, "warn", f"schema v{v}; the next write migrates it to "
+                          f"v{SCHEMA_VERSION}", keep)
+        _validate_current_schema(con)
+        return _check("schema", name, "ok", f"v{v}")
+    except Exception as e:
+        return _check("schema", name, "fail", _safe(e, 300),
+                      "restore a copy of the database, or move it aside to start a new one")
+
+
+def _doctor_snapshot(con) -> dict:
+    name = "last snapshot is recent"
+    fix = "cmon collect (prints the error, if any)" + (
+        f"; background logs: {CMON_HOME}/collect.err.log" if sys.platform == "darwin" else "")
+    try:
+        last = con.execute("SELECT max(observed_at) FROM snapshots WHERE provider='claude'").fetchone()[0]
+    except Exception:
+        return _check("snapshot", name, "skip", "not checked: the schema predates this cmon")
+    if last is None:
+        return _check("snapshot", name, "warn", "no snapshots yet", fix)
+    age = datetime.now(UTC) - last
+    detail = f"{_fmt_until(age)} ago"
+    if age > timedelta(minutes=GUARD_STALE_MIN):  # three missed 20-min collections, as guard reads it
+        return _check("snapshot", name, "warn", detail, fix)
+    return _check("snapshot", name, "ok", detail)
+
+
+def _doctor_db() -> list[dict]:
+    """Lock, schema and last snapshot, through one read-only connection: doctor never creates,
+    migrates or writes the database, so it's safe on a file an older cmon still uses."""
+    import re
+    import time
+
+    import duckdb
+    lock, schema, snap = "database not locked", "database schema is current", "last snapshot is recent"
+    path = os.path.abspath(DB)
+    if not os.path.exists(path):
+        return [_check("lock", lock, "skip", "no database yet"),
+                _check("schema", schema, "skip", "no database yet"),
+                _check("snapshot", snap, "warn", f"no database yet at {path}",
+                       "cmon collect (cmon install schedules it)")]
+    deadline = time.monotonic() + DOCTOR_LOCK_WAIT_S
+    while True:
+        try:
+            con = duckdb.connect(path, read_only=True)
+            break
+        except Exception as e:
+            msg = str(e)
+            if not re.search(r"\block\b", msg, re.IGNORECASE):  # a word, so "block" isn't a lock
+                return [_check("lock", lock, "skip", "not checked: the database doesn't open"),
+                        _check("schema", schema, "fail", f"can't open {path}: {_safe(msg, 300)}",
+                               f"if a newer cmon wrote it, {UPDATE_FIX}; else restore a copy of the file"),
+                        _check("snapshot", snap, "skip", "not checked: the database doesn't open")]
+            if time.monotonic() >= deadline:
+                pid = re.search(r"PID (\d+)", msg)
+                who = f"PID {pid.group(1)}" if pid else "another process"
+                return [_check("lock", lock, "warn", f"held by {who}",
+                               "read commands still work; it frees when that cmon watch or collect ends"),
+                        _check("schema", schema, "skip", "not checked: the database is locked"),
+                        _check("snapshot", snap, "skip", "not checked: the database is locked")]
+            time.sleep(0.25)
+    try:
+        return [_check("lock", lock, "ok", "free"), _doctor_schema(con), _doctor_snapshot(con)]
+    finally:
+        con.close()
+
+
+def _doctor_sync_dir(cfg: dict) -> dict:
+    name = "sync_dir reachable"
+    raw = cfg.get("sync_dir")
+    if not raw:
+        return _check("sync_dir", name, "skip", "not set")
+    unset = "reconnect the synced folder, or: cmon config clear sync_dir"
+    if not isinstance(raw, str):
+        return _check("sync_dir", name, "fail", f"not a path: {raw!r}", unset)
+    path = os.path.abspath(os.path.expanduser(raw))
+    if not os.path.isdir(path):
+        return _check("sync_dir", name, "fail", f"{path} is not an existing folder", unset)
+    if not os.access(path, os.W_OK | os.X_OK):
+        return _check("sync_dir", name, "fail", f"{path} is not writable", unset)
+    return _check("sync_dir", name, "ok", path)
+
+
+def _doctor_read_json(path: str) -> tuple[bool, object, str | None]:
+    """(present, data, error) for a hand-edited JSON file. NaN and Infinity are refused, as
+    the menu bar's decoder refuses them."""
+    def refuse(token):
+        raise ValueError(f"{token} is not valid JSON")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return True, json.load(f, parse_constant=refuse), None
+    except FileNotFoundError:
+        return False, None, None
+    except json.JSONDecodeError as e:
+        return True, None, f"not valid JSON: {e.msg} at line {e.lineno}, column {e.colno}"
+    except RecursionError:
+        return True, None, "not valid JSON: nested too deeply"
+    except (OSError, UnicodeDecodeError, ValueError) as e:
+        return True, None, f"unreadable: {_safe(e)}"
+
+
+def _doctor_config() -> dict:
+    """cmon reads a broken config.json as empty, in silence: every preference falls back to its
+    default. Values are held to what 'config set' accepts."""
+    name = "config.json is valid"
+    present, data, err = _doctor_read_json(CONFIG)
+    if not present:
+        return _check("config", name, "ok", "not present; defaults apply")
+    if err or not isinstance(data, dict):
+        return _check("config", name, "fail", err or "not a JSON object",
+                      f"fix {CONFIG}, or delete it to get the defaults")
+    problems, unknown = [], sorted(k for k in data if k not in CONFIG_KEYS)
+    for key in sorted(k for k in data if k in CONFIG_KEYS):
+        value = data[key]
+        if not isinstance(value, str) or not value:
+            problems.append(f"{key}: {value!r} is not a non-empty string")
+        elif key != "sync_dir":  # whether the folder exists is the sync_dir check's job
+            try:
+                CONFIG_VALIDATORS[key](value)
+            except ValueError as e:
+                problems.append(str(e))
+    if problems:
+        if unknown:
+            problems.append(f"unknown keys, ignored: {', '.join(unknown)}")
+        return _check("config", name, "fail", "; ".join(p.rstrip(".") for p in problems),
+                      "cmon config set <key> <value>, or: cmon config clear <key>")
+    if unknown:
+        return _check("config", name, "warn", f"unknown keys, ignored: {', '.join(unknown)}",
+                      f"remove them from {CONFIG}")
+    return _check("config", name, "ok", f"{len(data)} preference(s)")
+
+
+def _is_number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _is_whole(v) -> bool:
+    """What Swift decodes as Int: 30 and 30.0 pass, 30.5 and anything past Int64 don't."""
+    if isinstance(v, float) and not (math.isfinite(v) and v.is_integer()):
+        return False
+    return _is_number(v) and -2 ** 63 <= v < 2 ** 63
+
+
+def _is_rule(v) -> bool:
+    return (isinstance(v, dict) and _finite(v.get("every_s"))
+            and all(v.get(k) is None or _finite(v[k]) for k in ("reset_within_min", "usage_above_pct")))
+
+
+# A Double field: json.load reads 1e400 as inf without the parse_constant hook seeing it, and
+# cmon Bar's decoder refuses any number past what a Double holds, so _finite, not _is_number.
+BAR_FIELDS = {  # key -> (test, what it must be), as cmon Bar's Settings decoder reads them
+    "segments": (lambda v: isinstance(v, list) and all(isinstance(s, str) for s in v), "a list of strings"),
+    "separator": (lambda v: isinstance(v, str), "a string"),
+    "hide_empty": (lambda v: isinstance(v, bool), "true or false"),
+    "reset_above_percent": (_finite, "a number"),
+    "reset_within_min": (_finite, "a number"),
+    "refresh": (lambda v: isinstance(v, list) and all(_is_rule(r) for r in v),
+                "a list of rules, each with a number every_s"),
+    "stale_minutes": (_is_whole, "a whole number"),
+    "cmon": (lambda v: isinstance(v, str), "a string"),
+    "watch_command": (lambda v: isinstance(v, str), "a string"),
+}
+
+
+def _doctor_bar() -> dict:
+    """Held to cmon Bar's decoder, not just JSON syntax: a wrong type makes the app drop the
+    whole file for its defaults. null and unknown keys are fine there, so they are here."""
+    name = "bar.json is valid"
+    path = os.path.join(CMON_HOME, "bar.json")
+    fix = f"fix {path}, or delete it to get the defaults"
+    present, data, err = _doctor_read_json(path)
+    if not present:
+        return _check("bar", name, "ok", "not present; cmon Bar writes the defaults on first run")
+    if err or not isinstance(data, dict):
+        return _check("bar", name, "fail", err or "not a JSON object", fix)
+    problems = [f"{key} must be {want}" for key, (test, want) in BAR_FIELDS.items()
+                if data.get(key) is not None and not test(data[key])]
+    if problems:
+        return _check("bar", name, "fail", "; ".join(problems), fix)
+    return _check("bar", name, "ok")
+
+
+def _doctor_lines(c: dict) -> list[str]:
+    head = f"  {DOCTOR_TAGS[c['status']]:<6}{c['name']}"
+    if c["status"] in ("ok", "skip"):
+        return [f"{head} ({c['detail']})" if c["detail"] else head]
+    lines = [head]
+    if c["detail"]:
+        lines.append(f"        {c['detail']}")
+    if c["fix"]:
+        lines.append(f"        -> {c['fix']}")
+    return lines
+
+
+def doctor(args):
+    """Every check runs, then exit 1 if any failed. A warning is something to know about that
+    doesn't stop cmon from working (no schedule, a stale snapshot, a held lock)."""
+    checks = [_doctor_token(), _doctor_api(args.offline), _doctor_schedule(), *_doctor_db(),
+              _doctor_sync_dir(_read_config()), _doctor_config(), _doctor_bar()]
+    failed = sum(c["status"] == "fail" for c in checks)
+    warned = sum(c["status"] == "warn" for c in checks)
+    if args.json:
+        print(json.dumps({"version": DOCTOR_VERSION, "ok": not failed, "checks": checks}, indent=2))
+    else:
+        for c in checks:
+            print("\n".join(_doctor_lines(c)))
+        notes = f"{warned} warning(s)" if warned else ""
+        if failed:
+            print(f"\n{failed} problem(s) found" + (f", {notes}." if notes else "."))
+        else:
+            print(f"\nNo problems, {notes}." if notes else "\nAll good.")
+    if failed:
+        sys.exit(1)
+
+
 def main():
     p = argparse.ArgumentParser(
         prog="cmon", description=__doc__.splitlines()[0],
@@ -4010,11 +5407,29 @@ def main():
     ps = sub.add_parser("status", help="single line for statusline/tmux/prompt (reads local cache)")
     ps.add_argument("--live", action="store_true", help="query API instead of local cache")
     ps.add_argument("--json", action="store_true", help="versioned JSON for the menu bar/scripts")
+    pg = sub.add_parser("guard", help="exit 1 if a window is at or above --max percent, 3 if there's no fresh "
+                                      "data, else 0 (reads local cache; for scripts and Claude Code hooks)")
+    pg.add_argument("--window", default="session",
+                    help="window to check: session (default; alias 5h), weekly_all (alias weekly) or a "
+                         "scoped model such as fable")
+    pg.add_argument("--max", type=_guard_number(100), required=True, metavar="N",
+                    help="percent at which the guard fails (exit 1)")
+    pg.add_argument("--stale-min", type=_guard_number(), default=GUARD_STALE_MIN, metavar="MIN",
+                    help=f"cache older than MIN minutes counts as no data (exit 3; default {GUARD_STALE_MIN})")
+    pg.add_argument("-q", "--quiet", action="store_true", help="no explanation on stderr")
+    pg.add_argument("--json", action="store_true",
+                    help="print {window, percent, max, resets_at, age_s, result} on stdout")
+    sub.add_parser("statusline", help="line for Claude Code's statusLine: plan from the local cache plus this "
+                                      "session's cost and points (reads its JSON on stdin; never the API or DB)")
     ptr = sub.add_parser("trends", help="consumption history: per-label summary + per-cycle peaks/anomaly")
     ptr.add_argument("--since", help="filter the summary from '24h', '7d' or ISO date")
     ptr.add_argument("--json", action="store_true", help="JSON output of the summary")
+    ptr.add_argument("--scoreboard", action="store_true",
+                     help=f"per weekly cycle (last {SCOREBOARD_CYCLES}): peak, percent left at the reset, hours "
+                          "the 5h window sat at 100 percent and 5h cycles that reached it, instead of the "
+                          "summary (--json prints a list; --since doesn't apply)")
     pb = sub.add_parser("burn", help="tokens & estimated US$ from local Claude Code logs")
-    pb.add_argument("--by", choices=["model", "surface", "day", "project", "session", "device"], default="model",
+    pb.add_argument("--by", choices=["model", "surface", "day", "project", "session", "device"],
                     help="group by model (default), surface (terminal/vscode/app/sdk), day, project, session or "
                          "device (see 'cmon sync')")
     pb.add_argument("--since",
@@ -4029,6 +5444,10 @@ def main():
     pb.add_argument("--json", action="store_true", help="JSON output")
     pb.add_argument("--all-accounts", action="store_true",
                     help="include Claude Desktop sessions not tied to the terminal's account")
+    pb.add_argument("--cache", action="store_true",
+                    help="cache efficiency instead of totals: hit rate, cache rewritten after more than 1h "
+                         "idle by project and session, and /compact candidates (estimate; not with --by "
+                         "or --plan)")
     psy = sub.add_parser("sync", help="exchange usage rows with your other devices through a synced folder "
                                       "('cmon config set sync_dir …'); 'collect' does it by itself once set")
     psy.add_argument("--dir", help="sync folder for this run (default: config sync_dir)")
@@ -4038,8 +5457,9 @@ def main():
     pc.add_argument("--force", action="store_true", help="save even with recent snapshot (bypass dedup)")
     pc.add_argument("--alert", action="store_true",
                     help="alerts (stderr + desktop notification + CMON_HOOK): rate hits 100%% "
-                         "before reset, or a window is within its lead of resetting "
-                         "(CMON_ALERT_LEAD / CMON_ALERT_LEAD_WEEKLY min)")
+                         "before reset, a window is within its lead of resetting "
+                         "(CMON_ALERT_LEAD / CMON_ALERT_LEAD_WEEKLY min), or it reached a percent "
+                         "set in config alert_at")
     pw = sub.add_parser("watch", help="live TUI with current usage, recording each read (Ctrl-C quits)")
     pw.add_argument("-n", "--interval", type=int, default=75, help="seconds between updates (default 75)")
     pw.add_argument("-u", "--usage", action="store_true", help="show the Usage bar column")
@@ -4060,7 +5480,11 @@ def main():
     pin.add_argument("-i", "--interval", type=int, default=20, help="minutes between collections (default 20)")
     pin.add_argument("--dry-run", action="store_true", help="show what it would do, don't install")
     sub.add_parser("uninstall", help="remove scheduling created by install")
-    pim = sub.add_parser("import", help="merge history from other cmon databases (e.g. old ./usage.duckdb)")
+    pdr = sub.add_parser("doctor", help="check token, API, background collection, database, sync_dir and "
+                                        "settings files; each problem comes with its fix (exit 1 if any fails)")
+    pdr.add_argument("--offline", action="store_true", help="skip the one API call")
+    pdr.add_argument("--json", action="store_true", help="{version, ok, checks[]} for assistants and scripts")
+    pim =sub.add_parser("import", help="merge history from other cmon databases (e.g. old ./usage.duckdb)")
     pim.add_argument("paths", nargs="+", metavar="PATH", help="source .duckdb files (opened read-only)")
     pp = sub.add_parser("plot", help="generate charts -> PNG (trajectory, pace-vs-target, burn)")
     pp.add_argument("-o", "--out", default=None,
@@ -4080,8 +5504,9 @@ def main():
                           description="Currently supports: timezone (used to display timestamps "
                                       "locally instead of UTC), quiet_hours (hours projections skip), "
                                       "keepalive (on: open a new 5h window when the last one ends), "
-                                      "sync_dir (folder shared with your other devices) and device_name "
-                                      "(this machine's label there).")
+                                      "sync_dir (folder shared with your other devices), device_name "
+                                      "(this machine's label there) and alert_at (percents that "
+                                      "'collect --alert' notifies at, e.g. 'session=80,95 weekly=90').")
     cfa = pcfg.add_subparsers(dest="action", required=True)
     cfset = cfa.add_parser("set", help="set a preference")
     cfset.add_argument("key", choices=sorted(CONFIG_KEYS))
@@ -4094,6 +5519,8 @@ def main():
     cfclr.add_argument("--all", action="store_true", help="remove every persisted preference")
 
     args = p.parse_args()
+    if _ENV_ERRORS and args.cmd != "guard":  # guard reports it as no data: its exit 1 means "over"
+        sys.exit(f"cmon: {'; '.join(_ENV_ERRORS)}.")
     if args.db:
         global DB
         DB = args.db
@@ -4105,10 +5532,12 @@ def main():
          "clear": config_clear}[args.action](args)
         return
     try:
-        {"now": now, "status": status, "trends": trends, "collect": collect,
+        {"now": now, "status": status, "guard": guard, "statusline": statusline, "trends": trends,
+         "collect": collect,
          "burn": burn, "watch": watch, "wait": wait, "plot": plot,
          "backtest": backtest, "tune": tune, "install": install,
-         "uninstall": uninstall, "import": import_db, "keepalive": keepalive, "sync": sync}[args.cmd](args)
+         "uninstall": uninstall, "import": import_db, "keepalive": keepalive, "sync": sync,
+         "doctor": doctor}[args.cmd](args)
     except FetchError as e:
         sys.exit(f"cmon: {e}")
 

@@ -47,7 +47,9 @@ struct Settings: Codable {
     /// reset is at most `resetWithinMin` minutes away. {5h_bar} {wk_bar} draw the usage as a
     /// block, {5h_dot} {wk_dot} as a traffic light. {top_client} {5h_top_client} name the
     /// client that used the most of the week or the 5h window (`VS Code 59%`), blank until
-    /// `cmon collect` has split the cycle.
+    /// `cmon collect` has split the cycle. {5h_proj} {wk_proj} are the projected percent at
+    /// reset (`112%`) and {5h_eta} the time until the 5h window hits 100% at that pace (`80m`),
+    /// blank until projected; {5h_eta} is also blank when the projection stays under 100%.
     /// With `hideEmpty`, a word holding a blank placeholder is dropped along with its
     /// decoration (`↻{reset_short}`), and so is a segment left with nothing: for labelled
     /// layouts, where positions don't carry the meaning.
@@ -161,14 +163,25 @@ struct Quota: Decodable, Sendable {
     let percent: Double
     let resetsAt: String?
     let byClient: ClientSplit?
+    /// Optional projection, written by `cmon collect` (also `watch`, `now`): the percent at reset
+    /// at the current pace, when that pace hits 100% (nil if not before the reset), and when
+    /// it was computed. Absent until computed for the current cycle.
+    let projectedPercent: Double?
+    let exhaustsAt: String?
+    let projectionAt: String?
 
     enum CodingKeys: String, CodingKey {
         case key, label, percent
         case resetsAt = "resets_at"
         case byClient = "by_client"
+        case projectedPercent = "projected_percent"
+        case exhaustsAt = "exhausts_at"
+        case projectionAt = "projection_at"
     }
 
     var resetDate: Date? { resetsAt.flatMap(parseISO) }
+    var exhaustsDate: Date? { exhaustsAt.flatMap(parseISO) }
+    var projectionDate: Date? { projectionAt.flatMap(parseISO) }
 }
 
 struct Snapshot: Decodable, Sendable {
@@ -260,6 +273,30 @@ func topClient(_ q: Quota?) -> String {
     return "\(top.label) \(Int((top.share * 100).rounded()))%"
 }
 
+/// Seconds until the window hits 100% at the projected pace: nil unless the projection
+/// reaches 100% before the reset and that moment is still ahead (a lapsed one is stale).
+func exhaustsIn(_ q: Quota?, now: Date) -> TimeInterval? {
+    guard let q, let p = q.projectedPercent, p >= 100, let at = q.exhaustsDate, at > now else { return nil }
+    return at.timeIntervalSince(now)
+}
+
+/// Projected percent at reset with its unit, blank until `cmon collect` has projected the cycle.
+func projectedText(_ q: Quota?) -> String {
+    q?.projectedPercent.map { "\(Int($0.rounded()))%" } ?? ""
+}
+
+/// Menu row line for the projection: "Projected 64% at reset", or past 100% when the limit is
+/// hit, plus its age once it is minutes old (it comes from the last collect, not the latest read).
+func projectionDetail(_ q: Quota, now: Date) -> String? {
+    guard let p = q.projectedPercent else { return nil }
+    var text = "Projected \(Int(p.rounded()))%"
+    text += exhaustsIn(q, now: now).map { " · 100% in \(spacedDuration($0))" } ?? " at reset"
+    if let at = q.projectionDate, now.timeIntervalSince(at) >= 120 {
+        text += " · \(spacedDuration(now.timeIntervalSince(at))) ago"
+    }
+    return text
+}
+
 /// A legend line of the "By client" menu section.
 struct ClientLine: Equatable {
     let label: String
@@ -309,6 +346,9 @@ func renderTitle(_ settings: Settings, _ snap: Snapshot, now: Date) -> String {
         "age": snap.observedDate.map { String(Int(now.timeIntervalSince($0) / 60)) } ?? "–",
         "top_client": topClient(weekly),
         "5h_top_client": topClient(session),
+        "5h_proj": projectedText(session),
+        "wk_proj": projectedText(weekly),
+        "5h_eta": exhaustsIn(session, now: now).map { unitDuration($0, hours: false) } ?? "",
     ]
     func fill(_ text: String) -> String {
         values.reduce(text) { $0.replacingOccurrences(of: "{\($1.key)}", with: $1.value) }
@@ -343,13 +383,17 @@ func resetDetail(_ q: Quota, now: Date) -> String {
 
 final class QuotaRowView: NSView {
     private let title: String, percent: Double
+    private let overrun: Bool  // projected past 100%: the projection line takes the warning tint
     var detail: String { didSet { if detail != oldValue { needsDisplay = true } } }
+    var projection: String? { didSet { if projection != oldValue { needsDisplay = true } } }
 
-    init(title: String, percent: Double, detail: String) {
+    init(title: String, percent: Double, detail: String, projection: String? = nil, overrun: Bool = false) {
         self.title = title
         self.percent = percent
         self.detail = detail
-        super.init(frame: NSRect(x: 0, y: 0, width: 280, height: 56))
+        self.projection = projection
+        self.overrun = overrun
+        super.init(frame: NSRect(x: 0, y: 0, width: 280, height: projection == nil ? 56 : 72))
         autoresizingMask = .width
     }
 
@@ -384,6 +428,10 @@ final class QuotaRowView: NSView {
         }
 
         (detail as NSString).draw(at: NSPoint(x: inset, y: 37), withAttributes: caption)
+        if let projection {
+            let attrs = overrun ? caption.merging([.foregroundColor: NSColor.systemOrange]) { $1 } : caption
+            (projection as NSString).draw(at: NSPoint(x: inset, y: 53), withAttributes: attrs)
+        }
     }
 
     private var tint: NSColor {
@@ -567,7 +615,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let now = Date()
         render()
         if menuOpen, let snap = snapshot {
-            for q in snap.windows { rowViews[q.key]?.detail = resetDetail(q, now: now) }
+            for q in snap.windows {
+                rowViews[q.key]?.detail = resetDetail(q, now: now)
+                rowViews[q.key]?.projection = projectionDetail(q, now: now)
+            }
             updatedItem?.title = updatedTitle(snap, now: now)
         }
         // The window just rolled over: fetch the new cycle (every 5 s until it shows up).
@@ -722,7 +773,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let snap = snapshot, !snap.offline {
             for q in snap.windows {
                 let row = NSMenuItem()
-                let view = QuotaRowView(title: displayName(q), percent: q.percent, detail: resetDetail(q, now: now))
+                let view = QuotaRowView(title: displayName(q), percent: q.percent, detail: resetDetail(q, now: now),
+                                        projection: projectionDetail(q, now: now),
+                                        overrun: (q.projectedPercent ?? 0) >= 100)
                 rowViews[q.key] = view
                 row.view = view
                 menu.addItem(row)
