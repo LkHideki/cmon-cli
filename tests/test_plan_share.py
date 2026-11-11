@@ -180,3 +180,25 @@ def test_burn_surface_filter(week, capsys):
     assert got["groups"][0]["plan_pp"] == pytest.approx(1) and got["rest_pp"] == pytest.approx(3)
     out = burn(capsys, json=False, surface="vscode")
     assert "· vscode only" in out and "rest (filtered out)" in out
+
+
+def test_client_split_reaches_status_json(con, monkeypatch):
+    snap(con, T0, 0)
+    tok(con, T0 + MIN, "cli", out=3_000_000)
+    tok(con, T0 + MIN, "claude-vscode")
+    snap(con, T0 + 10 * MIN, 8)
+    rows = [("weekly_all", "All models", 8.0, RESET.isoformat(), True)]
+    cmon._refresh_client_share(con, rows, T0 + 10 * MIN)
+    w = cmon._status_json((rows, 0.0))["providers"]["claude"]["windows"][0]
+    assert w["by_client"]["clients"] == [{"key": "cli", "label": "Terminal", "share": 0.75},
+                                         {"key": "claude-vscode", "label": "VS Code", "share": 0.25}]
+    assert w["by_client"]["other"] == 0
+    # a new cycle began: the cached split belongs to the old one and is left out
+    later = [("weekly_all", "All models", 1.0, (RESET + timedelta(days=7)).isoformat(), True)]
+    assert "by_client" not in cmon._status_json((later, 0.0))["providers"]["claude"]["windows"][0]
+
+
+def test_status_json_without_split_is_unchanged(home):
+    rows = [("weekly_all", "All models", 8.0, RESET.isoformat(), True)]
+    assert set(cmon._status_json((rows, 0.0))["providers"]["claude"]["windows"][0]) == {
+        "key", "label", "percent", "resets_at", "active"}

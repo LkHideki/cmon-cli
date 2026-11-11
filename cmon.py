@@ -1375,6 +1375,7 @@ def collect(args):
     for _k, lbl, pct, reset, _a in rows:
         print(f"  {lbl:16} {pct:4.0f}%  reset {reset[:16] if reset else '-'}")
     _collect_sync(con)
+    _refresh_client_share(con, rows, ts)
     if getattr(args, "alert", False):
         _fire_rate_alerts(rows, con)  # rate-based: at current pace hits 100% before reset
         _fire_lead_alert(rows)  # time-based: 5h window resets in <= CMON_ALERT_LEAD min (+ hook)
@@ -2837,10 +2838,62 @@ def _status_json(got) -> dict:
         return {"version": 1, "offline": True, "observed_at": None, "age_s": None, "providers": {}}
     rows, age = got
     observed = datetime.now(UTC) - timedelta(seconds=age)
-    windows = [{"key": key, "label": label, "percent": percent, "resets_at": resets_at,
-                "active": bool(active)} for key, label, percent, resets_at, active in rows]
+    windows = []
+    for key, label, percent, resets_at, active in rows:
+        w = {"key": key, "label": label, "percent": percent, "resets_at": resets_at, "active": bool(active)}
+        if resets_at and (split := _client_share_for(key, resets_at)):
+            w["by_client"] = split  # optional, from the last 'collect'
+        windows.append(w)
     return {"version": 1, "offline": False, "observed_at": observed.isoformat(),
             "age_s": round(age), "providers": {"claude": {"windows": windows}}}
+
+
+CLIENT_NAMES = {"cli": "Terminal", "claude-vscode": "VS Code", "claude-desktop": "Desktop app",
+                "sdk-cli": "SDK"}
+SHARE_WINDOWS = {"session": 300, "weekly_all": 10080}
+
+
+def _clients_cache() -> str:
+    return os.path.join(CMON_HOME, "clients.json")
+
+
+def _refresh_client_share(con, rows, now_utc) -> None:
+    """Cache each window's split by client over its current cycle, for 'status --json' and
+    cmon Bar: status must stay a file read, and the split needs the database. Best-effort."""
+    try:
+        cycles = {}
+        for key, _lbl, _pct, reset, _a in rows:
+            if key in SHARE_WINDOWS and reset:
+                cycles[key] = (reset, datetime.fromisoformat(reset) - timedelta(minutes=SHARE_WINDOWS[key]))
+        if not cycles:
+            return
+        scan_logs(con, since=min(start for _r, start in cycles.values()), quiet=True)
+        windows = {}
+        for key, (reset, start) in cycles.items():
+            got = _plan_share(con, key, since=start)
+            if not got or got["total"] <= 0:
+                continue
+            total = got["total"]
+            clients = [{"key": g, "label": CLIENT_NAMES.get(g, g), "share": round(v / total, 4)}
+                       for g, v in sorted(got["groups"].items(), key=lambda kv: -kv[1]) if v / total >= 0.005]
+            windows[key] = {"resets_at": reset, "clients": clients, "other": round(got["other"] / total, 4)}
+        _atomic_write_json(_clients_cache(), {"version": 1, "computed_at": now_utc.isoformat(), "windows": windows})
+    except Exception as e:
+        print(f"cmon: client split skipped: {e}", file=sys.stderr)
+
+
+def _client_share_for(key, resets_at):
+    """Cached split of `key` if it was computed for the same cycle, else None."""
+    try:
+        with open(_clients_cache(), encoding="utf-8") as f:
+            data = json.load(f)
+        w = data["windows"][key]
+        if abs((datetime.fromisoformat(w["resets_at"]) - datetime.fromisoformat(resets_at)).total_seconds()) \
+                > CYCLE_JITTER_S:
+            return None  # a new cycle began since: the old split would be wrong
+        return {"computed_at": data["computed_at"], "clients": w["clients"], "other": w["other"]}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
 
 
 def status(args):
