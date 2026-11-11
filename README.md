@@ -366,7 +366,23 @@ delta versus the previous one, and a warning if the current cycle deviates from 
 uv run cmon trends                # summary + cycle breakdown
 uv run cmon trends --since 24h    # summary over the last 24h (accepts 7d or ISO date)
 uv run cmon trends --json         # JSON summary for script/pipe
+uv run cmon trends --scoreboard   # one row per weekly cycle: peak, leftover, time blocked
 ```
+
+**Cycle scoreboard.** `--scoreboard` replaces the output above with one row per weekly
+(All models) cycle, the last 8, oldest first: when it started, its peak, what was left at the
+reset (100% minus the cycle's last reading), the hours the 5h window spent at 100% inside it,
+and how many 5h cycles reached 100%. The current cycle is marked *in progress*, and its leftover
+is what's left so far. Frequent 5h blocks with weekly leftover point to bursts that could be
+spread out; a high leftover with no blocks points to a plan bigger than the usage. `--json`
+prints the rows as a list of `{start, peak_pct, leftover_pct, in_progress, blocked_h,
+blocked_5h_cycles}`, with `start` in ISO 8601 UTC; `--since` doesn't apply.
+
+Blocked time is measured between snapshots, so its resolution is the collection interval
+(20 minutes with `cmon install`): a block that starts and ends between two collections doesn't
+show, a 5h cycle seen at 100% by a single reading counts as a hit with no hours, and the minutes
+before the first and after the last 100% reading aren't counted. A gap in the readings longer
+than the 5h window isn't counted either, since a reset may have happened inside it.
 
 ### `cmon burn` — tokens & cost (from logs)
 

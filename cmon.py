@@ -3314,6 +3314,71 @@ def _cycles(con, key: str) -> list:
     return segs
 
 
+SCOREBOARD_CYCLES = 8  # weekly cycles shown by 'trends --scoreboard'
+
+
+def _scoreboard(con, now: datetime) -> list[dict]:
+    """The last SCOREBOARD_CYCLES weekly_all cycles, oldest first: start, peak, what was left
+    at the reset (100 minus the cycle's last reading), hours the 5h window sat at 100% inside
+    the cycle and how many 5h cycles reached 100%.
+
+    A weekly cycle runs from its first reading to the next cycle's first reading. Blocked time
+    is the sum of the gaps between consecutive readings of one 5h cycle that start at 100%, so
+    it only sees what the collection interval sees: the stretch before the first 100% reading
+    and after the last one is not counted, and a 5h cycle with one 100% reading counts as a hit
+    with no hours. A gap longer than the 5h window hides a reset and is left out. The last
+    cycle is in progress unless its latest reading says it already reset."""
+    weeks = _cycles(con, "weekly_all")[-SCOREBOARD_CYCLES:]
+    if not weeks:
+        return []
+    window = timedelta(minutes=300)
+    hits, blocked = [], []  # first 100% reading of each 5h cycle; (from, to) spans at 100%
+    for s in _cycles(con, "session"):  # percent never drops inside a cycle, so 100% holds to its end
+        first = next((i for i, p in enumerate(s.percent) if p >= 100), None)
+        if first is None:
+            continue
+        hits.append(s.ts[first])
+        blocked += [(a, b) for a, b in zip(s.ts[first:], s.ts[first + 1:], strict=False) if b - a <= window]
+    last = con.execute("SELECT resets_at FROM snapshots WHERE provider='claude' AND key='weekly_all' "
+                       "ORDER BY observed_at DESC LIMIT 1").fetchone()
+    still_open = last is None or last[0] is None or last[0] > now
+    out = []
+    for i, w in enumerate(weeks):
+        lo = w.ts[0]
+        hi = weeks[i + 1].ts[0] if i + 1 < len(weeks) else None
+        secs = 0.0
+        for a, b in blocked:
+            a, b = max(a, lo), b if hi is None else min(b, hi)
+            if b > a:
+                secs += (b - a).total_seconds()
+        out.append({"start": lo, "peak_pct": round(max(w.percent), 1),
+                    "leftover_pct": round(100 - w.percent[-1], 1),
+                    "in_progress": hi is None and still_open,
+                    "blocked_h": round(secs / 3600, 2),
+                    "blocked_5h_cycles": sum(1 for t in hits if t >= lo and (hi is None or t < hi))})
+    return out
+
+
+def _print_scoreboard(rows: list[dict]) -> None:
+    tz = _resolve_tz()
+    head = ("start", "peak", "left at reset", "5h blocked", "5h cycles at 100%")
+    cells = [(f"{r['start'].astimezone(tz):%Y-%m-%d %H:%M %Z}", f"{r['peak_pct']:.0f}%",
+              f"{r['leftover_pct']:.0f}%", f"{r['blocked_h']:.1f}h", str(r["blocked_5h_cycles"]),
+              "in progress" if r["in_progress"] else "") for r in rows]
+    widths = [max(len(h), *(len(c[j]) for c in cells)) for j, h in enumerate(head)]
+
+    def line(vals):
+        first = f"{vals[0]:<{widths[0]}}"
+        return "  " + "  ".join([first, *(f"{v:>{w}}" for v, w in zip(vals[1:], widths[1:], strict=False))])
+
+    print(f"Weekly (All models) — last {len(rows)} cycle(s):")
+    print(line(head))
+    for c in cells:
+        print((line(c[:5]) + (f"  {c[5]}" if c[5] else "")).rstrip())
+    print("Blocked time is measured between snapshots: a block shorter than the collection interval "
+          "doesn't show.")
+
+
 def trends(args):
     """Consumption history: a per-label summary (snapshots/peak/total consumed over --since,
     --json for scripts) followed by the reset-aware per-cycle breakdown — peak per cycle,
@@ -3321,6 +3386,16 @@ def trends(args):
     con = db(create=False)
     if con is None:
         sys.exit("No history — run 'cmon collect' a few times first.")
+    if getattr(args, "scoreboard", False):
+        rows = _scoreboard(con, datetime.now(UTC))
+        if getattr(args, "json", False):
+            print(json.dumps([{**r, "start": r["start"].astimezone(UTC).isoformat(timespec="seconds")}
+                              for r in rows], ensure_ascii=False))
+            return
+        if not rows:
+            sys.exit("No weekly cycles yet — run 'cmon collect' a few times first.")
+        _print_scoreboard(rows)
+        return
     g = _summary(con, _parse_since(getattr(args, "since", None)))
     if getattr(args, "json", False):
         print(json.dumps(g, ensure_ascii=False))
@@ -4409,6 +4484,10 @@ def main():
     ptr = sub.add_parser("trends", help="consumption history: per-label summary + per-cycle peaks/anomaly")
     ptr.add_argument("--since", help="filter the summary from '24h', '7d' or ISO date")
     ptr.add_argument("--json", action="store_true", help="JSON output of the summary")
+    ptr.add_argument("--scoreboard", action="store_true",
+                     help=f"per weekly cycle (last {SCOREBOARD_CYCLES}): peak, percent left at the reset, hours "
+                          "the 5h window sat at 100 percent and 5h cycles that reached it, instead of the "
+                          "summary (--json prints a list; --since doesn't apply)")
     pb = sub.add_parser("burn", help="tokens & estimated US$ from local Claude Code logs")
     pb.add_argument("--by", choices=["model", "surface", "day", "project", "session", "device"], default="model",
                     help="group by model (default), surface (terminal/vscode/app/sdk), day, project, session or "

@@ -40,6 +40,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   cycle that began today counts from its reset, a reset later today makes all that's left today's,
   a gap in the readings around midnight moves the count to the first reading of the day, and with
   no earlier reading today the line shows only the budget. No line without a weekly window.
+- **`cmon trends --scoreboard`: how each weekly cycle went.** One row per weekly cycle, the last
+  8: start, peak, what was left at the reset, hours the 5h window sat at 100% inside it and how
+  many 5h cycles reached 100%, with the current cycle marked *in progress*. `--json` prints a
+  list. Blocked time is measured between snapshots, so a block shorter than the collection
+  interval doesn't show. `trends` without the flag is unchanged.
 
 ### Changed
 
