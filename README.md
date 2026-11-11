@@ -295,7 +295,8 @@ model such as `fable`. The one-line explanation goes to stderr (`--quiet` drops 
 ```
 
 `result` is `under`, `over`, `no_data`, `missing` or `stale`; `percent` and `resets_at` are
-`null` unless it's `under` or `over`, and `resets_at` is also `null` once the cached cycle ended.
+`null` unless it's `under` or `over`, and `resets_at` is also `null` once the cached cycle ended
+or when the cached reset time can't be read, in which case the percent alone decides.
 
 `guard` reads only the cache that `cmon collect` (every 20 min after `cmon install`),
 `status --live` and cmon Bar keep. It never calls the API or opens the database, so it takes

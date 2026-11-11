@@ -454,6 +454,7 @@ def test_bar_absent_or_valid_is_ok(paths):
     ('{"refresh": [{"reset_within_min": 5}]}', "refresh must be a list of rules"),
     ('{"refresh": [{"every_s": "60"}]}', "refresh must be a list of rules"),
     ('{"separator": 5, "cmon": false}', "separator must be a string; cmon must be a string"),
+    pytest.param("[" * 100_000, "nested too deeply", id="deep-nesting"),  # RecursionError: was a traceback
 ])
 def test_bar_problems_fail_like_the_app_decoder(paths, text, needle):
     c = _bar(paths, text)

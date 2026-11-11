@@ -3277,8 +3277,8 @@ def guard(args):
             reset = row[3] if isinstance(row[3], str) and row[3] else None
             try:
                 ended = reset is not None and datetime.fromisoformat(reset) <= datetime.now(UTC)
-            except (ValueError, TypeError):
-                ended = False
+            except (ValueError, TypeError):  # unreadable or without an offset: judge the percent alone
+                reset, ended = None, False
             if ended:  # the cycle rolled over since the last read: nothing used in the new one yet
                 pct, reset = 0.0, None
             out |= {"percent": float(pct), "resets_at": reset,
@@ -3366,7 +3366,7 @@ def _statusline_input() -> dict:
             return {}  # run by hand: don't wait for input that won't come
         raw = stdin.buffer.read(STATUSLINE_STDIN_MAX) if hasattr(stdin, "buffer") else stdin.read(STATUSLINE_STDIN_MAX)
         data = json.loads(raw) if raw.strip() else {}
-    except (OSError, ValueError, TypeError, AttributeError):
+    except (OSError, ValueError, TypeError, AttributeError, RecursionError):  # deep nesting overflows the parser
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -5151,6 +5151,8 @@ def _doctor_read_json(path: str) -> tuple[bool, object, str | None]:
         return False, None, None
     except json.JSONDecodeError as e:
         return True, None, f"not valid JSON: {e.msg} at line {e.lineno}, column {e.colno}"
+    except RecursionError:
+        return True, None, "not valid JSON: nested too deeply"
     except (OSError, UnicodeDecodeError, ValueError) as e:
         return True, None, f"unreadable: {_safe(e)}"
 

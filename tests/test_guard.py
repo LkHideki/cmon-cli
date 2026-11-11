@@ -113,6 +113,18 @@ def test_malformed_percent_is_3(cli, clock, no_backend):
     assert "no usable percent" in result.stderr
 
 
+@pytest.mark.parametrize("reset", ["garbage", "2030-01-02T08:00:00"])  # unparseable; no offset
+@pytest.mark.parametrize(("pct", "code", "result"), [(10.0, 0, "under"), (95.0, 1, "over")])
+def test_unreadable_reset_judges_the_percent_alone(cli, clock, no_backend, reset, pct, code, result):
+    # Was a traceback and exit 1, which a hook reads as "over --max" even at 10%.
+    _cache(clock, [("session", "Current session", pct, reset, True)])
+    out = cli("guard", "--max", "80", "--json")
+    assert out.exit_code == code
+    assert _json(out) == {"window": "session", "percent": pct, "max": 80.0, "resets_at": None,
+                          "age_s": 300, "result": result}
+    assert "resets in" not in out.stderr
+
+
 def test_missing_window_is_3_and_lists_known_ones(cli, clock, no_backend):
     _cache(clock)
     result = cli("guard", "--window", "opus", "--max", "90", "--json")

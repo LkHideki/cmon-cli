@@ -191,6 +191,8 @@ def test_points_without_cost_still_show(clock, cli, stdin, no_backend):
     '{"rate_limits": "x"}', '{"rate_limits": {"five_hour": {"used_percentage": true}}}',
     '{"rate_limits": {"five_hour": {"used_percentage": "9"}, "seven_day": []}}',
     b"\xff\xfe garbage", "\ufeff{}",
+    # nested past the parser's recursion limit: RecursionError, not a ValueError
+    pytest.param("[" * 200_000, id="deep-array"), pytest.param('{"a":' * 100_000, id="deep-object"),
 ])
 def test_bad_stdin_prints_the_plan_part(clock, cli, stdin, no_backend, payload):
     cache(clock)
