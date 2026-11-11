@@ -545,7 +545,8 @@ def token_clear(_):
 
 # --- Config: persisted user preferences (~/.cmon/config.json) ---
 CONFIG = os.path.expanduser("~/.cmon/config.json")
-CONFIG_KEYS = {"timezone", "quiet_hours", "keepalive"}  # allowlist; extend here as new preferences are added
+# allowlist; extend here as new preferences are added
+CONFIG_KEYS = {"timezone", "quiet_hours", "keepalive", "sync_dir", "device_name"}
 
 
 def _validate_timezone(value: str) -> str:
@@ -612,8 +613,24 @@ def _validate_keepalive(value: str) -> str:
     return value
 
 
+def _validate_sync_dir(value: str) -> str:
+    path = os.path.abspath(os.path.expanduser(value))
+    if not os.path.isdir(path):
+        raise ValueError(f"Invalid sync_dir {value!r}: not an existing folder. Use one your devices already "
+                         "sync (iCloud Drive, Dropbox, Syncthing…).")
+    return path
+
+
+def _validate_device_name(value: str) -> str:
+    name = value.strip()
+    if not (0 < len(name) <= 40) or not all(c.isalnum() or c in " ._-" for c in name):
+        raise ValueError(f"Invalid device_name {value!r}. Use up to 40 letters, digits, spaces, '.', '_' or '-'.")
+    return name
+
+
 CONFIG_VALIDATORS = {"timezone": _validate_timezone, "quiet_hours": _validate_quiet_hours,
-                     "keepalive": _validate_keepalive}
+                     "keepalive": _validate_keepalive, "sync_dir": _validate_sync_dir,
+                     "device_name": _validate_device_name}
 
 
 def _read_config() -> dict:
@@ -3217,6 +3234,138 @@ def _parse_many(paths: list) -> list:
         return [_parse_jsonl(p) for p in paths]
 
 
+# --- Devices: each machine shares its own rows through a folder the user already syncs ---
+def _device_name() -> str:
+    """This machine's label: config device_name, else the short hostname."""
+    import socket
+    name = _read_config().get("device_name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    host = socket.gethostname().split(".")[0]
+    return "".join(c for c in host if c.isalnum() or c in " ._-")[:40] or "this device"
+
+
+def _device_id(con) -> str:
+    """Random id of this database, made once. Names the machine's file in sync_dir."""
+    got = _meta_get(con, "device_id")
+    if got and got[0]:
+        return got[0]
+    import uuid
+    dev = uuid.uuid4().hex[:16]
+    _meta_set(con, "device_id", dev)
+    return dev
+
+
+def _sql_str(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _device_col() -> str:
+    """SQL for a token row's device. Rows read here have no metadata and belong to this machine;
+    imported rows carry their device id, named by the latest name that device exported."""
+    dev = "json_extract_string(metadata_json, '$.device_id')"
+    return (f"coalesce((SELECT value FROM meta WHERE key = 'device:' || {dev}), {dev}, "
+            f"{_sql_str(_device_name())})")
+
+
+SYNC_COLS = ("source_event_id, observed_at, model, surface, project, session_id, input_tokens, output_tokens, "
+             "reasoning_tokens, cache_read_tokens, cache_write_tokens")
+
+
+def sync_devices(con, sync_dir: str) -> dict:
+    """Write this machine's rows to <sync_dir>/<device id>.parquet and import the other
+    machines' files. Exports only rows read from this machine's own transcripts (never
+    imported ones, so nothing echoes back) and only the terminal account's (token_terminal).
+    A file from another account is skipped: it would charge someone else's usage to this
+    plan. Imports are idempotent (same message keys), so a copy made by the sync tool is
+    harmless. Imported Desktop sessions are mapped to the terminal account, which their
+    exporter already checked, so token_terminal keeps them."""
+    import glob
+    account = _terminal_account()
+    if not account:
+        raise RuntimeError("the terminal's Claude Code account is unknown (log in to Claude Code first)")
+    _meta_set(con, "terminal_account", account)
+    dev, name = _device_id(con), _device_name()
+    _meta_set(con, f"device:{dev}", name)
+    out = {"device": name, "exported": None, "imported": {}, "other_account": [], "errors": []}
+    local = "FROM token_terminal WHERE metadata_json IS NULL"
+    count, last = con.execute(f"SELECT count(*), max(observed_at) {local}").fetchone()
+    target = os.path.join(sync_dir, f"{dev}.parquet")
+    sig = f"{count}|{last}|{name}"
+    if (_meta_get(con, "sync_export") or ("",))[0] != sig or not os.path.exists(target):
+        tmp = os.path.join(sync_dir, f".{dev}.parquet.tmp")
+        con.execute(f"COPY (SELECT {SYNC_COLS}, {_sql_str(account)} account, {_sql_str(dev)} device_id, "
+                    f"{_sql_str(name)} device {local}) TO {_sql_str(tmp)} (FORMAT parquet, COMPRESSION zstd)")
+        os.chmod(tmp, 0o600)  # project names and session ids
+        os.replace(tmp, target)
+        _meta_set(con, "sync_export", sig)
+        out["exported"] = count
+    for path in sorted(glob.glob(os.path.join(sync_dir, "*.parquet"))):
+        try:
+            st = os.stat(path)
+            seen_key, seen = f"sync_seen:{os.path.basename(path)}", f"{st.st_mtime_ns}:{st.st_size}"
+            if (_meta_get(con, seen_key) or ("",))[0] == seen:
+                continue
+            acct, other, other_name = con.execute(
+                "SELECT any_value(account), any_value(device_id), arg_max(device, observed_at) "
+                "FROM read_parquet(?)", [path]).fetchone()
+            if other == dev or other is None:
+                continue  # this machine's own file (or an empty one)
+            if acct != account:
+                out["other_account"].append(other_name)
+                continue
+            con.execute("BEGIN")
+            try:
+                before = con.execute("SELECT count(*) FROM token_log").fetchone()[0]
+                con.execute(
+                    f"INSERT INTO token_log({_TOKEN_LOG_COLS}) SELECT 'claude', {SYNC_COLS}, 0, "
+                    "json_object('device_id', device_id) FROM read_parquet(?) WHERE source_event_id NOT IN "
+                    "(SELECT source_event_id FROM token_log WHERE provider = 'claude')", [path])
+                con.execute(
+                    "INSERT INTO session_account SELECT DISTINCT session_id, ? FROM read_parquet(?) "
+                    "WHERE surface = 'claude-desktop' AND session_id NOT IN (SELECT session FROM session_account)",
+                    [account, path])
+                added = con.execute("SELECT count(*) FROM token_log").fetchone()[0] - before
+                con.execute("COMMIT")
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
+            _meta_set(con, f"device:{other}", other_name)
+            _meta_set(con, seen_key, seen)
+            out["imported"][other_name] = out["imported"].get(other_name, 0) + added
+        except Exception as e:  # a file the sync tool is still writing, or not cmon's
+            out["errors"].append(f"{os.path.basename(path)}: {e}")
+    return out
+
+
+def sync(args):
+    """Exchange usage rows with the other devices through sync_dir."""
+    sync_dir = getattr(args, "dir", None) or _read_config().get("sync_dir")
+    if not sync_dir:
+        sys.exit("No sync folder: run 'cmon config set sync_dir <folder your devices sync>' "
+                 "(iCloud Drive, Dropbox, Syncthing…).")
+    try:
+        sync_dir = _validate_sync_dir(sync_dir)
+    except ValueError as e:
+        sys.exit(str(e))
+    con = _db_retry(30)
+    if con is None:
+        sys.exit("cmon: database locked by another cmon process for 30s — try again")
+    scan_logs(con)
+    try:
+        got = sync_devices(con, sync_dir)
+    except RuntimeError as e:
+        sys.exit(f"cmon sync: {e}")
+    exported = "unchanged" if got["exported"] is None else f"{got['exported']} rows"
+    print(f"{got['device']}: exported {exported} to {sync_dir}")
+    for name, n in got["imported"].items():
+        print(f"  imported {n} new rows from {name}")
+    if got["other_account"]:
+        print(f"  skipped (another Claude account): {', '.join(got['other_account'])}")
+    for e in got["errors"]:
+        print(f"  could not read {e}", file=sys.stderr)
+
+
 def _session_window_start(rows, now_utc):
     """Start of the CURRENT 5h rate-limit window (session resets_at − 5h), not a rolling
     now−5h — so burn/model-mix reflect only what you spent in this cycle. Falls back to
@@ -3346,7 +3495,7 @@ SURFACE_ALIASES = {"terminal": "cli", "vscode": "claude-vscode", "app": "claude-
 
 
 def _burn_filters(args) -> tuple[str, list, list[str]]:
-    """(' AND …' SQL, params, description) for burn's --surface. Values come from the user, so
+    """(' AND …' SQL, params, description) for burn's --surface/--device. Values come from the user, so
     they only ever travel as parameters."""
     sql, params, desc = "", [], []
     if getattr(args, "surface", None):
@@ -3354,6 +3503,11 @@ def _burn_filters(args) -> tuple[str, list, list[str]]:
         params += [SURFACE_ALIASES.get(n.lower(), n) for n in names]
         sql += f" AND surface IN ({', '.join('?' * len(names))})"
         desc.append(f"{', '.join(_surface(v) for v in params[-len(names):])} only")
+    if getattr(args, "device", None):
+        names = [n.strip() for n in args.device.split(",") if n.strip()]
+        params += names
+        sql += f" AND {_device_col()} IN ({', '.join('?' * len(names))})"
+        desc.append(f"{', '.join(names)} only")
     return sql, params, desc
 
 
@@ -3385,7 +3539,7 @@ def burn(args):
         since = _parse_since(raw_since)
     scan_logs(con, since)
     col = {"model": "model", "surface": "surface", "day": "CAST(observed_at AS DATE)",
-           "project": "project", "session": "session_id"}[args.by]
+           "project": "project", "session": "session_id", "device": _device_col()}[args.by]
     filt, fparams, fdesc = _burn_filters(args)
     where = "WHERE provider='claude'" + (" AND observed_at >= ?" if since else "") + filt
     wparams = ([since] if since else []) + fparams
@@ -3438,7 +3592,7 @@ def burn(args):
             print(json.dumps(items, ensure_ascii=False))
         return
     per = {"model": "model", "surface": "surface", "day": "day",
-           "project": "project", "session": "session"}[args.by]
+           "project": "project", "session": "session", "device": "device"}[args.by]
     since_local = since.astimezone(_resolve_tz()) if since else None
     window = f" since {since_local:%Y-%m-%d %H:%M %Z}" if since_local else ""
     only = "".join(f" · {d}" for d in fdesc)
@@ -3788,19 +3942,24 @@ def main():
     ptr.add_argument("--since", help="filter the summary from '24h', '7d' or ISO date")
     ptr.add_argument("--json", action="store_true", help="JSON output of the summary")
     pb = sub.add_parser("burn", help="tokens & estimated US$ from local Claude Code logs")
-    pb.add_argument("--by", choices=["model", "surface", "day", "project", "session"], default="model",
-                    help="group by model (default), surface (terminal/vscode/app/sdk), day, project or session")
+    pb.add_argument("--by", choices=["model", "surface", "day", "project", "session", "device"], default="model",
+                    help="group by model (default), surface (terminal/vscode/app/sdk), day, project, session or "
+                         "device (see 'cmon sync')")
     pb.add_argument("--since",
                     help="window: '24h', '7d', '30d' (default; with --plan, the current cycle), ISO date, "
                          "or 'all' for everything")
     pb.add_argument("--surface", metavar="CLIENT",
                     help="only these clients, comma-separated: terminal, vscode, app, sdk or a raw entrypoint")
+    pb.add_argument("--device", metavar="NAME", help="only these devices, comma-separated (see 'cmon sync')")
     pb.add_argument("--plan", nargs="?", const="weekly_all", metavar="WINDOW",
                     help="also split the official percent of WINDOW across groups: weekly (default), 5h, "
                          "or a scoped model such as fable")
     pb.add_argument("--json", action="store_true", help="JSON output")
     pb.add_argument("--all-accounts", action="store_true",
                     help="include Claude Desktop sessions not tied to the terminal's account")
+    psy = sub.add_parser("sync", help="exchange usage rows with your other devices through a synced folder "
+                                      "('cmon config set sync_dir …'); 'collect' does it by itself once set")
+    psy.add_argument("--dir", help="sync folder for this run (default: config sync_dir)")
     sub.add_parser("keepalive", help="send one small Haiku request now, which opens a 5h window if none is running "
                                      "('cmon config set keepalive on' does this by itself)")
     pc = sub.add_parser("collect", help="save 1 snapshot to database")
@@ -3847,8 +4006,10 @@ def main():
 
     pcfg = sub.add_parser("config", help="manage persisted user preferences (~/.cmon/config.json)",
                           description="Currently supports: timezone (used to display timestamps "
-                                      "locally instead of UTC), quiet_hours (hours projections skip) "
-                                      "and keepalive (on: open a new 5h window when the last one ends).")
+                                      "locally instead of UTC), quiet_hours (hours projections skip), "
+                                      "keepalive (on: open a new 5h window when the last one ends), "
+                                      "sync_dir (folder shared with your other devices) and device_name "
+                                      "(this machine's label there).")
     cfa = pcfg.add_subparsers(dest="action", required=True)
     cfset = cfa.add_parser("set", help="set a preference")
     cfset.add_argument("key", choices=sorted(CONFIG_KEYS))
@@ -3875,7 +4036,7 @@ def main():
         {"now": now, "status": status, "trends": trends, "collect": collect,
          "burn": burn, "watch": watch, "wait": wait, "plot": plot,
          "backtest": backtest, "tune": tune, "install": install,
-         "uninstall": uninstall, "import": import_db, "keepalive": keepalive}[args.cmd](args)
+         "uninstall": uninstall, "import": import_db, "keepalive": keepalive, "sync": sync}[args.cmd](args)
     except FetchError as e:
         sys.exit(f"cmon: {e}")
 
