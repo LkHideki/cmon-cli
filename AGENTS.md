@@ -78,6 +78,10 @@ Prefer `cmon status --json`, the stable contract (`--live` forces an API call):
     "resets_at": "2026-11-04T14:00:00+00:00", "active": true}]}}}
 ```
 
+A window may also carry `by_client` (`clients[]` with `key`, `label`, `share` as a fraction of
+what the window used, plus `other`), written by `cmon collect` for the current cycle; it's absent
+until collection has run.
+
 `offline: true` means no data is available, and `providers` is then empty. `status` exits 0 even
 when offline, so check that field rather than the exit code.
 

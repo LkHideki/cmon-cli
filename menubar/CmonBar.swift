@@ -45,7 +45,9 @@ struct Settings: Codable {
     /// {wk_reset_h} {wk_reset_hm} {age} are bare numbers. The 5h reset ({reset_short},
     /// {reset}, {reset_hm}) is blank unless 5h usage is above `resetAbovePercent` or the
     /// reset is at most `resetWithinMin` minutes away. {5h_bar} {wk_bar} draw the usage as a
-    /// block, {5h_dot} {wk_dot} as a traffic light.
+    /// block, {5h_dot} {wk_dot} as a traffic light. {top_client} {5h_top_client} name the
+    /// client that used the most of the week or the 5h window (`VS Code 59%`), blank until
+    /// `cmon collect` has split the cycle.
     /// With `hideEmpty`, a word holding a blank placeholder is dropped along with its
     /// decoration (`↻{reset_short}`), and so is a segment left with nothing: for labelled
     /// layouts, where positions don't carry the meaning.
@@ -131,15 +133,39 @@ struct Settings: Codable {
 
 // MARK: - Data (`cmon status --json`, version 1)
 
+/// One client's part of a window's usage this cycle, as a fraction of what was used.
+struct ClientShare: Decodable, Sendable, Equatable {
+    let key: String
+    let label: String
+    let share: Double
+}
+
+/// Optional `by_client` of a window, written by `cmon collect`: who used this cycle's percent.
+/// `other` rose with nothing logged on this Mac (claude.ai chat, other devices).
+struct ClientSplit: Decodable, Sendable {
+    let computedAt: String?
+    let clients: [ClientShare]
+    let other: Double
+
+    enum CodingKeys: String, CodingKey {
+        case clients, other
+        case computedAt = "computed_at"
+    }
+
+    var computedDate: Date? { computedAt.flatMap(parseISO) }
+}
+
 struct Quota: Decodable, Sendable {
     let key: String
     let label: String
     let percent: Double
     let resetsAt: String?
+    let byClient: ClientSplit?
 
     enum CodingKeys: String, CodingKey {
         case key, label, percent
         case resetsAt = "resets_at"
+        case byClient = "by_client"
     }
 
     var resetDate: Date? { resetsAt.flatMap(parseISO) }
@@ -228,6 +254,32 @@ func usageBar(_ percent: Double) -> String {
 /// Same thresholds as the menu's progress bars.
 func usageDot(_ percent: Double) -> String { percent >= 95 ? "🔴" : percent >= 80 ? "🟡" : "🟢" }
 
+/// The client that used the most of a window this cycle: "VS Code 59%"; blank without a split.
+func topClient(_ q: Quota?) -> String {
+    guard let top = q?.byClient?.clients.max(by: { $0.share < $1.share }) else { return "" }
+    return "\(top.label) \(Int((top.share * 100).rounded()))%"
+}
+
+/// A legend line of the "By client" menu section.
+struct ClientLine: Equatable {
+    let label: String
+    let share: Double   // fraction of what the window used
+    let points: Double  // percent of the limit
+    let colorKey: String
+}
+
+/// Clients by share, then what no local log explains, each with the points of the limit it used.
+func clientLines(_ q: Quota) -> [ClientLine] {
+    guard let split = q.byClient else { return [] }
+    var lines = split.clients.sorted { $0.share > $1.share }
+        .map { ClientLine(label: $0.label, share: $0.share, points: $0.share * q.percent, colorKey: $0.key) }
+    if split.other >= 0.005 {
+        lines.append(ClientLine(label: "claude.ai & elsewhere", share: split.other,
+                                points: split.other * q.percent, colorKey: "other"))
+    }
+    return lines
+}
+
 func renderTitle(_ settings: Settings, _ snap: Snapshot, now: Date) -> String {
     let session = snap.window("session"), weekly = snap.window("weekly_all")
     func pct(_ q: Quota?) -> String { q.map { String(Int($0.percent.rounded())) } ?? "–" }
@@ -255,6 +307,8 @@ func renderTitle(_ settings: Settings, _ snap: Snapshot, now: Date) -> String {
         "wk_reset_h": left(weekly).map { String(Int($0 / 3600)) } ?? "–",
         "wk_reset_hm": left(weekly).map(compactDuration) ?? "–",
         "age": snap.observedDate.map { String(Int(now.timeIntervalSince($0) / 60)) } ?? "–",
+        "top_client": topClient(weekly),
+        "5h_top_client": topClient(session),
     ]
     func fill(_ text: String) -> String {
         values.reduce(text) { $0.replacingOccurrences(of: "{\($1.key)}", with: $1.value) }
@@ -335,6 +389,91 @@ final class QuotaRowView: NSView {
     private var tint: NSColor {
         percent >= 95 ? .systemRed : percent >= 80 ? .systemOrange : .controlAccentColor
     }
+}
+
+// MARK: - Menu block: who used a window, as one stacked bar and a legend
+
+func clientColor(_ key: String, index: Int) -> NSColor {
+    switch key {
+    case "claude-vscode": return .systemBlue
+    case "cli": return .systemGreen
+    case "claude-desktop": return .systemPurple
+    case "sdk-cli": return .systemOrange
+    case "other": return .tertiaryLabelColor
+    default: return [NSColor.systemTeal, .systemPink, .systemIndigo, .systemBrown][index % 4]
+    }
+}
+
+final class ClientSplitView: NSView {
+    private let title: String, caption: String, lines: [ClientLine]
+    private static let lineHeight: CGFloat = 19
+
+    init(title: String, caption: String, lines: [ClientLine]) {
+        self.title = title
+        self.caption = caption
+        self.lines = lines
+        super.init(frame: NSRect(x: 0, y: 0, width: 280, height: 42 + CGFloat(lines.count) * Self.lineHeight))
+        autoresizingMask = .width
+    }
+
+    required init?(coder: NSCoder) { fatalError("unused") }
+
+    override var isFlipped: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let inset: CGFloat = 14, width = bounds.width - inset * 2
+        let body: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 13),
+                                                   .foregroundColor: NSColor.labelColor]
+        let small: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11),
+                                                    .foregroundColor: NSColor.secondaryLabelColor]
+        let figure: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold),
+            .foregroundColor: NSColor.labelColor]
+        let points: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular),
+            .foregroundColor: NSColor.secondaryLabelColor]
+
+        (title as NSString).draw(at: NSPoint(x: inset, y: 6), withAttributes: body)
+        let cap = caption as NSString
+        cap.draw(at: NSPoint(x: inset + width - cap.size(withAttributes: small).width, y: 8), withAttributes: small)
+
+        // One bar for the whole cycle's usage, a segment per client with hairline gaps.
+        let track = NSRect(x: inset, y: 28, width: width, height: 6)
+        NSGraphicsContext.saveGraphicsState()
+        NSBezierPath(roundedRect: track, xRadius: 3, yRadius: 3).addClip()
+        NSColor.quaternaryLabelColor.setFill()
+        track.fill()
+        var x = track.minX
+        for (i, line) in lines.enumerated() {
+            let w = width * min(max(line.share, 0), 1)
+            clientColor(line.colorKey, index: i).setFill()
+            NSRect(x: x, y: track.minY, width: max(w - 1, 0), height: track.height).fill()
+            x += w
+        }
+        NSGraphicsContext.restoreGraphicsState()
+
+        for (i, line) in lines.enumerated() {
+            let y = 40 + CGFloat(i) * Self.lineHeight
+            clientColor(line.colorKey, index: i).setFill()
+            NSBezierPath(ovalIn: NSRect(x: inset, y: y + 5, width: 8, height: 8)).fill()
+            (line.label as NSString).draw(at: NSPoint(x: inset + 14, y: y + 1), withAttributes: small.merging(
+                [.foregroundColor: NSColor.labelColor, .font: NSFont.systemFont(ofSize: 12)]) { $1 })
+            let share = "\(Int((line.share * 100).rounded()))%" as NSString
+            let shareW = share.size(withAttributes: figure).width
+            share.draw(at: NSPoint(x: inset + width - shareW, y: y + 1), withAttributes: figure)
+            let pts = String(format: "%.1f pts", line.points) as NSString
+            pts.draw(at: NSPoint(x: inset + width - 40 - pts.size(withAttributes: points).width, y: y + 2),
+                     withAttributes: points)
+        }
+    }
+}
+
+/// Right side of a split's header: "76% used", plus the split's age once it is minutes old
+/// (it comes from the last `cmon collect`, the percent from the latest read).
+func splitCaption(_ q: Quota, now: Date) -> String {
+    let used = "\(Int(q.percent.rounded()))% used"
+    guard let at = q.byClient?.computedDate, now.timeIntervalSince(at) >= 120 else { return used }
+    return "\(used) · split \(spacedDuration(now.timeIntervalSince(at))) ago"
 }
 
 // MARK: - App
@@ -558,8 +697,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let title = renderTitle(settings, snap, now: now)
         if button.title != title { button.title = title }  // the ticker calls this every second
         button.appearsDisabled = isStale(snap, now: now) || error != nil
-        let usage = snap.windows.map { "\(displayName($0)) \(Int($0.percent.rounded()))%" }
+        var usage = snap.windows.map { "\(displayName($0)) \(Int($0.percent.rounded()))%" }
             .joined(separator: "  ·  ")
+        if let week = snap.window("weekly_all"), !clientLines(week).isEmpty {
+            usage += "\nThis week: " + clientLines(week).prefix(3)
+                .map { "\($0.label) \(Int(($0.share * 100).rounded()))%" }
+                .joined(separator: " · ")
+        }
         button.toolTip = titleLegend(settings).map { "\($0)\n\(usage)" } ?? usage
     }
 
@@ -582,6 +726,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 rowViews[q.key] = view
                 row.view = view
                 menu.addItem(row)
+            }
+            let split = ["weekly_all", "session"].compactMap { snap.window($0) }.filter { !clientLines($0).isEmpty }
+            if !split.isEmpty {
+                menu.addItem(.separator())
+                menu.addItem(.sectionHeader(title: "By client"))
+                for q in split {
+                    let row = NSMenuItem()
+                    row.view = ClientSplitView(title: q.key == "session" ? "This 5h window" : "This week",
+                                               caption: splitCaption(q, now: now), lines: clientLines(q))
+                    menu.addItem(row)
+                }
             }
             menu.addItem(.separator())
             let updated = NSMenuItem(title: updatedTitle(snap, now: now), action: nil, keyEquivalent: "")

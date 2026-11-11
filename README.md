@@ -203,7 +203,10 @@ title shows the quota as `90% 75'  44% 91` — 5h window, then weekly limit, eac
 used and time until it resets: plain hours from 2 h up, minutes with `'` below that and
 seconds with `"` in the last minute — and a click
 opens a per-window breakdown with progress bars, reset times and when the next update is
-due.
+due. Under **By client**, one bar per window shows who used this cycle's percent — VS Code,
+Terminal, Desktop app, SDK — and how much of it nothing on this Mac logged (*claude.ai &
+elsewhere*). The split comes from the background `cmon collect` (see
+[`--plan`](#cmon-burn--tokens--cost-from-logs)), so it appears once collection is installed.
 
 ```sh
 make install                  # everything, including the cmon command this app needs
@@ -223,7 +226,8 @@ is reported in the menu and defaults are used):
   `reset_within_min` (100) minutes away; while shown they count down on their own —
   `{wk_reset_h}` (hours)
   `{wk_reset_hm}` `{age}` (minutes since the data was read); `{5h_bar}` `{wk_bar}` draw usage
-  as a block and `{5h_dot}` `{wk_dot}` as a traffic light. The title dims when the data is
+  as a block and `{5h_dot}` `{wk_dot}` as a traffic light; `{top_client}` `{5h_top_client}` name
+  the client that used the most of the week or the 5h window (`VS Code 57%`). The title dims when the data is
   older than `stale_minutes`. With `"hide_empty": true`, a word holding a blank placeholder and
   any segment left empty disappear, which suits labelled layouts:
 
