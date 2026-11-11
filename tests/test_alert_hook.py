@@ -13,9 +13,10 @@ FIELDS = ("CMON_ALERT_KIND", "CMON_ALERT_KEY", "CMON_ALERT_PERCENT", "CMON_ALERT
 @pytest.fixture
 def hook(tmp_path, monkeypatch):
     """A real CMON_HOOK that appends one tab-separated line per run: the alert fields, then
-    whether cmon's own credential leaked into its environment."""
+    whether cmon's own credential leaked into its environment. An unset field prints 'unset',
+    so a field that is set but empty (the promise to hooks under `set -u`) shows as ''."""
     out = tmp_path / "hook.log"
-    fields = " ".join(f'"${f}"' for f in FIELDS)
+    fields = " ".join(f'"${{{f}-unset}}"' for f in FIELDS)
     fmt = "%s\\t" * len(FIELDS) + "%s\\n"
     monkeypatch.setenv("CMON_HOOK", f"printf '{fmt}' {fields} \"${{CLAUDE_OAUTH_TOKEN-unset}}\" "
                                     f">> {shlex.quote(str(out))}")
@@ -106,3 +107,14 @@ def test_hook_env_formats_percent_and_reset():
                    "CMON_ALERT_PERCENT": "69", "CMON_ALERT_RESETS_AT": "2030-01-01T18:00:00+00:00"}
     assert cmon._hook_env("m", "rate", "k", 5.5, None)["CMON_ALERT_PERCENT"] == "5.5"
     assert cmon._hook_env("m", "rate", "k", None, "")["CMON_ALERT_RESETS_AT"] == ""
+    assert cmon._hook_env("m", "rate", "k") == {  # unknown: still set, empty
+        "CMON_ALERT_MSG": "m", "CMON_ALERT_KIND": "rate", "CMON_ALERT_KEY": "k",
+        "CMON_ALERT_PERCENT": "", "CMON_ALERT_RESETS_AT": ""}
+
+
+def test_hook_under_set_u_survives_unknown_fields(monkeypatch, tmp_path):
+    out = tmp_path / "hook.log"
+    monkeypatch.setenv("CMON_HOOK", f'set -u; printf "[%s][%s]" "$CMON_ALERT_PERCENT" "$CMON_ALERT_RESETS_AT" '
+                                    f'> {shlex.quote(str(out))}')
+    cmon._run_hook("m", kind="rate", key="weekly_all")
+    assert out.read_text() == "[][]"

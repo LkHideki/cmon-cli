@@ -687,7 +687,7 @@ command in environment variables, which are always set and empty when unknown:
 |---|---|
 | `CMON_ALERT_MSG` | The alert text, as shown on stderr |
 | `CMON_ALERT_KIND` | `rate` (pace hits 100% before reset), `lead` (reset is near) or `threshold` (an `alert_at` percent was reached) |
-| `CMON_ALERT_KEY` | The window: `session` (5h) or `weekly_all` |
+| `CMON_ALERT_KEY` | The window: `session` (5h), `weekly_all`, or for rate and threshold alerts any other key the API reports, such as `weekly_scoped:Fable` |
 | `CMON_ALERT_PERCENT` | Percent of the window used, e.g. `87` or `87.5` |
 | `CMON_ALERT_RESETS_AT` | When the window resets, ISO 8601 in UTC, e.g. `2026-11-04T02:00:00+00:00` |
 
@@ -712,8 +712,11 @@ export CMON_HOOK='curl -fsS -m 10 -H "Title: cmon $CMON_ALERT_KIND $CMON_ALERT_K
   -d "$CMON_ALERT_MSG" https://ntfy.sh/my-cmon-topic-7f3k'
 ```
 
-Any JSON webhook. It leaves out `CMON_ALERT_MSG`, which may hold quotes; the other variables
-never do, so they are safe to splice into JSON:
+Any JSON webhook. It leaves out `CMON_ALERT_MSG`, which may hold quotes. `CMON_ALERT_KIND`,
+`CMON_ALERT_PERCENT` and `CMON_ALERT_RESETS_AT` never do, and neither does `CMON_ALERT_KEY` for
+`session` and `weekly_all`. A scoped key such as `weekly_scoped:Fable` ends in the model name
+exactly as the API reports it, so this recipe trusts that name to hold no quotes; build the JSON
+with a tool such as `jq` if you'd rather not:
 
 ```bash
 export CMON_HOOK='curl -fsS -m 10 -H "Content-Type: application/json" -d "{\"kind\":\"$CMON_ALERT_KIND\",\"window\":\"$CMON_ALERT_KEY\",\"percent\":${CMON_ALERT_PERCENT:-null},\"resets_at\":\"$CMON_ALERT_RESETS_AT\"}" https://example.com/hooks/cmon'
