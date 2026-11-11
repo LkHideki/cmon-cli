@@ -3786,7 +3786,8 @@ def _price_table() -> list[tuple[str, tuple]]:
         try:
             with open(path, encoding="utf-8") as f:
                 table.update(_validate_prices(json.load(f)))
-        except (OSError, ValueError, OverflowError) as e:  # bad JSON/encoding; an int too big for a float
+        except (OSError, ValueError, OverflowError, RecursionError) as e:  # bad JSON/encoding; an int
+            # too big for a float; nesting past the parser's limit
             print(f"cmon: ignoring {path} ({e}); using the built-in prices.", file=sys.stderr)
     ordered = sorted(table.items(), key=lambda kv: (-len(kv[0]), kv[0]))
     _price_cache = (sig, ordered)
@@ -4245,8 +4246,10 @@ def _plan_share(con, key, since=None, until=None, col="surface", src="token_term
     `where`/`params` select the rows to group (callers build them from fixed choices); the
     rows they leave out still take their part of each rise, reported as 'rest', so a filter
     narrows the view without inflating what's left.
-    Returns {'groups': {grp: pp}, 'rest': pp, 'other': pp, 'total': pp, 'cycles': n} or None
-    without snapshots in the period."""
+    Returns {'groups': {grp: pp}, 'rest': pp, 'other': pp, 'total': pp, 'cycles': n,
+    'rest_unpriced': {model: tokens}} or None without snapshots in the period. rest_unpriced holds
+    the models of the left-out rows that had no price: costed at zero here, they hand their part of
+    the percent to the groups shown, and the caller never sees those rows to warn about them."""
     scoped = key.split(":", 1)[1].lower() if ":" in key else None
     tok_where = "provider='claude'" + (" AND lower(model) LIKE ?" if scoped else "")
     grp = f"CASE WHEN true{where} THEN {col} ELSE {_REST_SQL} END" if where else col
@@ -4276,7 +4279,7 @@ def _plan_share(con, key, since=None, until=None, col="surface", src="token_term
         [key, CYCLE_JITTER_S, *bparams, *tok_params]).fetchall()
     if not rows:
         return None
-    groups, other, cycles = {}, 0.0, 0
+    groups, other, cycles, rest_unpriced = {}, 0.0, 0, {}
     pending = {}  # grp -> cost logged since the last tick
     cur, cur_cost = None, {}
 
@@ -4303,10 +4306,12 @@ def _plan_share(con, key, since=None, until=None, col="surface", src="token_term
             cur, cur_cost = (ts, new_cycle, d), {}
         if grp is not None:
             cur_cost[grp] = cur_cost.get(grp, 0.0) + _cost(model, i or 0, o or 0, cr or 0, cw or 0)
+            if grp == _REST and _price_match(model) is None and (n := (i or 0) + (o or 0) + (cr or 0) + (cw or 0)):
+                rest_unpriced[model or "?"] = rest_unpriced.get(model or "?", 0) + n
     settle(cur[1], cur[2], cur_cost)
     rest = groups.pop(_REST, 0.0)
     return {"groups": groups, "rest": rest, "other": other, "total": sum(groups.values()) + rest + other,
-            "cycles": cycles}
+            "cycles": cycles, "rest_unpriced": rest_unpriced}
 
 
 PLAN_ALIASES = {"weekly": "weekly_all", "week": "weekly_all", "5h": "session"}
@@ -4533,7 +4538,9 @@ def burn(args):
     scan_logs(con, since)
     if cache:
         return _burn_cache(con, args, since)
-    col = {"model": "model", "surface": "surface", "day": "CAST(observed_at AS DATE)",
+    # day as text: _plan_share's CASE puts filtered-out rows in a string group, which DuckDB won't
+    # mix with a DATE. ISO text prints and serializes as the date did.
+    col = {"model": "model", "surface": "surface", "day": "CAST(CAST(observed_at AS DATE) AS VARCHAR)",
            "project": "project", "session": "session_id", "device": _device_col()}[by]
     filt, fparams, fdesc = _burn_filters(args)
     where = "WHERE provider='claude'" + (" AND observed_at >= ?" if since else "") + filt
@@ -4578,6 +4585,8 @@ def burn(args):
     share = _plan_share(con, plan[0], since=since, col=col, src=src, where=filt, params=fparams) if plan else None
     if plan and share is None:
         sys.exit(f"No '{plan[0]}' snapshots in period: run 'cmon collect', or 'cmon install' to collect them.")
+    for name, n in (share["rest_unpriced"] if share else {}).items():  # filtered out, but skewing the split
+        unpriced[name] = unpriced.get(name, 0) + n
     pp = share["groups"] if share else {}
     for g in pp:
         agg.setdefault(g, [0, 0.0])  # a period starting mid-cycle can charge a group outside it

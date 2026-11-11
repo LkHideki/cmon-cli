@@ -182,6 +182,20 @@ def test_burn_surface_filter(week, capsys):
     assert "· vscode only" in out and "rest (filtered out)" in out
 
 
+def test_burn_by_day_plan_with_a_filter(week, capsys):
+    # The CASE that puts filtered-out rows in 'rest' mixed a DATE with a string: a binder error on
+    # every DuckDB, where the other --by columns are strings and worked.
+    whole = burn(capsys, by="day")
+    days = [g["grp"] for g in whole["groups"]]
+    assert len(days) == 1 and whole["groups"][0]["plan_pp"] == pytest.approx(4)
+    got = burn(capsys, by="day", surface="vscode")
+    assert [g["grp"] for g in got["groups"]] == days
+    assert got["groups"][0]["plan_pp"] == pytest.approx(1) and got["rest_pp"] == pytest.approx(3)
+    out = burn(capsys, json=False, by="day", surface="vscode")
+    assert f"  {days[0]} " in out and "rest (filtered out)" in out
+    assert burn(capsys, by="day", device="nowhere")["rest_pp"] == pytest.approx(4)  # --device: same CASE
+
+
 def test_client_split_reaches_status_json(con, monkeypatch):
     snap(con, T0, 0)
     tok(con, T0 + MIN, "cli", out=3_000_000)

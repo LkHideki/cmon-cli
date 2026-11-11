@@ -84,6 +84,7 @@ def test_most_specific_substring_wins_whatever_the_order(home, order):
     '{"opus": [1, 2, 3, 4], "OPUS": [1, 2, 3, 4]}',
     '{"opus": [1' + "0" * 400 + ', 2, 3, 4]}',
     b'\xff\xfe{}',
+    pytest.param("[" * 100_000 + "]" * 100_000, id="deep-nesting"),  # RecursionError: was a traceback
 ])
 def test_invalid_file_warns_once_and_keeps_defaults(home, capsys, content):
     path = Path(cmon._prices_file())
@@ -165,6 +166,24 @@ def test_burn_plan_json_unpriced_usage_goes_elsewhere_until_priced(con, capsys):
     assert got["unpriced_models"] == []
     pp = {g["grp"]: g["plan_pp"] for g in got["groups"]}
     assert pp["cli"] == pytest.approx(2) and pp["claude-vscode"] == pytest.approx(4) and got["other_pp"] == 0
+
+
+def test_burn_plan_filter_still_reports_the_unpriced_model_it_filtered_out(con, capsys):
+    # The split prices the terminal's rows too, as 'rest': at zero, the rise they caused went to
+    # the VS Code rows the filter kept (4 pp for US$ 0.25), and the warning has to say why.
+    snap(con, T0, 0)
+    tok(con, T0 + MIN, "cli", model="claude-mythos-1", out=10_000_000)
+    tok(con, T0 + MIN, "claude-vscode", out=10_000)
+    snap(con, T0 + 10 * MIN, 4)
+    got, err = burn(capsys, by="surface", plan="weekly", since=None, surface="vscode")
+    assert got["unpriced_models"] == ["claude-mythos-1"] and err == ""
+    assert [g["grp"] for g in got["groups"]] == ["claude-vscode"] and "unpriced_models" not in got["groups"][0]
+    assert got["groups"][0]["plan_pp"] == pytest.approx(4) and got["rest_pp"] == 0
+    _out, err = burn(capsys, by="surface", plan="weekly", since=None, surface="vscode", json=False)
+    assert "no price for claude-mythos-1 (10.0M tok)" in err
+    prices({"mythos": [0, 25, 0, 0]})
+    got, _err = burn(capsys, by="surface", plan="weekly", since=None, surface="vscode")
+    assert got["unpriced_models"] == [] and got["rest_pp"] == pytest.approx(4, abs=0.01)
 
 
 def test_burn_with_a_bad_file_warns_once(con, capsys):

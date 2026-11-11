@@ -609,7 +609,9 @@ A model that matches no key costs US$ 0. `burn` then warns on stderr, naming the
 tokens, because that zero also skews `--plan`: the percent the model used goes to whichever groups
 logged a cost in the same interval, or to *other*. `--json` reports the same thing as
 `unpriced_models`: a list at the top of the `--plan` object, and on each group that has such tokens
-in both forms. cmon doesn't guess a price for a model it doesn't know.
+in both forms. The warning and the top-level list also name a model found only in the rows that
+`--surface` or `--device` filtered out, since the split still prices those rows, as *rest*. cmon
+doesn't guess a price for a model it doesn't know.
 
 **The `<synthetic>` label** (usually `0%` in the model mix) is not a real model: Claude
 Code stamps `model: "<synthetic>"` on messages it generates *locally* instead of calling
