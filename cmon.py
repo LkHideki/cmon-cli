@@ -566,12 +566,20 @@ CONFIG = os.path.expanduser("~/.cmon/config.json")
 CONFIG_KEYS = {"timezone", "quiet_hours", "keepalive", "sync_dir", "device_name", "alert_at"}
 
 
+def _tz_errors() -> tuple:
+    """What ZoneInfo raises for a name it can't load. Before Python 3.13 a tzdata folder such as
+    'America' raises IsADirectoryError and a name past the OS's limit OSError, not
+    ZoneInfoNotFoundError; an absolute or '..' path raises ValueError on every version."""
+    from zoneinfo import ZoneInfoNotFoundError
+    return ZoneInfoNotFoundError, OSError, ValueError
+
+
 def _validate_timezone(value: str) -> str:
     """Raise ValueError with a user-facing message if `value` isn't a valid IANA tz name."""
-    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    from zoneinfo import ZoneInfo
     try:
         ZoneInfo(value)
-    except ZoneInfoNotFoundError as e:
+    except _tz_errors() as e:
         raise ValueError(
             f"Unknown timezone {value!r}. Use an IANA name, e.g. 'America/Sao_Paulo', 'UTC'.") from e
     return value
@@ -739,14 +747,14 @@ def _resolve_tz():
     """Effective ZoneInfo for display, in precedence order: CMON_TZ env (quick override,
     doesn't persist) -> ~/.cmon/config.json {"timezone": ...} -> UTC. An invalid value at
     either source is skipped with a stderr warning, falling through."""
-    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    from zoneinfo import ZoneInfo
     for source, name in (("env CMON_TZ", os.environ.get("CMON_TZ")),
                          ("config", _read_config().get("timezone"))):
         if not name:
             continue
         try:
             return ZoneInfo(name)
-        except ZoneInfoNotFoundError:
+        except _tz_errors():
             print(f"cmon: ignoring invalid timezone {name!r} from {source} "
                  "(run 'cmon config set timezone <IANA name>').", file=sys.stderr)
     return ZoneInfo("UTC")
@@ -814,6 +822,17 @@ def _retry_after(r) -> float | None:
         return None
 
 
+def _without_token(text: str, tok: str | None) -> str:
+    """TEXT with the token and any Bearer value taken out. requests quotes the whole Authorization
+    header in some errors (a token ending in CR or LF fails its header check, with the value's repr
+    in the message), and that text reaches the terminal and the report doctor prints for assistants."""
+    import re
+    if tok:
+        for form in sorted({tok, tok.strip(), repr(tok)[1:-1]} - {""}, key=len, reverse=True):
+            text = text.replace(form, "<token>")
+    return re.sub(r"(Bearer\s+)[^\s'\"]+", r"\1<token>", text)
+
+
 def fetch(retries: int = RETRIES, timeout: float = 30) -> dict:
     """Query usage endpoint with retry/backoff. Raises FetchError with user-readable message —
     401/403 fail immediately (no point retrying); 429 and 5xx and network errors retry
@@ -850,7 +869,7 @@ def fetch(retries: int = RETRIES, timeout: float = 30) -> dict:
                 r.raise_for_status()
                 return r.json()
         except requests.RequestException as e:
-            last, wait = f"network: {e}", 2 ** attempt
+            last, wait = f"network: {_without_token(str(e), tok)}", 2 ** attempt
         attempt += 1
         if attempt < retries:
             time.sleep(wait)
@@ -5004,10 +5023,10 @@ def _doctor_api(offline: bool) -> dict:
     return _check("api", name, "ok", detail or "logged in; no limits in the reply")
 
 
-def _doctor_run(cmd: list[str]):
-    """CompletedProcess, or None when the tool is missing or hangs."""
+def _doctor_run(cmd: list[str], raw: bool = False):
+    """CompletedProcess, or None when the tool is missing or hangs. raw keeps the output as bytes."""
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        return subprocess.run(cmd, capture_output=True, text=not raw, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return None
 
@@ -5022,7 +5041,7 @@ def _sched_issue(argv: list[str]) -> tuple[str, str] | None:
             return "fail", f"the scheduled command points to a missing file: {path}"
     if "--db" in argv[:-1]:
         target = os.path.abspath(argv[argv.index("--db") + 1])
-        if target != os.path.abspath(DB):
+        if os.path.normcase(target) != os.path.normcase(os.path.abspath(DB)):  # Windows ignores case
             return "warn", f"it collects into {target}, but this cmon reads {os.path.abspath(DB)}"
     return None
 
@@ -5081,6 +5100,47 @@ def _doctor_schedule_linux(name: str) -> dict:
     return _check("schedule", name, "warn", "not scheduled", "cmon install")
 
 
+def _schtasks_argv(raw) -> list[str] | None:
+    """The task's command from `schtasks /query /xml` output, as argv, or None when it can't be read
+    for sure. Bytes, because the tool may write UTF-16 or the console code page: a path decoded with
+    the wrong guess would read as a deleted clone. Only UTF-16 and strict UTF-8 (ASCII included) are
+    trusted. The arguments are the quoted words _install_windows wrote, which can't hold a quote."""
+    import re
+    from xml.sax.saxutils import unescape
+    if not isinstance(raw, bytes):
+        return None
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        encoding = "utf-16"
+    else:
+        encoding = "utf-16-le" if b"\x00" in raw else "utf-8-sig"
+    try:
+        text = raw.decode(encoding)
+    except UnicodeDecodeError:
+        return None
+    m = re.search(r"<Exec>.*?<Command>(.*?)</Command>\s*(?:<Arguments>(.*?)</Arguments>)?", text, re.S)
+    if not m:
+        return None
+    entities = {"&quot;": '"', "&apos;": "'"}
+    command = unescape(m.group(1), entities).strip()
+    args = unescape(m.group(2) or "", entities)
+    words = [a or b for a, b in re.findall(r'"([^"]*)"|(\S+)', args)]
+    return [command.strip('"'), *words] if command else None
+
+
+def _doctor_schedule_windows(name: str) -> dict:
+    r = _doctor_run(["schtasks", "/query", "/tn", "cmon-collect", "/xml"], raw=True)
+    if r is None:
+        return _check("schedule", name, "warn", "could not run schtasks to check the task")
+    if r.returncode != 0:
+        return _check("schedule", name, "warn", "not scheduled", "cmon install")
+    argv = _schtasks_argv(r.stdout)
+    if argv is None:
+        return _check("schedule", name, "ok", "Task Scheduler task cmon-collect; its command couldn't be read")
+    if issue := _sched_issue(argv):
+        return _check("schedule", name, *issue, fix="cmon install")
+    return _check("schedule", name, "ok", "Task Scheduler task cmon-collect")
+
+
 def _doctor_schedule(platform: str | None = None) -> dict:
     """Looks where 'cmon install' puts the job on each OS. Not scheduled is a warning, not a
     failure: background collection is optional for the CLI alone."""
@@ -5091,12 +5151,7 @@ def _doctor_schedule(platform: str | None = None) -> dict:
     if platform.startswith("linux"):
         return _doctor_schedule_linux(name)
     if platform.startswith("win"):
-        r = _doctor_run(["schtasks", "/query", "/tn", "cmon-collect"])
-        if r is None:
-            return _check("schedule", name, "warn", "could not run schtasks to check the task")
-        if r.returncode != 0:
-            return _check("schedule", name, "warn", "not scheduled", "cmon install")
-        return _check("schedule", name, "ok", "Task Scheduler task cmon-collect")
+        return _doctor_schedule_windows(name)
     return _check("schedule", name, "skip", f"no scheduler support on {platform}")
 
 
@@ -5266,16 +5321,18 @@ def _is_whole(v) -> bool:
 
 
 def _is_rule(v) -> bool:
-    return (isinstance(v, dict) and _is_number(v.get("every_s"))
-            and all(v.get(k) is None or _is_number(v[k]) for k in ("reset_within_min", "usage_above_pct")))
+    return (isinstance(v, dict) and _finite(v.get("every_s"))
+            and all(v.get(k) is None or _finite(v[k]) for k in ("reset_within_min", "usage_above_pct")))
 
 
+# A Double field: json.load reads 1e400 as inf without the parse_constant hook seeing it, and
+# cmon Bar's decoder refuses any number past what a Double holds, so _finite, not _is_number.
 BAR_FIELDS = {  # key -> (test, what it must be), as cmon Bar's Settings decoder reads them
     "segments": (lambda v: isinstance(v, list) and all(isinstance(s, str) for s in v), "a list of strings"),
     "separator": (lambda v: isinstance(v, str), "a string"),
     "hide_empty": (lambda v: isinstance(v, bool), "true or false"),
-    "reset_above_percent": (_is_number, "a number"),
-    "reset_within_min": (_is_number, "a number"),
+    "reset_above_percent": (_finite, "a number"),
+    "reset_within_min": (_finite, "a number"),
     "refresh": (lambda v: isinstance(v, list) and all(_is_rule(r) for r in v),
                 "a list of rules, each with a number every_s"),
     "stale_minutes": (_is_whole, "a whole number"),

@@ -162,6 +162,35 @@ def test_api_failure_picks_the_fix_by_cause(monkeypatch, msg, fix):
     assert c["status"] == "fail" and c["detail"] == msg and fix in c["fix"]
 
 
+@pytest.mark.parametrize("tok", [SECRET + "\r", SECRET + "\n", "\n" + SECRET])
+def test_api_failure_never_carries_the_token(monkeypatch, tok):
+    # requests rejects a header value with CR/LF before sending anything, quoting the whole value
+    # in its error, and fetch put that error in the message doctor reports.
+    import requests
+
+    def session():
+        s = requests.Session()
+        s.trust_env = False
+        return s
+    monkeypatch.setattr(cmon, "get_token", lambda: ("env CLAUDE_OAUTH_TOKEN", tok))
+    monkeypatch.setattr(cmon, "_session", session)  # conftest still blocks every socket
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+    c = cmon._doctor_api(offline=False)
+    assert c["status"] == "fail" and "header value" in c["detail"] and "Bearer <token>" in c["detail"]
+    assert SECRET not in json.dumps(c) and SECRET[:12] not in c["detail"] and SECRET[-4:] not in c["detail"]
+
+
+@pytest.mark.parametrize(("text", "tok"), [
+    ("in header value: 'Bearer abc def-123\\r'", "abc def-123\r"),  # repr form, a space inside
+    ('auth "Bearer x9y8z7w6" refused', "other-token"),               # not our token: Bearer still
+    ("no token here", None),
+])
+def test_without_token(text, tok):
+    out = cmon._without_token(text, tok)
+    assert "abc" not in out and "def-123" not in out and "x9y8z7w6" not in out
+    assert out == text if tok is None else "<token>" in out
+
+
 def test_api_reply_of_unknown_shape_fails(monkeypatch):
     monkeypatch.setattr(cmon, "fetch", lambda **_k: {"limits": [{"percent": 1}]})  # no 'kind'
     c = cmon._doctor_api(offline=False)
@@ -269,12 +298,53 @@ def test_linux_cron_entry_is_ok_and_absent_warns(paths, monkeypatch):
     assert c["status"] == "warn" and c["detail"] == "not scheduled"
 
 
-@pytest.mark.parametrize(("proc", "status"), [(Proc(0), "ok"), (Proc(1), "warn"), (None, "warn")])
+def _task_xml(argv, encoding="utf-16"):
+    """What `schtasks /query /tn cmon-collect /xml` prints for a task 'cmon install' made."""
+    from xml.sax.saxutils import escape
+    args = " ".join(f'"{escape(a)}"' for a in argv[1:])
+    xml = ('<?xml version="1.0" encoding="UTF-16"?>\r\n'
+           '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\r\n'
+           '  <Actions Context="Author">\r\n    <Exec>\r\n'
+           f'      <Command>"{escape(argv[0])}"</Command>\r\n      <Arguments>{args}</Arguments>\r\n'
+           '    </Exec>\r\n  </Actions>\r\n</Task>\r\n')
+    return xml.encode(encoding)
+
+
+@pytest.mark.parametrize(("proc", "status"), [("task", "ok"), (Proc(1), "warn"), (None, "warn")])
 def test_windows_task(monkeypatch, proc, status):
+    proc = Proc(0, _task_xml(_sched_argv())) if proc == "task" else proc  # cmon.DB is the test's by now
     calls = []
-    monkeypatch.setattr(cmon, "_doctor_run", lambda cmd: calls.append(cmd) or proc)
-    assert cmon._doctor_schedule("win32")["status"] == status
-    assert calls == [["schtasks", "/query", "/tn", "cmon-collect"]]
+    monkeypatch.setattr(cmon, "_doctor_run", lambda cmd, raw=False: calls.append((cmd, raw)) or proc)
+    c = cmon._doctor_schedule("win32")
+    assert c["status"] == status
+    assert calls == [(["schtasks", "/query", "/tn", "cmon-collect", "/xml"], True)]
+    if status == "ok":
+        assert c["detail"] == "Task Scheduler task cmon-collect"
+
+
+@pytest.mark.parametrize("encoding", ["utf-16", "utf-16-le", "utf-8"])
+def test_windows_task_pointing_at_a_deleted_clone_fails(paths, monkeypatch, encoding):
+    # Only existence was checked: a task left by a deleted clone reported ok.
+    gone = str(paths.root / "deleted clone & co" / "cmon.py")
+    xml = _task_xml([sys.executable, gone, "--db", os.path.abspath(cmon.DB), "collect", "--alert"], encoding)
+    monkeypatch.setattr(cmon, "_doctor_run", lambda cmd, raw=False: Proc(0, xml))
+    c = cmon._doctor_schedule("win32")
+    assert c["status"] == "fail" and gone in c["detail"] and c["fix"] == "cmon install"
+
+
+def test_windows_task_feeding_another_database_warns(paths, monkeypatch):
+    other = str(paths.root / "other.duckdb")
+    monkeypatch.setattr(cmon, "_doctor_run", lambda cmd, raw=False: Proc(0, _task_xml(_sched_argv(other))))
+    c = cmon._doctor_schedule("win32")
+    assert c["status"] == "warn" and other in c["detail"]
+
+
+@pytest.mark.parametrize("out", [b"\x82 not utf-8, a console code page guess", b"<Task/>", ""])
+def test_windows_task_whose_command_cant_be_read_is_ok_unchecked(monkeypatch, out):
+    # A path decoded with the wrong code page would read as a deleted clone: don't guess.
+    monkeypatch.setattr(cmon, "_doctor_run", lambda cmd, raw=False: Proc(0, out))
+    c = cmon._doctor_schedule("win32")
+    assert c["status"] == "ok" and c["detail"] == "Task Scheduler task cmon-collect; its command couldn't be read"
 
 
 def test_unknown_platform_skips():
@@ -433,12 +503,22 @@ def test_config_absent_or_valid_is_ok(paths):
     ("{", "not valid JSON"),
     ("[1, 2]", "not a JSON object"),
     ('{"timezone": "Mars/Base"}', "Unknown timezone 'Mars/Base'"),
+    # a tzdata folder, and a name past the OS's limit: IsADirectoryError / OSError on Python 3.11-3.12
+    ('{"timezone": "America"}', "Unknown timezone 'America'"),
+    pytest.param('{"timezone": "' + "a" * 300 + '"}', "Unknown timezone 'aaaa", id="timezone-too-long"),
     ('{"keepalive": true}', "keepalive: True is not a non-empty string"),
     ('{"alert_at": "session=120", "zzz": 1}', "unknown keys, ignored: zzz"),
 ])
 def test_config_problems_fail(paths, text, needle):
     c = _config(paths, text)
     assert c["status"] == "fail" and needle in c["detail"]
+
+
+@pytest.mark.parametrize("name", ["America", "a" * 300, "/etc/localtime"], ids=["folder", "too-long", "absolute"])
+def test_unloadable_timezone_falls_back_to_utc(paths, capsys, name):
+    _write(str(paths.config), json.dumps({"timezone": name}))
+    assert str(cmon._resolve_tz()) == "UTC"
+    assert "ignoring invalid timezone" in capsys.readouterr().err
 
 
 def test_config_unknown_keys_alone_warn(paths):
@@ -475,6 +555,13 @@ def test_bar_absent_or_valid_is_ok(paths):
     ('{"refresh": [{"every_s": "60"}]}', "refresh must be a list of rules"),
     ('{"separator": 5, "cmon": false}', "separator must be a string; cmon must be a string"),
     pytest.param("[" * 100_000, "nested too deeply", id="deep-nesting"),  # RecursionError: was a traceback
+    # past what a Double holds: Python reads inf, cmon Bar's decoder refuses the file
+    ('{"reset_above_percent": 1e400}', "reset_above_percent must be a number"),
+    ('{"reset_within_min": -1e400}', "reset_within_min must be a number"),
+    pytest.param('{"reset_above_percent": 1' + "0" * 400 + '}', "reset_above_percent must be a number",
+                 id="int-past-double"),
+    ('{"refresh": [{"every_s": 1e400}]}', "refresh must be a list of rules"),
+    ('{"refresh": [{"every_s": 60, "usage_above_pct": 1e400}]}', "refresh must be a list of rules"),
 ])
 def test_bar_problems_fail_like_the_app_decoder(paths, text, needle):
     c = _bar(paths, text)

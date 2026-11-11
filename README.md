@@ -861,13 +861,13 @@ It works on any OS and after any kind of install, so `uv tool install` users get
 |---|---|
 | `token source found` | No token in `CLAUDE_OAUTH_TOKEN`, the OS vault or Claude Code's login (fail), or Claude Code's access token has expired (warn). Same lookup as `cmon token status`; doctor names the source and never prints the token, not even masked |
 | `usage API reachable and logged in` | The one call to the usage endpoint fails; the fix depends on the cause (log in, network, update cmon). Nothing is saved |
-| `background collection scheduled` | Nothing where `cmon install` puts it: the LaunchAgent on macOS, the systemd timer or the crontab line on Linux, the Task Scheduler task on Windows (warn). It fails when the job points at a file that's gone, such as a deleted clone, and warns when it collects into another database |
+| `background collection scheduled` | Nothing where `cmon install` puts it: the LaunchAgent on macOS, the systemd timer or the crontab line on Linux, the Task Scheduler task on Windows (warn). It fails when the job points at a file that's gone, such as a deleted clone, and warns when it collects into another database; on Windows only when `schtasks` prints the task's command as UTF-8 or UTF-16 (otherwise the detail says the command couldn't be read), since a path decoded with the wrong code page would look gone |
 | `database not locked` | Another process holds DuckDB's write lock for more than 2 s; the detail names its PID (warn) |
 | `database schema is current` | The schema is newer than this cmon reads, or the file isn't a usable database (fail); older, so the next write migrates it (warn) |
 | `last snapshot is recent` | No snapshot yet, or the last one is over 60 minutes old (warn) |
 | `sync_dir reachable` | `sync_dir` is set and the folder is gone or read-only (fail). Skipped when unset |
 | `config.json is valid` | `~/.cmon/config.json` isn't JSON, or holds a value `cmon config set` would refuse (fail), or keys cmon doesn't know (warn). cmon itself reads a broken file as empty, in silence |
-| `bar.json is valid` | `~/.cmon/bar.json` isn't JSON or has a value of the wrong type for cmon Bar, which then ignores the whole file (fail). `null` and unknown keys are fine, as in the app |
+| `bar.json is valid` | `~/.cmon/bar.json` isn't JSON or has a value of the wrong type for cmon Bar, a number past what a Double holds (`1e400`) included, which then ignores the whole file (fail). `null` and unknown keys are fine, as in the app |
 
 ```text
   ok    token source found (Claude Code credentials, expires in 5h 12m)

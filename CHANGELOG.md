@@ -114,6 +114,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   so the filtered plan share failed there; newer DuckDB accepted it for every `--by` but `day`,
   whose dates DuckDB wouldn't mix with the *rest* group's text, so `--by day --plan` with a filter
   failed on every version. Both work now. The NUL byte is what kept CI red since 0.8.0.
+- **A token with a CR or LF in it no longer shows up in error messages.** requests refuses such a
+  header before sending anything and quotes the whole `Bearer` value in its error, which `cmon now`,
+  `collect` and the new `cmon doctor` printed as it came. The token and any `Bearer` value are now
+  replaced by `<token>`. It takes a `CLAUDE_OAUTH_TOKEN` read from a file with CRLF line endings.
+- **A timezone that names a tzdata folder (`America`) or is too long for a file name no longer
+  crashes cmon** on Python 3.11 and 3.12, where it raises IsADirectoryError or OSError rather than
+  the not-found error cmon caught. `config set` refuses it, display commands fall back to UTC with
+  the usual warning, and `doctor` reports it as a failed `config.json is valid` check.
 
 ## [0.8.0] — 2026-11-10
 
