@@ -169,3 +169,14 @@ def test_burn_plan_aliases_and_unknown_window(week, capsys):
 def test_burn_plan_needs_snapshots(home, capsys):
     with pytest.raises(SystemExit, match="cmon collect"):
         burn(capsys)
+
+
+def test_burn_surface_filter(week, capsys):
+    got = burn(capsys, plan=None, since="all", by="model", surface="vscode")
+    assert [g["tok"] for g in got] == [1_000_000]
+    got = burn(capsys, by="project", surface="terminal,claude-vscode")
+    assert sum(g["tok"] for g in got["groups"]) == 4_000_000 and got["rest_pp"] == 0
+    got = burn(capsys, by="project", surface="vscode")
+    assert got["groups"][0]["plan_pp"] == pytest.approx(1) and got["rest_pp"] == pytest.approx(3)
+    out = burn(capsys, json=False, surface="vscode")
+    assert "· vscode only" in out and "rest (filtered out)" in out

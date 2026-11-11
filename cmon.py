@@ -3341,6 +3341,20 @@ def _plan_share(con, key, since=None, until=None, col="surface", src="token_term
 
 
 PLAN_ALIASES = {"weekly": "weekly_all", "week": "weekly_all", "5h": "session"}
+SURFACE_ALIASES = {"terminal": "cli", "vscode": "claude-vscode", "app": "claude-desktop",
+                   "desktop": "claude-desktop", "sdk": "sdk-cli"}
+
+
+def _burn_filters(args) -> tuple[str, list, list[str]]:
+    """(' AND …' SQL, params, description) for burn's --surface. Values come from the user, so
+    they only ever travel as parameters."""
+    sql, params, desc = "", [], []
+    if getattr(args, "surface", None):
+        names = [n.strip() for n in args.surface.split(",") if n.strip()]
+        params += [SURFACE_ALIASES.get(n.lower(), n) for n in names]
+        sql += f" AND surface IN ({', '.join('?' * len(names))})"
+        desc.append(f"{', '.join(_surface(v) for v in params[-len(names):])} only")
+    return sql, params, desc
 
 
 def _plan_window(con, name: str):
@@ -3372,17 +3386,19 @@ def burn(args):
     scan_logs(con, since)
     col = {"model": "model", "surface": "surface", "day": "CAST(observed_at AS DATE)",
            "project": "project", "session": "session_id"}[args.by]
-    where = "WHERE provider='claude'" + (" AND observed_at >= ?" if since else "")
+    filt, fparams, fdesc = _burn_filters(args)
+    where = "WHERE provider='claude'" + (" AND observed_at >= ?" if since else "") + filt
+    wparams = ([since] if since else []) + fparams
     src = "token_log" if getattr(args, "all_accounts", False) else "token_terminal"
     rows = con.execute(
         f"SELECT {col} grp,model,sum(input_tokens),sum(output_tokens),sum(cache_read_tokens),"
         f"sum(cache_write_tokens) "
-        f"FROM {src} {where} GROUP BY grp, model", [since] if since else []).fetchall()
+        f"FROM {src} {where} GROUP BY grp, model", wparams).fetchall()
     excluded = 0 if src == "token_log" else con.execute(
         "SELECT coalesce(sum(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens), 0) "
         f"FROM token_log {where}",
-        [since] if since else []).fetchone()[0] - sum(i + o + r + c for _g, _m, i, o, r, c in rows)
-    if not rows:
+        wparams).fetchone()[0] - sum(i + o + r + c for _g, _m, i, o, r, c in rows)
+    if not rows and not plan:
         sys.exit("No Claude Code log data in period.")
     # Per-group tokens+cost, and per-component totals — cost needs the per-model price map,
     # so it's computed here in Python rather than in SQL.
@@ -3403,7 +3419,7 @@ def burn(args):
         ccost["output"] += o * p[1] / 1e6
         ccost["cache read"] += r * p[2] / 1e6
         ccost["cache write"] += c * p[3] / 1e6
-    share = _plan_share(con, plan[0], since=since, col=col, src=src) if plan else None
+    share = _plan_share(con, plan[0], since=since, col=col, src=src, where=filt, params=fparams) if plan else None
     if plan and share is None:
         sys.exit(f"No '{plan[0]}' snapshots in period: run 'cmon collect', or 'cmon install' to collect them.")
     pp = share["groups"] if share else {}
@@ -3416,7 +3432,8 @@ def burn(args):
         if share:
             print(json.dumps({"window": plan[0], "since": since.isoformat() if since else None,
                               "cycles": share["cycles"], "total_pp": share["total"],
-                              "other_pp": share["other"], "groups": items}, ensure_ascii=False))
+                              "other_pp": share["other"], **({"rest_pp": share["rest"]} if filt else {}),
+                              "groups": items}, ensure_ascii=False))
         else:
             print(json.dumps(items, ensure_ascii=False))
         return
@@ -3424,10 +3441,11 @@ def burn(args):
            "project": "project", "session": "session"}[args.by]
     since_local = since.astimezone(_resolve_tz()) if since else None
     window = f" since {since_local:%Y-%m-%d %H:%M %Z}" if since_local else ""
-    print(f"Consumption by {per}{window} (API equivalent):")
+    only = "".join(f" · {d}" for d in fdesc)
+    print(f"Consumption by {per}{window}{only} (API equivalent):")
     lines = [(_surface(g) if args.by == "surface" else str(g), v[0] / 1e6, v[1], pp.get(g, 0.0))
              for g, v in ordered]
-    other_lbl = "other (no local log)"
+    other_lbl, rest_lbl = "other (no local log)", "rest (filtered out)"
     w = max([len(lbl) for lbl, *_ in lines] + [len(other_lbl) if share else len("TOTAL")])
     total_pp = share["total"] if share else 0.0
 
@@ -3436,6 +3454,8 @@ def burn(args):
     for lbl, tok_m, cost, gpp in lines:
         print(f"  {lbl:<{w}} {tok_m:9.1f}M tok   US$ {cost:9.2f}{pp_col(gpp)}")
     if share:
+        if filt:
+            print(f"  {rest_lbl:<{w}} {'':30}{pp_col(share['rest'])}")
         print(f"  {other_lbl:<{w}} {'':30}{pp_col(share['other'])}")
     total_c = sum(v[1] for _, v in ordered)
     total_tok = sum(v[0] for _, v in ordered)
@@ -3773,6 +3793,8 @@ def main():
     pb.add_argument("--since",
                     help="window: '24h', '7d', '30d' (default; with --plan, the current cycle), ISO date, "
                          "or 'all' for everything")
+    pb.add_argument("--surface", metavar="CLIENT",
+                    help="only these clients, comma-separated: terminal, vscode, app, sdk or a raw entrypoint")
     pb.add_argument("--plan", nargs="?", const="weekly_all", metavar="WINDOW",
                     help="also split the official percent of WINDOW across groups: weekly (default), 5h, "
                          "or a scoped model such as fable")
