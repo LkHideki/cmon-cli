@@ -88,7 +88,9 @@ when offline, so check that field rather than the exit code.
 For where the percent went, use `cmon burn --by surface --plan --json` (also `--by project`,
 `model`, `day`, `device`): `groups[].plan_pp` is each group's points of the window's percent over
 the current cycle, and `other_pp` is what rose with nothing logged on this machine (claude.ai chat,
-other devices). It's an estimate built from snapshots and local transcripts.
+other devices). It's an estimate built from snapshots and local transcripts. A non-empty
+`unpriced_models` means those models were costed at zero, which skews `plan_pp` towards the other
+groups; prices go in `~/.cmon/prices.json` (README, `burn` section), and they're the user's call.
 
 ## Explaining the menu bar
 

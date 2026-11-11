@@ -5,6 +5,24 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Prices outside the code: `~/.cmon/prices.json`.** An optional file of model substring →
+  `[input, output, cache_read, cache_write]` in US$ per million tokens replaces built-in prices and
+  adds new models. The longest matching substring wins, so the file's order doesn't matter. An
+  invalid file is ignored with one warning, and the built-in prices apply.
+- **`burn --json` reports `unpriced_models`**: at the top of the `--plan` object, and on each group
+  that has tokens of a model with no price.
+
+### Fixed
+
+- **`cmon burn` no longer prices an unknown model at zero in silence.** It warns on stderr, naming
+  the model and its tokens, since that zero also hands the model's share of the percent in
+  `burn --plan` to other groups or to *other*. A new model such as Mythos used to show up as US$ 0
+  with no hint.
+
 ## [0.8.0] — 2026-11-10
 
 ### Added

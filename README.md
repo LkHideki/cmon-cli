@@ -350,7 +350,8 @@ estimate, and it gets better the closer together the snapshots are.
 Without `--since` it covers the window's current cycle. `--plan` takes `weekly` (default), `5h` or a
 scoped model such as `fable`. With `--surface` or `--device`, the clients filtered out keep their
 points as *rest (filtered out)*, so what's left isn't inflated. `--json` with `--plan` prints an
-object with `window`, `since`, `cycles`, `total_pp`, `other_pp` and `groups`, each with `plan_pp`.
+object with `window`, `since`, `cycles`, `total_pp`, `other_pp`, `unpriced_models` (see *Prices*
+below) and `groups`, each with `plan_pp`.
 
 Scanning is incremental (caches by `mtime`+size, deduplicates by `uuid`): the
 first run reads everything (~tens of seconds on large bases), subsequent runs take
@@ -367,9 +368,32 @@ you extract from your plan (easily tens of times the monthly subscription).
 
 Crossing both sources: the **API** tells you *where the wall is* (official % + reset), the
 **logs** tell you *how you spent it* (which model/project drained it). Caveats: cost is
-an **estimate** (price table editable at the top of [`cmon.py`](cmon.py); cache write
-at 2×, TTL 1h), and logs cover **only Claude Code CLI** — usage on claude.ai web/desktop
-doesn't appear (but counts toward the official %).
+an **estimate** (prices below; cache write at 2×, TTL 1h), and logs cover **only Claude Code
+CLI** — usage on claude.ai web/desktop doesn't appear (but counts toward the official %).
+
+**Prices: `~/.cmon/prices.json`.** cmon ships prices for Fable, Opus, Sonnet and Haiku. The file,
+optional, replaces any of them and adds new ones, in US$ per million tokens, in the order input,
+output, cache read, cache write:
+
+```json
+{
+  "mythos": [20, 100, 2, 40],
+  "opus-4-1": [15, 75, 1.5, 30]
+}
+```
+
+Each key is matched, case-insensitively, as a substring of the model id in the transcripts
+(`claude-opus-4-1-20250805`), and the longest matching key wins whatever its place in the file, so
+`opus-4-1` takes precedence over the built-in `opus`. Built-in keys you don't list keep their price.
+An invalid file (not JSON, a value that isn't four numbers ≥ 0, the same key twice in different
+case) is ignored as a whole, with one warning, and the built-in prices apply. Edits take effect on
+the next run, and in a running `watch` on its next refresh.
+
+A model that matches no key costs US$ 0. `burn` then warns on stderr, naming the model and its
+tokens, because that zero also skews `--plan`: the percent the model used goes to whichever groups
+logged a cost in the same interval, or to *other*. `--json` reports the same thing as
+`unpriced_models`: a list at the top of the `--plan` object, and on each group that has such tokens
+in both forms. cmon doesn't guess a price for a model it doesn't know.
 
 **The `<synthetic>` label** (usually `0%` in the model mix) is not a real model: Claude
 Code stamps `model: "<synthetic>"` on messages it generates *locally* instead of calling

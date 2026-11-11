@@ -3042,7 +3042,8 @@ def trends(args):
 
 # --- Logs layer: mines ~/.claude/projects/**/*.jsonl for tokens & cost ---
 LOGS_ROOT = os.path.expanduser("~/.claude/projects")
-# USD per million tokens: (input, output, cache_read, cache_write). Estimate — adjust here.
+# USD per million tokens: (input, output, cache_read, cache_write). Estimate: built-in defaults,
+# which ~/.cmon/prices.json overrides and extends (see _price_table).
 # cache_read ≈ 0.1× input; cache_write = 2× input (1h TTL, what Claude Code uses).
 PRICES = {
     "fable":  (10.0, 50.0, 1.00, 20.0),
@@ -3050,14 +3051,69 @@ PRICES = {
     "sonnet": (3.0, 15.0, 0.30, 6.0),
     "haiku":  (1.0, 5.0, 0.10, 2.0),
 }
+_price_cache: tuple | None = None  # (file signature, table) of the last _price_table load
+
+
+def _prices_file() -> str:
+    return os.path.join(CMON_HOME, "prices.json")
+
+
+def _validate_prices(raw) -> dict:
+    """prices.json content -> {lowercase substring: 4-tuple}, or ValueError naming the problem."""
+    if not isinstance(raw, dict):
+        raise ValueError("expected an object of model substring -> [input, output, cache_read, cache_write]")
+    out = {}
+    for k, v in raw.items():
+        key = k.strip().lower()
+        if not key:
+            raise ValueError("empty model substring")
+        if key in out:
+            raise ValueError(f"{k!r} appears twice (substrings are case-insensitive)")
+        if not (isinstance(v, list) and len(v) == 4 and all(
+                isinstance(x, int | float) and not isinstance(x, bool) and math.isfinite(x) and x >= 0
+                for x in v)):
+            raise ValueError(f"{k!r} needs [input, output, cache_read, cache_write]: 4 numbers >= 0, "
+                             "US$ per million tokens")
+        out[key] = tuple(float(x) for x in v)
+    return out
+
+
+def _price_table() -> list[tuple[str, tuple]]:
+    """PRICES merged with ~/.cmon/prices.json, longest substring first (ties alphabetical), so
+    'opus-4-1' wins over 'opus' whatever the file's order. A missing file is the defaults; an
+    invalid one is ignored as a whole with one stderr warning. Reloaded when the file changes."""
+    global _price_cache
+    path = _prices_file()
+    try:
+        st = os.stat(path)
+        sig = (path, st.st_mtime_ns, st.st_size)
+    except OSError:
+        sig = (path, None, None)
+    if _price_cache is not None and _price_cache[0] == sig:
+        return _price_cache[1]
+    table = dict(PRICES)
+    if sig[1] is not None:
+        try:
+            with open(path, encoding="utf-8") as f:
+                table.update(_validate_prices(json.load(f)))
+        except (OSError, ValueError, OverflowError) as e:  # bad JSON/encoding; an int too big for a float
+            print(f"cmon: ignoring {path} ({e}); using the built-in prices.", file=sys.stderr)
+    ordered = sorted(table.items(), key=lambda kv: (-len(kv[0]), kv[0]))
+    _price_cache = (sig, ordered)
+    return ordered
+
+
+def _price_match(model: str):
+    """Price 4-tuple of `model`, or None when no substring of the table matches it."""
+    m = (model or "").lower()
+    for k, p in _price_table():
+        if k in m:
+            return p
+    return None
 
 
 def _price(model: str):
-    m = (model or "").lower()
-    for k, p in PRICES.items():
-        if k in m:
-            return p
-    return (0.0, 0.0, 0.0, 0.0)
+    return _price_match(model) or (0.0, 0.0, 0.0, 0.0)
 
 
 def _short_model(model: str) -> str:
@@ -3631,8 +3687,15 @@ def burn(args):
     agg = {}  # grp -> [tok, custo]
     ctok = {"input": 0, "output": 0, "cache read": 0, "cache write": 0}
     ccost = {"input": 0.0, "output": 0.0, "cache read": 0.0, "cache write": 0.0}
+    unpriced, unpriced_by_grp = {}, {}  # model -> tokens; grp -> {models}: priced at zero below
     for grp, model, i, o, r, c in rows:
-        p = _price(model)
+        p = _price_match(model)
+        if p is None:
+            p = (0.0, 0.0, 0.0, 0.0)
+            if i + o + r + c > 0:  # '<synthetic>' rows carry no tokens: nothing to price
+                name = model or "?"
+                unpriced[name] = unpriced.get(name, 0) + i + o + r + c
+                unpriced_by_grp.setdefault(grp, set()).add(name)
         cost = (i * p[0] + o * p[1] + r * p[2] + c * p[3]) / 1e6
         a = agg.setdefault(grp, [0, 0.0])
         a[0] += i + o + r + c
@@ -3653,16 +3716,26 @@ def burn(args):
         agg.setdefault(g, [0, 0.0])  # a period starting mid-cycle can charge a group outside it
     ordered = sorted(agg.items(), key=lambda kv: (-pp.get(kv[0], 0.0), -kv[1][1]))  # share, then cost
     if getattr(args, "json", False):
+        # The plain form is a bare array, so its unpriced models ride on each group, and only when
+        # there are some: a top-level key would turn the array into an object.
         items = [{"grp": g.isoformat() if hasattr(g, "isoformat") else g, "tok": int(v[0]), "custo": v[1],
-                  **({"plan_pp": pp.get(g, 0.0)} if share else {})} for g, v in ordered]
+                  **({"plan_pp": pp.get(g, 0.0)} if share else {}),
+                  **({"unpriced_models": sorted(unpriced_by_grp[g])} if g in unpriced_by_grp else {})}
+                 for g, v in ordered]
         if share:
             print(json.dumps({"window": plan[0], "since": since.isoformat() if since else None,
                               "cycles": share["cycles"], "total_pp": share["total"],
                               "other_pp": share["other"], **({"rest_pp": share["rest"]} if filt else {}),
-                              "groups": items}, ensure_ascii=False))
+                              "unpriced_models": sorted(unpriced), "groups": items}, ensure_ascii=False))
         else:
             print(json.dumps(items, ensure_ascii=False))
         return
+    if unpriced:
+        names = ", ".join(f"{m} ({t / 1e6:.1f}M tok)" for m, t in sorted(unpriced.items()))
+        one = len(unpriced) == 1
+        print(f"cmon: no price for {names}: {'its' if one else 'their'} cost counts as US$ 0, and burn --plan "
+              f"gives the percent {'it' if one else 'they'} used to other groups (or to 'other'). "
+              f"Add {'it' if one else 'them'} to {_prices_file()} (see README).", file=sys.stderr)
     per = {"model": "model", "surface": "surface", "day": "day",
            "project": "project", "session": "session", "device": "device"}[args.by]
     since_local = since.astimezone(_resolve_tz()) if since else None
@@ -3730,6 +3803,7 @@ def watch(args):
 
     tz = _resolve_tz()  # resolved once, before Live(screen=True) takes over — any invalid-tz
                        # warning must print here, never inside render() (would corrupt the TUI)
+    _price_table()  # same for an invalid prices.json: warn now; the load is cached while the file is unchanged
     show_bar = getattr(args, "usage", False)
     base = float(args.interval)
     cur = base  # adaptive poll interval: grows on 403/errors, eases back on sustained success
