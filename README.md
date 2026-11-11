@@ -19,8 +19,10 @@ cmon tracks Claude only for now. Its database is already prepared for other prov
 | [`menubar/`](menubar/) | cmon Bar, the macOS app, in Swift |
 | [`scripts/setup.sh`](scripts/setup.sh) | What `make install`, `make uninstall` and `make doctor` run |
 | [`tests/`](tests/) | Python tests; they never touch your real data or the network |
-| [`docs/plans/`](docs/plans/) | Design plans, in Portuguese; not all of them are implemented |
+| [`docs/plans/`](docs/plans/) | Design plans, mostly in Portuguese; not all of them are implemented |
 | [`CHANGELOG.md`](CHANGELOG.md) | What changed in each release, and how to upgrade |
+| [`ROADMAP.md`](ROADMAP.md) | Candidate features, open for contributions |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to set up, test and send a change |
 
 ## Quick start (macOS)
 
@@ -947,13 +949,14 @@ uv run ruff check --fix .    # auto-fix what it can
 uv run cmon <cmd>            # run straight from source
 ```
 
-CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs ruff + CLI smoke tests
-on Python 3.11–3.13. PRs welcome: keep `ruff` green and the file style lean. Useful
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs pytest, ruff and a CLI smoke
+test on Python 3.11–3.13 and on DuckDB 1.1.1, the oldest supported, and builds and tests cmon Bar
+on macOS. PRs welcome: [CONTRIBUTING.md](CONTRIBUTING.md) says what a change needs, and
+[ROADMAP.md](ROADMAP.md) lists features waiting for someone to build them. Useful
 environment variables: `CMON_DB` (database path), `CMON_RETRIES`, `CMON_DEDUP_SECS`,
 `CMON_ALERT_LEAD` / `CMON_ALERT_LEAD_WEEKLY` (minutes before the 5h / weekly reset to alert),
 `CMON_HOOK` (command run on every alert; see [Alerts](#alerts)),
-`CMON_OAUTH_CLIENT_ID` / `CMON_OAUTH_TOKEN_URL` (OAuth refresh overrides; URL allowlisted to
-`*.anthropic.com`), `CMON_ALLOW_PLAINTEXT_KEYRING` (permit saving to a cleartext keyring backend),
+`CMON_ALLOW_PLAINTEXT_KEYRING` (permit saving to a cleartext keyring backend),
 `CMON_TZ` (display timezone override; see [Config](#config)). A number variable that doesn't parse
 stops every command with one line naming it, and makes `cmon guard` exit 3.
 

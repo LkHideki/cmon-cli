@@ -1,0 +1,39 @@
+name: Feature request
+description: Propose a new command, option or cmon Bar change
+labels: [enhancement, triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check [ROADMAP.md](https://github.com/LkHideki/cmon-cli/blob/main/ROADMAP.md) first. If your
+        idea is there and has an issue (label `roadmap`), comment on that issue instead of opening a
+        new one.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you're trying to do, and why the current commands don't get you there.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you propose
+      description: The command or output you have in mind. A sample of the output helps a lot.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+  - type: input
+    id: roadmap
+    attributes:
+      label: Roadmap item
+      description: Its ID, such as B5, if the idea is in ROADMAP.md
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Contributing
+      options:
+        - label: I'd like to implement this myself.

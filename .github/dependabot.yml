@@ -1,0 +1,11 @@
+version: 2
+updates:
+  # Only the CI actions. Python dependencies stay manual: the DuckDB range in pyproject.toml
+  # excludes versions with known bugs, and CI tests the oldest one on purpose.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
