@@ -85,6 +85,12 @@ until collection has run.
 `offline: true` means no data is available, and `providers` is then empty. `status` exits 0 even
 when offline, so check that field rather than the exit code.
 
+To gate a script or hook on the limit, use `cmon guard --window session --max 90`: exit 0 under
+the percent, 1 at or above it, 3 when there's no fresh data (no cache, window missing, or older
+than `--stale-min`, 60 min), 2 for bad arguments. It reads only the cache, never the API. `--json`
+prints `{window, percent, max, resets_at, age_s, result}`, with `result` one of `under`, `over`,
+`no_data`, `missing`, `stale`.
+
 For where the percent went, use `cmon burn --by surface --plan --json` (also `--by project`,
 `model`, `day`, `device`): `groups[].plan_pp` is each group's points of the window's percent over
 the current cycle, and `other_pp` is what rose with nothing logged on this machine (claude.ai chat,

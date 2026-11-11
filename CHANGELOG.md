@@ -26,6 +26,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `set`. If one collect finds several percents passed at once, only the highest notifies. Until
   now only `cmon wait --at` could say "the 5h window passed 80%", and it held a terminal for a
   single wait. Without the key nothing changes.
+- **`cmon guard --max N`: an exit code for scripts and Claude Code hooks.** Exits 1 when the window
+  (`--window`, default `session`; `5h`, `weekly` and scoped models work) is at or above N percent,
+  0 under it, and 3 when there's no data, the window is missing or the cache is older than
+  `--stale-min` (60 minutes), so an empty cache can't pass for a free window. A cached cycle that
+  already reset counts as 0%. It reads only the status cache, never the API or the database, so a
+  hook doesn't wait on the network or on a running `collect`. `--quiet` drops the stderr line and
+  `--json` prints `{window, percent, max, resets_at, age_s, result}`. `status` keeps exiting 0.
 
 ### Changed
 

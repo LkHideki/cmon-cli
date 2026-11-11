@@ -165,6 +165,7 @@ The examples use `uv run cmon`, for a clone of this repository. After `make inst
 ```bash
 uv run cmon now       # current usage + reset + rate/projection (--advice adds pacing tips)
 uv run cmon status    # one-liner for statusline/tmux/prompt
+uv run cmon guard --max 90  # exit 1 when the 5h window is at 90% or more (scripts, hooks)
 uv run cmon watch     # live TUI, self-updating (Ctrl-C exits)
 uv run cmon wait      # block until 5h window resets, then notify
 uv run cmon collect   # save 1 snapshot to database (with UTC timestamp)
@@ -202,6 +203,77 @@ it never shows a dead cycle and never blocks a prompt. `--live` always queries t
 
 `--json` prints a versioned payload (`version`, `offline`, `observed_at`, `age_s`,
 `providers.claude.windows[]`) for scripts and the menu bar app.
+
+### `cmon guard` — exit code for scripts and hooks
+
+`status` always exits 0 so it never breaks a statusline. `guard` is the opposite: it exits
+non-zero when a window is at or above a percent, so a batch can stop before the limit blocks it:
+
+```sh
+cmon guard --window session --max 90 || exit 0   # don't start the batch near the end of the window
+```
+
+| Exit | Meaning |
+|---|---|
+| 0 | Under `--max`, including a window whose cached reset already passed (nothing used in the new cycle yet) |
+| 1 | At or above `--max` |
+| 2 | Bad arguments (argparse's usage error) |
+| 3 | No data: no cache, the window isn't in it, or it's older than `--stale-min` minutes (60) |
+
+Exit 3 is separate on purpose: an empty or stale cache must not pass for a free window. Test
+for 1 when "unknown" should let the work go ahead, as the hook below does.
+
+`--window` takes `session` (the default, alias `5h`), `weekly_all` (alias `weekly`) or a scoped
+model such as `fable`. The one-line explanation goes to stderr (`--quiet` drops it), and
+`--json` prints the verdict on stdout:
+
+```json
+{"window": "session", "percent": 42.0, "max": 90.0, "resets_at": "2026-11-04T02:00:00+00:00", "age_s": 300, "result": "under"}
+```
+
+`result` is `under`, `over`, `no_data`, `missing` or `stale`; `percent` and `resets_at` are
+`null` unless it's `under` or `over`, and `resets_at` is also `null` once the cached cycle ended.
+
+`guard` reads only the cache that `cmon collect` (every 20 min after `cmon install`),
+`status --live` and cmon Bar keep. It never calls the API or opens the database, so it takes
+milliseconds and a running `collect` can't hold it up. Unlike `status`, it doesn't fetch the new
+cycle when the cached one already reset. If a long loop needs a fresher number, run
+`cmon status --live > /dev/null` before it, at the cost of one API call.
+
+A loop of `claude -p` runs that stops near the limit:
+
+```sh
+for task in tasks/*.md; do
+  cmon guard --max 85 || break   # 1: near the limit, 3: no fresh data
+  claude -p "$(cat "$task")" > "${task%.md}.out"
+done
+```
+
+A Claude Code hook that tells the agent to wrap up once the 5h window passes 90%. In
+`UserPromptSubmit`, what a hook prints with exit 0 is added to the agent's context; any other
+exit code except 2 is only reported as a hook error, so the command maps the verdict to text
+and always exits 0. In `~/.claude/settings.json` or a project's `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cmon guard --max 90 --quiet; [ $? -ne 1 ] || echo 'The 5h usage window is above 90%. Finish the current step, commit, and write down where you stopped before the limit blocks this session.'"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+To refuse new prompts instead, exit 2 from the hook: Claude Code then blocks the prompt and
+shows the hook's stderr, e.g.
+`cmon guard --max 98; [ $? -ne 1 ] || exit 2`.
 
 ### Menu bar (macOS)
 

@@ -3009,6 +3009,85 @@ def status(args):
     print(" · ".join(parts))
 
 
+GUARD_STALE_MIN = 60  # default --stale-min: three missed 20-min collections
+GUARD_EXIT = {"under": 0, "over": 1}  # anything else (no_data, missing, stale, malformed) exits 3
+
+
+def _guard_number(hi: float | None = None):
+    """argparse type for guard's --max (0 < N <= 100) and --stale-min (N > 0). NaN fails both."""
+    def parse(value: str) -> float:
+        try:
+            n = float(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{value!r} is not a number") from None
+        if not n > 0 or (hi is not None and n > hi):
+            raise argparse.ArgumentTypeError(
+                f"{value!r} must be above 0" + (f" and at most {hi:g}" if hi is not None else ""))
+        return n
+    return parse
+
+
+def _guard_row(rows, name: str):
+    """The cached row for NAME: a key, an alias (5h, weekly) or a scoped model (fable for
+    weekly_scoped:Fable), case-insensitive, matched the way 'burn --plan' matches it."""
+    want = PLAN_ALIASES.get(name.lower(), name).lower()
+    return next((r for r in rows if want in (r[0].lower(), r[0].lower().rsplit(":", 1)[-1])), None)
+
+
+def guard(args):
+    """Exit code against a percent ceiling, for scripts and Claude Code hooks: 0 under --max, 1 at
+    or above it, 3 when there's nothing fresh to judge by. Unknown gets its own code or an empty
+    cache would pass for a free window, and it isn't 2, which argparse uses for a usage error.
+    Reads only the status cache, never the API or DuckDB: unlike 'status' it doesn't refresh a
+    cycle that already reset, so a hook never waits on the network or on a collect's write lock."""
+    out = {"window": PLAN_ALIASES.get(args.window.lower(), args.window), "percent": None,
+           "max": args.max, "resets_at": None, "age_s": None, "result": "no_data"}
+    got = _read_cache()
+    rows = [r for r in got[0] if len(r) >= 5 and isinstance(r[0], str)] if got else []
+    if not rows:
+        msg = "no cached usage; run 'cmon collect', or 'cmon install' to collect in the background"
+    else:
+        age = got[1]
+        out["age_s"] = round(age)
+        row = _guard_row(rows, args.window)
+        pct = row[2] if row else None
+        if row:
+            out["window"] = row[0]
+        label = (LEAD_LABEL_BY_KEY.get(row[0]) or _safe(row[1] or row[0])) if row else None
+        if age > args.stale_min * 60:
+            out["result"] = "stale"
+            msg = (f"cached usage is {age / 60:.0f} min old, over --stale-min {args.stale_min:g}; "
+                   "is 'cmon collect' running? ('cmon install' schedules it)")
+        elif row is None:
+            out["result"] = "missing"
+            known = ", ".join(_safe(r[0], 60) for r in rows)
+            msg = f"no window {args.window!r} in the cache (known: {known})"
+        elif isinstance(pct, bool) or not isinstance(pct, (int, float)):
+            msg = f"the cached {label} has no usable percent"
+        else:
+            reset = row[3] if isinstance(row[3], str) and row[3] else None
+            try:
+                ended = reset is not None and datetime.fromisoformat(reset) <= datetime.now(UTC)
+            except (ValueError, TypeError):
+                ended = False
+            if ended:  # the cycle rolled over since the last read: nothing used in the new one yet
+                pct, reset = 0.0, None
+            out |= {"percent": float(pct), "resets_at": reset,
+                    "result": "over" if pct >= args.max else "under"}
+            verdict = "at or above" if out["result"] == "over" else "under"
+            if ended:
+                msg = f"{label} already reset; counting it as 0%, {verdict} --max {args.max:g}"
+            else:
+                msg = f"{label} at {pct:g}%, {verdict} --max {args.max:g}"
+                if reset:
+                    msg += f"; resets in {fmt_eta(reset)}"
+    if args.json:
+        print(json.dumps(out))
+    if not args.quiet:
+        print(f"cmon guard: {msg}.", file=sys.stderr)
+    sys.exit(GUARD_EXIT.get(out["result"], 3))
+
+
 def wait(args):
     """Block until window resets (default) or hits --at N%, then notify.
     Ctrl-C cancels. Poll every --interval s; in reset mode sleep until resets_at."""
@@ -4173,6 +4252,18 @@ def main():
     ps = sub.add_parser("status", help="single line for statusline/tmux/prompt (reads local cache)")
     ps.add_argument("--live", action="store_true", help="query API instead of local cache")
     ps.add_argument("--json", action="store_true", help="versioned JSON for the menu bar/scripts")
+    pg = sub.add_parser("guard", help="exit 1 if a window is at or above --max percent, 3 if there's no fresh "
+                                      "data, else 0 (reads local cache; for scripts and Claude Code hooks)")
+    pg.add_argument("--window", default="session",
+                    help="window to check: session (default; alias 5h), weekly_all (alias weekly) or a "
+                         "scoped model such as fable")
+    pg.add_argument("--max", type=_guard_number(100), required=True, metavar="N",
+                    help="percent at which the guard fails (exit 1)")
+    pg.add_argument("--stale-min", type=_guard_number(), default=GUARD_STALE_MIN, metavar="MIN",
+                    help=f"cache older than MIN minutes counts as no data (exit 3; default {GUARD_STALE_MIN})")
+    pg.add_argument("-q", "--quiet", action="store_true", help="no explanation on stderr")
+    pg.add_argument("--json", action="store_true",
+                    help="print {window, percent, max, resets_at, age_s, result} on stdout")
     ptr = sub.add_parser("trends", help="consumption history: per-label summary + per-cycle peaks/anomaly")
     ptr.add_argument("--since", help="filter the summary from '24h', '7d' or ISO date")
     ptr.add_argument("--json", action="store_true", help="JSON output of the summary")
@@ -4270,7 +4361,7 @@ def main():
          "clear": config_clear}[args.action](args)
         return
     try:
-        {"now": now, "status": status, "trends": trends, "collect": collect,
+        {"now": now, "status": status, "guard": guard, "trends": trends, "collect": collect,
          "burn": burn, "watch": watch, "wait": wait, "plot": plot,
          "backtest": backtest, "tune": tune, "install": install,
          "uninstall": uninstall, "import": import_db, "keepalive": keepalive, "sync": sync}[args.cmd](args)
